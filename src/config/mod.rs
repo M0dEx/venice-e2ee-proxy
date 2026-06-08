@@ -236,6 +236,7 @@ pub enum SessionFallbackScope {
     Agent,
     #[default]
     Request,
+    Disabled,
 }
 
 impl SessionFallbackScope {
@@ -243,6 +244,7 @@ impl SessionFallbackScope {
         match self {
             Self::Agent => "agent",
             Self::Request => "request",
+            Self::Disabled => "disabled",
         }
     }
 }
@@ -517,6 +519,7 @@ mod tests {
         assert_eq!(config.session.max_ttl_seconds, 1_800);
         assert_eq!(config.session.max_requests, 100);
         assert_eq!(config.session.fallback_scope, SessionFallbackScope::Request);
+        assert_eq!(SessionFallbackScope::Disabled.as_str(), "disabled");
         assert_eq!(
             config.session.headers.preferred,
             "X-Venice-Proxy-Session-Id"

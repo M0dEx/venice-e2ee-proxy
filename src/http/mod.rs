@@ -16,7 +16,9 @@ use tokio::net::TcpListener;
 
 use crate::{
     config::ProxyConfig,
+    keys::ProxyInstanceKey,
     openai::ErrorResponse,
+    sessions::SessionManager,
     venice::{VeniceClient, VeniceClientError},
 };
 
@@ -38,6 +40,8 @@ pub const HEADER_PROXY_ERROR_CODE: &str = "X-Venice-Proxy-Error-Code";
 pub struct AppState {
     config: Arc<ProxyConfig>,
     venice_client: VeniceClient,
+    proxy_instance_key: Option<ProxyInstanceKey>,
+    session_manager: SessionManager,
 }
 
 impl AppState {
@@ -47,9 +51,14 @@ impl AppState {
     }
 
     pub fn from_parts(config: ProxyConfig, venice_client: VeniceClient) -> Self {
+        let proxy_instance_key = ProxyInstanceKey::generate_from_config(&config.keys);
+        let session_manager = SessionManager::new(config.session.clone());
+
         Self {
             config: Arc::new(config),
             venice_client,
+            proxy_instance_key,
+            session_manager,
         }
     }
 
@@ -59,6 +68,14 @@ impl AppState {
 
     pub fn venice_client(&self) -> &VeniceClient {
         &self.venice_client
+    }
+
+    pub fn proxy_instance_key(&self) -> Option<&ProxyInstanceKey> {
+        self.proxy_instance_key.as_ref()
+    }
+
+    pub fn session_manager(&self) -> &SessionManager {
+        &self.session_manager
     }
 }
 
@@ -289,6 +306,22 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect("test Venice client should build")
+    }
+
+    #[test]
+    fn app_state_initializes_key_and_session_managers_from_config() {
+        let state = AppState::from_parts(ProxyConfig::default(), test_venice_client());
+
+        let key = state
+            .proxy_instance_key()
+            .expect("default config should generate startup key");
+        assert_eq!(key.public_key_hex().len(), 130);
+        assert!(state.session_manager().is_empty().unwrap());
+
+        let mut config = ProxyConfig::default();
+        config.keys.generate_proxy_instance_key_on_startup = false;
+        let state = AppState::from_parts(config, test_venice_client());
+        assert!(state.proxy_instance_key().is_none());
     }
 
     async fn error_body(response: Response) -> ErrorResponse {
