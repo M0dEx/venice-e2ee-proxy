@@ -6,6 +6,7 @@ Local OpenAI-compatible proxy for Venice.AI E2EE models.
 ## Stack
 
 - Language/runtime: Rust, using the Cargo package manager.
+- HTTP/runtime: async Rust with `tokio` and `axum` for the OpenAI-compatible HTTP server.
 - Crate layout: one binary entrypoint in `src/main.rs` plus a library surface in `src/lib.rs` for implementation modules.
 
 ## Commands
@@ -15,7 +16,8 @@ Use direct Cargo commands only.
 | Purpose | Command |
 | --- | --- |
 | Install/fetch dependencies | `cargo fetch` |
-| Local development entrypoint | `cargo run` |
+| Local development entrypoint with defaults | `cargo run` |
+| Local development entrypoint with config | `cargo run -- path/to/config.toml` |
 | Format code | `cargo fmt` |
 | Check formatting | `cargo fmt --check` |
 | Lint | `cargo clippy --all-targets --all-features -- -D warnings` |
@@ -42,6 +44,9 @@ Use direct Cargo commands only.
 
 ## Tests
 
-- Unit test placeholder: `src/lib.rs` verifies the module boundary list.
-- Integration test placeholder: `tests/baseline.rs` verifies the Cargo integration test harness is wired.
+- Unit tests in `src/config` cover defaults, validation, and safe Venice API key lookup.
+- Unit tests in `src/http` cover route registration, unknown routes/methods, Axum JSON extractor rejections for malformed/non-object JSON, and safe header helpers.
+- Unit tests in `src/main.rs` cover the optional config path CLI shape.
+- `src/lib.rs` still verifies the module boundary list.
+- `tests/baseline.rs` verifies the Cargo integration test harness is wired.
 
