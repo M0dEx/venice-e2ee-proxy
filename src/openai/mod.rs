@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod chat;
+
 /// OpenAI-compatible model-list response envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelListResponse {

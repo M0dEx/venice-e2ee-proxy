@@ -1,5 +1,7 @@
 //! HTTP server, route wiring, shared headers, and route errors.
 //!
+//! adds request-side chat normalization and Venice E2EE payload construction while
+//! response transformation remains deferred.
 
 use std::{io, sync::Arc};
 
@@ -10,16 +12,20 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde_json::{Map, Value};
+use serde_json::Value;
 use thiserror::Error;
 use tokio::net::TcpListener;
 
 use crate::{
     attestation::{AttestationError, AttestationVerifier},
     config::ProxyConfig,
+    e2ee::E2eeCodec,
     keys::ProxyInstanceKey,
-    openai::ErrorResponse,
-    sessions::SessionManager,
+    openai::{
+        ErrorResponse,
+        chat::{ChatCompletionRequest, ChatConstructionError, ChatRequestError},
+    },
+    sessions::{AttestedModelState, SessionContext, SessionError, SessionManager, SessionRequest},
     venice::{VeniceClient, VeniceClientError},
 };
 
@@ -125,18 +131,65 @@ async fn list_models(State(state): State<AppState>) -> Result<Response, ProxyErr
 }
 
 async fn create_chat_completion(
-    State(_state): State<AppState>,
-    Json(body): Json<ChatCompletionPlaceholderRequest>,
-) -> ProxyError {
-    let _accepted_field_count = body.len();
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, ProxyError> {
+    let request = ChatCompletionRequest::parse(&body)?;
+    let proxy_instance_key = state
+        .proxy_instance_key()
+        .ok_or(ProxyError::ProxyInstanceKeyUnavailable)?;
 
-    ProxyError::NotImplemented {
-        message: "POST /v1/chat/completions is registered but not available yet."
+    let session = state
+        .session_manager()
+        .get_or_create(SessionRequest::new(&request.model, &headers).with_body(&body))?
+        .session;
+    let session = ensure_attested_session(&state, session).await?;
+    let model_public_key = session
+        .attested_model_public_key
+        .as_deref()
+        .ok_or(ProxyError::MissingAttestedModelKey)?;
+
+    let codec =
+        E2eeCodec::from_config(&state.config().e2ee).map_err(ChatConstructionError::E2ee)?;
+    let prepared = request.into_venice_e2ee_request(&codec, model_public_key)?;
+
+    let _venice_e2ee_headers = (
+        proxy_instance_key.public_key_hex(),
+        model_public_key,
+        "ecdsa",
+    );
+    let _venice_e2ee_request = prepared.upstream;
+
+    Err(ProxyError::NotImplemented {
+        message: "Encrypted Venice chat request construction is complete; response transformation is not available yet."
             .to_owned(),
-    }
+    })
 }
 
-type ChatCompletionPlaceholderRequest = Map<String, Value>;
+async fn ensure_attested_session(
+    state: &AppState,
+    session: SessionContext,
+) -> Result<SessionContext, ProxyError> {
+    if session.attested_model_public_key.is_some() {
+        return Ok(session);
+    }
+
+    let attestation = state
+        .attestation_verifier()
+        .verify_model_attestation(&session.model_id)
+        .await?;
+
+    let state_update = AttestedModelState {
+        model_public_key: attestation.model_public_key,
+        attestation_report: attestation.attestation_report,
+        verified_at: attestation.verified_at,
+    };
+
+    Ok(state
+        .session_manager()
+        .set_attested_model_state(&session.session_key, state_update)?)
+}
 
 async fn method_not_allowed(method: Method, uri: Uri) -> ProxyError {
     ProxyError::MethodNotAllowed { method, uri }
@@ -152,6 +205,18 @@ pub enum ProxyError {
     Venice(#[from] VeniceClientError),
     #[error(transparent)]
     Attestation(#[from] AttestationError),
+    #[error(transparent)]
+    Session(#[from] SessionError),
+    #[error(transparent)]
+    ChatRequest(#[from] ChatRequestError),
+    #[error(transparent)]
+    ChatConstruction(#[from] ChatConstructionError),
+    #[error(
+        "proxy instance key is unavailable; keys.generate_proxy_instance_key_on_startup must be enabled for E2EE chat requests"
+    )]
+    ProxyInstanceKeyUnavailable,
+    #[error("session does not contain an attested model public key after attestation verification")]
+    MissingAttestedModelKey,
     #[error("{message}")]
     NotImplemented { message: String },
     #[error("method {method} is not supported for {uri}")]
@@ -168,6 +233,15 @@ impl ProxyError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             Self::Attestation(_) => StatusCode::BAD_GATEWAY,
+            Self::Session(
+                SessionError::MissingSessionIdentifier | SessionError::InvalidHeaderValue { .. },
+            ) => StatusCode::BAD_REQUEST,
+            Self::Session(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ChatRequest(_) => StatusCode::BAD_REQUEST,
+            Self::ChatConstruction(_) => StatusCode::BAD_GATEWAY,
+            Self::ProxyInstanceKeyUnavailable | Self::MissingAttestedModelKey => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
@@ -178,6 +252,14 @@ impl ProxyError {
         match self {
             Self::Venice(error) => error.api_error_type(),
             Self::Attestation(error) => error.api_error_type(),
+            Self::Session(
+                SessionError::MissingSessionIdentifier | SessionError::InvalidHeaderValue { .. },
+            ) => "invalid_request_error",
+            Self::Session(_) => "proxy_session_error",
+            Self::ChatRequest(_) => "invalid_request_error",
+            Self::ChatConstruction(_) => "proxy_e2ee_error",
+            Self::ProxyInstanceKeyUnavailable => "proxy_configuration_error",
+            Self::MissingAttestedModelKey => "proxy_attestation_error",
             Self::NotImplemented { .. } => "proxy_not_implemented",
             Self::MethodNotAllowed { .. } | Self::NotFound { .. } => "invalid_request_error",
         }
@@ -187,6 +269,13 @@ impl ProxyError {
         match self {
             Self::Venice(error) => error.api_error_code(),
             Self::Attestation(error) => error.api_error_code(),
+            Self::Session(SessionError::MissingSessionIdentifier) => "session_identifier_missing",
+            Self::Session(SessionError::InvalidHeaderValue { .. }) => "invalid_session_header",
+            Self::Session(_) => "session_error",
+            Self::ChatRequest(error) => error.api_error_code(),
+            Self::ChatConstruction(error) => error.api_error_code(),
+            Self::ProxyInstanceKeyUnavailable => "proxy_instance_key_unavailable",
+            Self::MissingAttestedModelKey => "attestation_failed",
             Self::NotImplemented { .. } => "not_implemented",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
             Self::NotFound { .. } => "not_found",
@@ -306,9 +395,12 @@ fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, extract::Query, http::Request, routing::get};
+    use serde_json::json;
+
+    use crate::config::NvidiaRequirement;
     use tower::ServiceExt;
 
     fn test_app() -> Router {
@@ -316,12 +408,19 @@ mod tests {
     }
 
     fn test_venice_client() -> VeniceClient {
-        VeniceClient::new(
-            "http://127.0.0.1:1/api/v1",
-            "test-api-key",
-            Duration::from_secs(1),
-        )
-        .expect("test Venice client should build")
+        test_venice_client_for_base_url("http://127.0.0.1:1/api/v1")
+    }
+
+    fn test_venice_client_for_base_url(base_url: impl AsRef<str>) -> VeniceClient {
+        VeniceClient::new(base_url.as_ref(), "test-api-key", Duration::from_secs(1))
+            .expect("test Venice client should build")
+    }
+
+    fn chat_config_with_basic_test_attestation() -> ProxyConfig {
+        let mut config = ProxyConfig::default();
+        config.attestation.require_tdx = false;
+        config.attestation.require_nvidia = NvidiaRequirement::Never;
+        config
     }
 
     #[test]
@@ -352,14 +451,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_route_returns_not_implemented_placeholder() {
-        let response = test_app()
+    async fn chat_route_constructs_e2ee_request_after_attestation_then_defers_response_transform() {
+        let model_public_key = ProxyInstanceKey::generate().public_key_hex().to_owned();
+        let base_url = spawn_attestation_server(model_public_key, true).await;
+        let app = router_with_venice_client(
+            chat_config_with_basic_test_attestation(),
+            test_venice_client_for_base_url(base_url),
+        );
+
+        let response = app
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"model":"example","messages":[]}"#))
+                    .header(HEADER_PROXY_SESSION_ID, "chat-route-test")
+                    .body(Body::from(
+                        r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+                    ))
                     .expect("request should build"),
             )
             .await
@@ -373,6 +482,40 @@ mod tests {
         let body = error_body(response).await;
         assert_eq!(body.error.kind, "proxy_not_implemented");
         assert_eq!(body.error.code, "not_implemented");
+    }
+
+    #[tokio::test]
+    async fn chat_route_attestation_failure_prevents_request_construction() {
+        let model_public_key = ProxyInstanceKey::generate().public_key_hex().to_owned();
+        let base_url = spawn_attestation_server(model_public_key, false).await;
+        let app = router_with_venice_client(
+            chat_config_with_basic_test_attestation(),
+            test_venice_client_for_base_url(base_url),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header(HEADER_PROXY_SESSION_ID, "chat-route-attestation-failure")
+                    .body(Body::from(
+                        r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(HEADER_PROXY_ERROR_CODE).unwrap(),
+            "attestation_upstream_not_verified"
+        );
+        let body = error_body(response).await;
+        assert_eq!(body.error.kind, "proxy_attestation_error");
+        assert_eq!(body.error.code, "attestation_upstream_not_verified");
     }
 
     #[tokio::test]
@@ -439,7 +582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_object_chat_json_uses_axum_extractor_rejection() {
+    async fn non_object_chat_json_returns_structured_invalid_request() {
         let response = test_app()
             .oneshot(
                 Request::builder()
@@ -452,8 +595,47 @@ mod tests {
             .await
             .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(response.headers().get(HEADER_PROXY_ERROR_CODE).is_none());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(HEADER_PROXY_ERROR_CODE).unwrap(),
+            "invalid_request"
+        );
+        let body = error_body(response).await;
+        assert_eq!(body.error.kind, "invalid_request_error");
+        assert_eq!(body.error.code, "invalid_request");
+    }
+
+    async fn spawn_attestation_server(model_public_key: String, verified: bool) -> String {
+        let app = Router::new().route(
+            "/api/v1/tee/attestation",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let model_public_key = model_public_key.clone();
+                async move {
+                    Json(json!({
+                        "attestation": {
+                            "verified": verified,
+                            "nonce": query.get("nonce").cloned().unwrap_or_default(),
+                            "model": query.get("model").cloned().unwrap_or_default(),
+                            "signing_key": model_public_key,
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock attestation listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock attestation listener should have local address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock attestation server should run");
+        });
+
+        format!("http://{addr}/api/v1")
     }
 
     #[test]

@@ -55,7 +55,8 @@ Use direct Cargo commands only.
 - Unit tests in `src/config` cover defaults, validation, and safe Venice API key lookup.
 - Unit tests in `src/venice` cover Venice-to-OpenAI model mapping, missing optional metadata defaults, malformed upstream model payloads, and API-key redaction in debug output.
 - Unit tests in `src/attestation` cover valid evidence, missing fields, debug evidence, required TDX/NVIDIA failures, malformed upstream evidence, and upstream fetch failures.
-- Unit tests in `src/http` cover route registration, unknown routes/methods, Axum JSON extractor rejections for malformed/non-object JSON, and safe header helpers.
+- Unit tests in `src/openai/chat` cover chat message normalization, unsupported request shapes, Venice parameter policy, and encrypted Venice request construction.
+- Unit tests in `src/http` cover route registration, chat request construction gating, unknown routes/methods, Axum JSON extractor rejections for malformed/non-object JSON, and safe header helpers.
 - Unit tests in `src/main.rs` cover the optional config path CLI shape.
 - `src/lib.rs` still verifies the module boundary list.
 - `tests/baseline.rs` verifies the Cargo integration test harness is wired.
