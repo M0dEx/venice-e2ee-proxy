@@ -7,6 +7,7 @@ Local OpenAI-compatible proxy for Venice.AI E2EE models.
 
 - Language/runtime: Rust, using the Cargo package manager.
 - HTTP/runtime: async Rust with `tokio` and `axum` for the OpenAI-compatible HTTP server.
+- Upstream/client direction: typed JSON with `serde`, `reqwest` for Venice HTTP calls, and `toml`/environment configuration.
 - Crate layout: one binary entrypoint in `src/main.rs` plus a library surface in `src/lib.rs` for implementation modules.
 
 ## Commands
@@ -23,7 +24,8 @@ Use direct Cargo commands only.
 | Lint | `cargo clippy --all-targets --all-features -- -D warnings` |
 | Typecheck | `cargo check --all-targets --all-features` |
 | Unit tests | `cargo test --lib` |
-| Integration tests | `cargo test --test baseline` |
+| Baseline integration test | `cargo test --test baseline` |
+| Mocked models integration tests | `cargo test --test models` |
 | All tests | `cargo test --all-targets --all-features` |
 | Baseline validation | Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` |
 
@@ -45,8 +47,10 @@ Use direct Cargo commands only.
 ## Tests
 
 - Unit tests in `src/config` cover defaults, validation, and safe Venice API key lookup.
+- Unit tests in `src/venice` cover Venice-to-OpenAI model mapping, missing optional metadata defaults, malformed upstream model payloads, and API-key redaction in debug output.
 - Unit tests in `src/http` cover route registration, unknown routes/methods, Axum JSON extractor rejections for malformed/non-object JSON, and safe header helpers.
 - Unit tests in `src/main.rs` cover the optional config path CLI shape.
 - `src/lib.rs` still verifies the module boundary list.
 - `tests/baseline.rs` verifies the Cargo integration test harness is wired.
+- `tests/models.rs` verifies mocked Venice success, authentication failures, server errors, malformed payloads, and upstream timeout handling for `GET /v1/models`.
 

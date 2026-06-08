@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 use venice_e2ee_proxy::{
     config::{ConfigError, ProxyConfig},
     http,
+    venice::VeniceClientError,
 };
 
 #[derive(Debug, Parser)]
@@ -31,11 +32,12 @@ async fn run() -> Result<(), RunError> {
     let config = load_config(cli.config)?;
     let bind_host = config.server.host.clone();
     let bind_port = config.server.port;
+    let app = http::router(config)?;
     let listener = TcpListener::bind((bind_host.as_str(), bind_port)).await?;
     let local_addr = listener.local_addr()?;
 
     eprintln!("venice-e2ee-proxy listening on http://{local_addr}");
-    http::serve(listener, config).await?;
+    http::serve(listener, app).await?;
     Ok(())
 }
 
@@ -54,6 +56,8 @@ fn load_config(config_path: Option<PathBuf>) -> Result<ProxyConfig, ConfigError>
 enum RunError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error(transparent)]
+    VeniceClient(#[from] VeniceClientError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }

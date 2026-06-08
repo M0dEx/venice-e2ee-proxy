@@ -1,9 +1,7 @@
 //! HTTP server, route wiring, shared headers, and route errors.
 //!
-//! placeholders for `/v1/models` and `/v1/chat/completions` without calling
-//! Venice upstream or implementing E2EE behavior.
 
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -16,7 +14,11 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::net::TcpListener;
 
-use crate::{config::ProxyConfig, openai::ErrorResponse};
+use crate::{
+    config::ProxyConfig,
+    openai::ErrorResponse,
+    venice::{VeniceClient, VeniceClientError},
+};
 
 pub const HEADER_PROXY_E2EE: &str = "X-Venice-Proxy-E2EE";
 pub const HEADER_PROXY_ATTESTATION_MODE: &str = "X-Venice-Proxy-Attestation-Mode";
@@ -35,21 +37,46 @@ pub const HEADER_PROXY_ERROR_CODE: &str = "X-Venice-Proxy-Error-Code";
 #[derive(Debug, Clone)]
 pub struct AppState {
     config: Arc<ProxyConfig>,
+    venice_client: VeniceClient,
 }
 
 impl AppState {
-    pub fn new(config: ProxyConfig) -> Self {
+    pub fn new(config: ProxyConfig) -> Result<Self, VeniceClientError> {
+        let venice_client = VeniceClient::from_config(&config)?;
+        Ok(Self::from_parts(config, venice_client))
+    }
+
+    pub fn from_parts(config: ProxyConfig, venice_client: VeniceClient) -> Self {
         Self {
             config: Arc::new(config),
+            venice_client,
         }
     }
 
     pub fn config(&self) -> &ProxyConfig {
         &self.config
     }
+
+    pub fn venice_client(&self) -> &VeniceClient {
+        &self.venice_client
+    }
 }
 
-pub fn router(config: ProxyConfig) -> Router {
+/// Builds the HTTP router using the configured Venice API key environment
+/// variable.
+pub fn router(config: ProxyConfig) -> Result<Router, VeniceClientError> {
+    Ok(router_from_state(AppState::new(config)?))
+}
+
+/// Builds the HTTP router with an already-constructed Venice client.
+///
+/// This keeps route tests deterministic without mutating process-wide
+/// environment variables.
+pub fn router_with_venice_client(config: ProxyConfig, venice_client: VeniceClient) -> Router {
+    router_from_state(AppState::from_parts(config, venice_client))
+}
+
+fn router_from_state(state: AppState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models).fallback(method_not_allowed))
         .route(
@@ -57,20 +84,19 @@ pub fn router(config: ProxyConfig) -> Router {
             post(create_chat_completion).fallback(method_not_allowed),
         )
         .fallback(not_found)
-        .with_state(AppState::new(config))
+        .with_state(state)
 }
 
-/// Serves the configured router on an already-bound listener.
-pub async fn serve(listener: TcpListener, config: ProxyConfig) -> std::io::Result<()> {
-    axum::serve(listener, router(config)).await
+/// Serves an already-built router on an already-bound listener.
+pub async fn serve(listener: TcpListener, router: Router) -> io::Result<()> {
+    axum::serve(listener, router).await
 }
 
-async fn list_models(State(_state): State<AppState>) -> ProxyError {
-    ProxyError::NotImplemented {
-        message:
-            "GET /v1/models is registered but not available yet."
-                .to_owned(),
-    }
+async fn list_models(State(state): State<AppState>) -> Result<Response, ProxyError> {
+    let models = state.venice_client().list_models().await?;
+    let mut response = Json(models).into_response();
+    ProxyMetadataHeaders::from_config(state.config()).apply(response.headers_mut());
+    Ok(response)
 }
 
 async fn create_chat_completion(
@@ -95,8 +121,10 @@ async fn not_found(uri: Uri) -> ProxyError {
     ProxyError::NotFound { uri }
 }
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum ProxyError {
+    #[error(transparent)]
+    Venice(#[from] VeniceClientError),
     #[error("{message}")]
     NotImplemented { message: String },
     #[error("method {method} is not supported for {uri}")]
@@ -108,6 +136,7 @@ pub enum ProxyError {
 impl ProxyError {
     fn status(&self) -> StatusCode {
         match self {
+            Self::Venice(_) => StatusCode::BAD_GATEWAY,
             Self::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
@@ -116,6 +145,7 @@ impl ProxyError {
 
     fn error_type(&self) -> &'static str {
         match self {
+            Self::Venice(error) => error.api_error_type(),
             Self::NotImplemented { .. } => "proxy_not_implemented",
             Self::MethodNotAllowed { .. } | Self::NotFound { .. } => "invalid_request_error",
         }
@@ -123,6 +153,7 @@ impl ProxyError {
 
     fn code(&self) -> &'static str {
         match self {
+            Self::Venice(error) => error.api_error_code(),
             Self::NotImplemented { .. } => "not_implemented",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
             Self::NotFound { .. } => "not_found",
@@ -142,7 +173,8 @@ impl IntoResponse for ProxyError {
 }
 
 ///
-/// attestation, key-binding, or session verification that has not happened yet.
+/// Fields are optional so handlers never claim E2EE, attestation, key-binding,
+/// or session verification that has not happened yet.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProxyMetadataHeaders {
     pub e2ee: Option<String>,
@@ -241,8 +273,23 @@ fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+
+    fn test_app() -> Router {
+        router_with_venice_client(ProxyConfig::default(), test_venice_client())
+    }
+
+    fn test_venice_client() -> VeniceClient {
+        VeniceClient::new(
+            "http://127.0.0.1:1/api/v1",
+            "test-api-key",
+            Duration::from_secs(1),
+        )
+        .expect("test Venice client should build")
+    }
 
     async fn error_body(response: Response) -> ErrorResponse {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -252,15 +299,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_routes_return_not_implemented_placeholders() {
-        let app = router(ProxyConfig::default());
-
-        let response = app
-            .clone()
+    async fn chat_route_returns_not_implemented_placeholder() {
+        let response = test_app()
             .oneshot(
                 Request::builder()
-                    .uri("/v1/models")
-                    .body(Body::empty())
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"example","messages":[]}"#))
                     .expect("request should build"),
             )
             .await
@@ -274,27 +320,11 @@ mod tests {
         let body = error_body(response).await;
         assert_eq!(body.error.kind, "proxy_not_implemented");
         assert_eq!(body.error.code, "not_implemented");
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"model":"example","messages":[]}"#))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
-
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = error_body(response).await;
-        assert_eq!(body.error.code, "not_implemented");
     }
 
     #[tokio::test]
     async fn unknown_route_returns_openai_style_not_found() {
-        let response = router(ProxyConfig::default())
+        let response = test_app()
             .oneshot(
                 Request::builder()
                     .uri("/v1/unknown")
@@ -316,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_method_returns_openai_style_method_error() {
-        let response = router(ProxyConfig::default())
+        let response = test_app()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -339,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_chat_json_uses_axum_extractor_rejection() {
-        let response = router(ProxyConfig::default())
+        let response = test_app()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -357,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_object_chat_json_uses_axum_extractor_rejection() {
-        let response = router(ProxyConfig::default())
+        let response = test_app()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
