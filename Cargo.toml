@@ -1,0 +1,6 @@
+[package]
+name = "venice-e2ee-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
