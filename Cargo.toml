@@ -4,15 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+hkdf = "0.12"
+polyval = { version = "0.6", features = ["zeroize"] }
 serde = { version = "1.0", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["macros", "net", "rt-multi-thread", "time"] }
 toml = "0.8"
-k256 = "0.13"
+k256 = { version = "0.13", features = ["ecdh"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 uuid = { version = "1.11", features = ["v4"] }
 zeroize = "1.8"
