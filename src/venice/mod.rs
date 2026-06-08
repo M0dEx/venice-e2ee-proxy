@@ -4,15 +4,25 @@
 
 use std::{fmt, sync::Arc, time::Duration};
 
-use reqwest::{Url, header::ACCEPT};
+use reqwest::{
+    Url,
+    header::{ACCEPT, CONTENT_TYPE},
+};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
     config::{ConfigError, ProxyConfig},
-    openai::{ModelCapabilities, ModelListResponse, ModelObject, VeniceModelMetadata},
+    openai::{
+        ModelCapabilities, ModelListResponse, ModelObject, VeniceModelMetadata,
+        chat::VeniceE2eeChatRequest,
+    },
 };
+
+pub const HEADER_VENICE_TEE_CLIENT_PUB_KEY: &str = "X-Venice-TEE-Client-Pub-Key";
+pub const HEADER_VENICE_TEE_MODEL_PUB_KEY: &str = "X-Venice-TEE-Model-Pub-Key";
+pub const HEADER_VENICE_TEE_SIGNING_ALGO: &str = "X-Venice-TEE-Signing-Algo";
 
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -81,6 +91,42 @@ impl VeniceClient {
         parse_model_list_response(&body)
     }
 
+    pub async fn create_chat_completion_stream(
+        &self,
+        request: &VeniceE2eeChatRequest,
+        client_public_key_hex: &str,
+        model_public_key_hex: &str,
+    ) -> Result<reqwest::Response, VeniceClientError> {
+        let url = self.chat_completions_url()?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(self.api_key.as_ref())
+            .header(ACCEPT, "text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .header(HEADER_VENICE_TEE_CLIENT_PUB_KEY, client_public_key_hex)
+            .header(HEADER_VENICE_TEE_MODEL_PUB_KEY, model_public_key_hex)
+            .header(HEADER_VENICE_TEE_SIGNING_ALGO, "ecdsa")
+            .json(request)
+            .send()
+            .await
+            .map_err(VeniceClientError::request_failure)?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(VeniceClientError::Authentication {
+                status: status.as_u16(),
+            });
+        }
+        if !status.is_success() {
+            return Err(VeniceClientError::UpstreamStatus {
+                status: status.as_u16(),
+            });
+        }
+
+        Ok(response)
+    }
+
     pub async fn fetch_attestation_evidence(
         &self,
         model_id: &str,
@@ -117,6 +163,14 @@ impl VeniceClient {
     fn models_url(&self) -> Result<Url, VeniceClientError> {
         self.base_url
             .join("models")
+            .map_err(|source| VeniceClientError::EndpointUrl {
+                message: source.to_string(),
+            })
+    }
+
+    fn chat_completions_url(&self) -> Result<Url, VeniceClientError> {
+        self.base_url
+            .join("chat/completions")
             .map_err(|source| VeniceClientError::EndpointUrl {
                 message: source.to_string(),
             })
