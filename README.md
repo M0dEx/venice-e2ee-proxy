@@ -44,10 +44,17 @@ Use direct Cargo commands only.
 - `src/tools`: OpenAI-style tool-call emulation.
 
 
+## Attestation v0.1 notes
+
+- `src/attestation` generates a fresh 32-byte nonce and fetches `/tee/attestation` per verification call; it does not maintain an internal cache. Successful results are intended to be cached only by session state according to the session TTL/request limits.
+- Basic envelope checks, secp256k1 signing-key normalization, Ethereum-style signing-address checks, debug-policy gates, and TDX/NVIDIA policy surfaces are implemented fail-closed.
+- Full Intel DCAP/QVL and NVIDIA NRAS cryptographic verifier backends are not linked in v0.1. When `attestation.require_tdx = true` or NVIDIA evidence is required/present under verification policy, the verifier returns a structured `attestation_verifier_unavailable` error rather than allowing encrypted chat.
+
 ## Tests
 
 - Unit tests in `src/config` cover defaults, validation, and safe Venice API key lookup.
 - Unit tests in `src/venice` cover Venice-to-OpenAI model mapping, missing optional metadata defaults, malformed upstream model payloads, and API-key redaction in debug output.
+- Unit tests in `src/attestation` cover valid evidence, missing fields, debug evidence, required TDX/NVIDIA failures, malformed upstream evidence, and upstream fetch failures.
 - Unit tests in `src/http` cover route registration, unknown routes/methods, Axum JSON extractor rejections for malformed/non-object JSON, and safe header helpers.
 - Unit tests in `src/main.rs` cover the optional config path CLI shape.
 - `src/lib.rs` still verifies the module boundary list.

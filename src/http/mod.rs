@@ -15,6 +15,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 
 use crate::{
+    attestation::{AttestationError, AttestationVerifier},
     config::ProxyConfig,
     keys::ProxyInstanceKey,
     openai::ErrorResponse,
@@ -42,6 +43,7 @@ pub struct AppState {
     venice_client: VeniceClient,
     proxy_instance_key: Option<ProxyInstanceKey>,
     session_manager: SessionManager,
+    attestation_verifier: AttestationVerifier,
 }
 
 impl AppState {
@@ -53,12 +55,14 @@ impl AppState {
     pub fn from_parts(config: ProxyConfig, venice_client: VeniceClient) -> Self {
         let proxy_instance_key = ProxyInstanceKey::generate_from_config(&config.keys);
         let session_manager = SessionManager::new(config.session.clone());
+        let attestation_verifier = AttestationVerifier::from_config(&config, venice_client.clone());
 
         Self {
             config: Arc::new(config),
             venice_client,
             proxy_instance_key,
             session_manager,
+            attestation_verifier,
         }
     }
 
@@ -76,6 +80,10 @@ impl AppState {
 
     pub fn session_manager(&self) -> &SessionManager {
         &self.session_manager
+    }
+
+    pub fn attestation_verifier(&self) -> &AttestationVerifier {
+        &self.attestation_verifier
     }
 }
 
@@ -142,6 +150,8 @@ async fn not_found(uri: Uri) -> ProxyError {
 pub enum ProxyError {
     #[error(transparent)]
     Venice(#[from] VeniceClientError),
+    #[error(transparent)]
+    Attestation(#[from] AttestationError),
     #[error("{message}")]
     NotImplemented { message: String },
     #[error("method {method} is not supported for {uri}")]
@@ -154,6 +164,10 @@ impl ProxyError {
     fn status(&self) -> StatusCode {
         match self {
             Self::Venice(_) => StatusCode::BAD_GATEWAY,
+            Self::Attestation(error) if error.verifier_unavailable() => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::Attestation(_) => StatusCode::BAD_GATEWAY,
             Self::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
@@ -163,6 +177,7 @@ impl ProxyError {
     fn error_type(&self) -> &'static str {
         match self {
             Self::Venice(error) => error.api_error_type(),
+            Self::Attestation(error) => error.api_error_type(),
             Self::NotImplemented { .. } => "proxy_not_implemented",
             Self::MethodNotAllowed { .. } | Self::NotFound { .. } => "invalid_request_error",
         }
@@ -171,6 +186,7 @@ impl ProxyError {
     fn code(&self) -> &'static str {
         match self {
             Self::Venice(error) => error.api_error_code(),
+            Self::Attestation(error) => error.api_error_code(),
             Self::NotImplemented { .. } => "not_implemented",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
             Self::NotFound { .. } => "not_found",
@@ -317,6 +333,10 @@ mod tests {
             .expect("default config should generate startup key");
         assert_eq!(key.public_key_hex().len(), 130);
         assert!(state.session_manager().is_empty().unwrap());
+        assert_eq!(
+            state.attestation_verifier().policy(),
+            &ProxyConfig::default().attestation
+        );
 
         let mut config = ProxyConfig::default();
         config.keys.generate_proxy_instance_key_on_startup = false;

@@ -6,6 +6,7 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use reqwest::{Url, header::ACCEPT};
 use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
@@ -80,12 +81,57 @@ impl VeniceClient {
         parse_model_list_response(&body)
     }
 
+    pub async fn fetch_attestation_evidence(
+        &self,
+        model_id: &str,
+        nonce: &str,
+    ) -> Result<Value, VeniceClientError> {
+        let url = self.attestation_url(model_id, nonce)?;
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(self.api_key.as_ref())
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(VeniceClientError::request_failure)?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(VeniceClientError::Authentication {
+                status: status.as_u16(),
+            });
+        }
+        if !status.is_success() {
+            return Err(VeniceClientError::UpstreamStatus {
+                status: status.as_u16(),
+            });
+        }
+
+        response
+            .json::<Value>()
+            .await
+            .map_err(VeniceClientError::malformed_attestation_payload)
+    }
+
     fn models_url(&self) -> Result<Url, VeniceClientError> {
         self.base_url
             .join("models")
             .map_err(|source| VeniceClientError::EndpointUrl {
                 message: source.to_string(),
             })
+    }
+
+    fn attestation_url(&self, model_id: &str, nonce: &str) -> Result<Url, VeniceClientError> {
+        let mut url = self.base_url.join("tee/attestation").map_err(|source| {
+            VeniceClientError::EndpointUrl {
+                message: source.to_string(),
+            }
+        })?;
+        url.query_pairs_mut()
+            .append_pair("model", model_id)
+            .append_pair("nonce", nonce);
+        Ok(url)
     }
 }
 
@@ -138,6 +184,8 @@ pub enum VeniceClientError {
     Request { message: String },
     #[error("Venice upstream returned malformed model payload: {message}")]
     MalformedPayload { message: String },
+    #[error("Venice upstream returned malformed attestation payload: {message}")]
+    MalformedAttestationPayload { message: String },
 }
 
 impl VeniceClientError {
@@ -151,7 +199,8 @@ impl VeniceClientError {
             Self::UpstreamStatus { .. }
             | Self::Timeout
             | Self::Request { .. }
-            | Self::MalformedPayload { .. } => "proxy_upstream_error",
+            | Self::MalformedPayload { .. }
+            | Self::MalformedAttestationPayload { .. } => "proxy_upstream_error",
         }
     }
 
@@ -167,7 +216,9 @@ impl VeniceClientError {
             Self::UpstreamStatus { .. } => "upstream_status_error",
             Self::Timeout => "upstream_timeout",
             Self::Request { .. } => "upstream_unavailable",
-            Self::MalformedPayload { .. } => "upstream_malformed_response",
+            Self::MalformedPayload { .. } | Self::MalformedAttestationPayload { .. } => {
+                "upstream_malformed_response"
+            }
         }
     }
 
@@ -189,6 +240,12 @@ impl VeniceClientError {
 
     fn malformed_payload(source: serde_json::Error) -> Self {
         Self::MalformedPayload {
+            message: source.to_string(),
+        }
+    }
+
+    fn malformed_attestation_payload(source: reqwest::Error) -> Self {
+        Self::MalformedAttestationPayload {
             message: source.to_string(),
         }
     }

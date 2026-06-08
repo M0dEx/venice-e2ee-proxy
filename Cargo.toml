@@ -11,10 +11,12 @@ clap = { version = "4.5", features = ["derive"] }
 ghash = { version = "0.5", features = ["zeroize"] }
 hkdf = "0.12"
 polyval = { version = "0.6", features = ["zeroize"] }
+base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1.0"
 sha2 = "0.10"
+sha3 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["macros", "net", "rt-multi-thread", "time"] }
 toml = "0.8"

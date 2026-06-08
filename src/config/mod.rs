@@ -303,14 +303,18 @@ impl fmt::Display for AttestationMode {
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NvidiaRequirement {
+    Required,
     #[default]
     WhenPresent,
+    Never,
 }
 
 impl NvidiaRequirement {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Required => "required",
             Self::WhenPresent => "when_present",
+            Self::Never => "never",
         }
     }
 }
@@ -531,6 +535,8 @@ mod tests {
             config.attestation.require_nvidia,
             NvidiaRequirement::WhenPresent
         );
+        assert_eq!(NvidiaRequirement::Required.as_str(), "required");
+        assert_eq!(NvidiaRequirement::Never.as_str(), "never");
         assert!(!config.attestation.allow_debug);
         assert_eq!(config.attestation.pccs_url, "");
         assert_eq!(
