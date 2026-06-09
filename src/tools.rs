@@ -269,9 +269,7 @@ impl ToolEmulationContext {
         let inner_start = self.config.marker_start.len();
         let inner_end = trimmed.len() - self.config.marker_end.len();
         let inner = trimmed[inner_start..inner_end].trim();
-        let value: Value = serde_json::from_str(inner).map_err(|source| {
-            ToolCallValidationError::new(format!("tool call JSON is invalid: {source}"))
-        })?;
+        let value = parse_tool_call_json(inner)?;
         let object = value
             .as_object()
             .ok_or_else(|| ToolCallValidationError::new("tool call JSON must be an object"))?;
@@ -310,6 +308,16 @@ impl ToolEmulationContext {
             arguments_json,
         })
     }
+}
+
+fn parse_tool_call_json(input: &str) -> Result<Value, ToolCallValidationError> {
+    serde_json::from_str(input).or_else(|strict_error| {
+        json5::from_str(input).map_err(|json5_error| {
+            ToolCallValidationError::new(format!(
+                "tool call JSON is invalid: {strict_error}; JSON5 fallback failed: {json5_error}"
+            ))
+        })
+    })
 }
 
 fn extract_tool_call_name_and_arguments<'a>(
@@ -917,6 +925,8 @@ mod tests {
             r#"<tool_call>{"function":{"name":"search_web","arguments":{"query":"Venice"}}}</tool_call>"#,
             r#"<tool_call>{"function":{"name":"search_web","parameters":{"query":"Venice"}}}</tool_call>"#,
             r#"<tool_call>{"type":"function","name":"search_web","arguments":"{\"query\":\"Venice\"}"}</tool_call>"#,
+            r#"<tool_call>{'name':'search_web','arguments':{'query':'Venice'}}</tool_call>"#,
+            r#"<tool_call>{name: 'search_web', arguments: {query: 'Venice'}}</tool_call>"#,
         ] {
             let tool_call = context
                 .validate_marker(marker)
