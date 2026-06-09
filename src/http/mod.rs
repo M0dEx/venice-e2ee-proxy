@@ -1,7 +1,6 @@
 //! HTTP server, route wiring, shared headers, and route errors.
 //!
-//! adds request-side chat normalization and Venice E2EE payload construction while
-//! response transformation remains deferred.
+//! construction, and encrypted response transformation.
 
 use std::{
     io,
@@ -161,13 +160,6 @@ async fn create_chat_completion(
         E2eeCodec::from_config(&state.config().e2ee).map_err(ChatConstructionError::E2ee)?;
     let prepared = request.into_venice_e2ee_request(&codec, model_public_key)?;
 
-    if !prepared.client_stream {
-        return Err(ProxyError::NotImplemented {
-            message: "Encrypted Venice chat request construction is complete; non-streaming response transformation is not available yet."
-                .to_owned(),
-        });
-    }
-
     let upstream = state
         .venice_client()
         .create_chat_completion_stream(
@@ -176,15 +168,27 @@ async fn create_chat_completion(
             model_public_key,
         )
         .await?;
+    let metadata = ProxyMetadataHeaders::for_verified_chat(state.config(), &session);
 
-    Ok(openai_chat_sse_response(
-        upstream,
-        codec,
-        proxy_instance_key.clone(),
-        request.model,
-        request.stream_options.include_usage.unwrap_or(false),
-        ProxyMetadataHeaders::for_verified_chat(state.config(), &session),
-    ))
+    if prepared.client_stream {
+        Ok(openai_chat_sse_response(
+            upstream,
+            codec,
+            proxy_instance_key.clone(),
+            request.model,
+            request.stream_options.include_usage.unwrap_or(false),
+            metadata,
+        ))
+    } else {
+        openai_chat_buffered_response(
+            upstream,
+            codec,
+            proxy_instance_key.clone(),
+            request.model,
+            metadata,
+        )
+        .await
+    }
 }
 
 async fn ensure_attested_session(
@@ -209,6 +213,59 @@ async fn ensure_attested_session(
     Ok(state
         .session_manager()
         .set_attested_model_state(&session.session_key, state_update)?)
+}
+
+async fn openai_chat_buffered_response(
+    upstream: reqwest::Response,
+    codec: E2eeCodec,
+    proxy_instance_key: ProxyInstanceKey,
+    fallback_model: String,
+    metadata: ProxyMetadataHeaders,
+) -> Result<Response, ProxyError> {
+    let completion =
+        buffer_openai_chat_completion(upstream, codec, proxy_instance_key, fallback_model).await?;
+    let mut response = Json(completion).into_response();
+    metadata.apply(response.headers_mut());
+    Ok(response)
+}
+
+async fn buffer_openai_chat_completion(
+    mut upstream: reqwest::Response,
+    codec: E2eeCodec,
+    proxy_instance_key: ProxyInstanceKey,
+    fallback_model: String,
+) -> Result<Value, ChatStreamError> {
+    let mut parser = SseEventParser::default();
+    let mut transformer =
+        OpenAiChatCompletionBuffer::new(codec, proxy_instance_key, fallback_model);
+    let mut upstream_done = false;
+
+    while let Some(chunk) = upstream
+        .chunk()
+        .await
+        .map_err(ChatStreamError::upstream_stream)?
+    {
+        let chunk = std::str::from_utf8(&chunk).map_err(ChatStreamError::invalid_utf8)?;
+        for event in parser.push(chunk)? {
+            if transformer.handle_event(event)? {
+                upstream_done = true;
+                break;
+            }
+        }
+
+        if upstream_done {
+            break;
+        }
+    }
+
+    if !upstream_done {
+        parser.finish()?;
+        return Err(ChatStreamError::malformed_event(
+            "upstream stream ended before data: [DONE]",
+        ));
+    }
+
+    transformer.into_response()
 }
 
 fn openai_chat_sse_response(
@@ -328,6 +385,178 @@ impl SseEventParser {
 struct RawSseEvent {
     event: Option<String>,
     data: String,
+}
+
+struct OpenAiChatCompletionBuffer {
+    codec: E2eeCodec,
+    proxy_instance_key: ProxyInstanceKey,
+    fallback_id: String,
+    fallback_created: i64,
+    fallback_model: String,
+    id: Option<String>,
+    created: Option<i64>,
+    model: Option<String>,
+    choice_index: Option<u64>,
+    saw_encrypted_content: bool,
+    content: String,
+    finish_reason: Option<Value>,
+    usage: Option<Value>,
+}
+
+impl OpenAiChatCompletionBuffer {
+    fn new(codec: E2eeCodec, proxy_instance_key: ProxyInstanceKey, fallback_model: String) -> Self {
+        Self {
+            codec,
+            proxy_instance_key,
+            fallback_id: format!("chatcmpl-local-{}", uuid::Uuid::new_v4()),
+            fallback_created: unix_timestamp_now(),
+            fallback_model,
+            id: None,
+            created: None,
+            model: None,
+            choice_index: None,
+            saw_encrypted_content: false,
+            content: String::new(),
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    fn handle_event(&mut self, event: RawSseEvent) -> Result<bool, ChatStreamError> {
+        if event.event.as_deref() == Some("error") {
+            return Err(ChatStreamError::upstream_event(event.data));
+        }
+
+        if event.data.trim() == "[DONE]" {
+            if !self.saw_encrypted_content {
+                self.codec
+                    .decrypt_response_content(None, self.proxy_instance_key.private_key())
+                    .map_err(ChatStreamError::decryption)?;
+            }
+            if self.finish_reason.is_none() {
+                self.finish_reason = Some(Value::String("stop".to_owned()));
+            }
+            return Ok(true);
+        }
+
+        let value: Value =
+            serde_json::from_str(&event.data).map_err(ChatStreamError::json_event)?;
+        if let Some(error) = value.get("error") {
+            return Err(ChatStreamError::upstream_event(error.to_string()));
+        }
+
+        self.record_metadata(&value);
+
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            return Err(ChatStreamError::malformed_event(
+                "upstream chat chunk is missing choices array",
+            ));
+        };
+
+        if choices.is_empty() {
+            return self.handle_usage_chunk(&value).map(|()| false);
+        }
+        if choices.len() != 1 {
+            return Err(ChatStreamError::malformed_event(format!(
+                "expected exactly one upstream choice, got {}",
+                choices.len(),
+            )));
+        }
+
+        self.handle_choice_chunk(&choices[0])?;
+        Ok(false)
+    }
+
+    fn handle_usage_chunk(&mut self, value: &Value) -> Result<(), ChatStreamError> {
+        let Some(usage) = value.get("usage") else {
+            return Err(ChatStreamError::malformed_event(
+                "upstream chunk has no choices and no usage",
+            ));
+        };
+
+        self.usage = Some(usage.clone());
+        Ok(())
+    }
+
+    fn handle_choice_chunk(&mut self, choice: &Value) -> Result<(), ChatStreamError> {
+        let choice = choice.as_object().ok_or_else(|| {
+            ChatStreamError::malformed_event("upstream choice must be a JSON object")
+        })?;
+        let index = normalized_choice_index(choice.get("index"))?;
+        match self.choice_index {
+            Some(existing) if existing != index => {
+                return Err(ChatStreamError::malformed_event(
+                    "upstream choice index changed while buffering a completion",
+                ));
+            }
+            None => self.choice_index = Some(index),
+            Some(_) => {}
+        }
+
+        let finish_reason = normalized_finish_reason(choice.get("finish_reason"))?;
+        let delta = choice.get("delta").unwrap_or(&Value::Null);
+        let content = delta
+            .get("content")
+            .map(|content| {
+                content.as_str().ok_or_else(|| {
+                    ChatStreamError::malformed_event("upstream delta.content must be a string")
+                })
+            })
+            .transpose()?;
+
+        if let Some(content) = content {
+            let decrypted = self
+                .codec
+                .decrypt_response_content(Some(content), self.proxy_instance_key.private_key())
+                .map_err(ChatStreamError::decryption)?;
+            self.saw_encrypted_content = true;
+            if let Some(content) = decrypted {
+                self.content.push_str(&content);
+            }
+        }
+
+        if !finish_reason.is_null() {
+            self.finish_reason = Some(finish_reason);
+        }
+
+        Ok(())
+    }
+
+    fn record_metadata(&mut self, value: &Value) {
+        if self.id.is_none()
+            && let Some(id) = string_field(value, "id")
+        {
+            self.id = Some(id.to_owned());
+        }
+        if self.created.is_none()
+            && let Some(created) = integer_field(value, "created")
+        {
+            self.created = Some(created);
+        }
+        if self.model.is_none()
+            && let Some(model) = string_field(value, "model")
+        {
+            self.model = Some(model.to_owned());
+        }
+    }
+
+    fn into_response(self) -> Result<Value, ChatStreamError> {
+        Ok(json!({
+            "id": self.id.unwrap_or(self.fallback_id),
+            "object": "chat.completion",
+            "created": self.created.unwrap_or(self.fallback_created),
+            "model": self.model.unwrap_or(self.fallback_model),
+            "choices": [{
+                "index": self.choice_index.unwrap_or(0),
+                "message": {
+                    "role": "assistant",
+                    "content": self.content,
+                },
+                "finish_reason": self.finish_reason.unwrap_or_else(|| Value::String("stop".to_owned())),
+            }],
+            "usage": self.usage.unwrap_or(Value::Null),
+        }))
+    }
 }
 
 fn sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
@@ -561,19 +790,7 @@ impl OpenAiChatStreamTransformer {
         delta: Value,
         finish_reason: Value,
     ) -> Result<Value, ChatStreamError> {
-        let index = match index {
-            Some(Value::Number(number)) => number.as_u64().ok_or_else(|| {
-                ChatStreamError::malformed_event(
-                    "upstream choice index must be a non-negative integer",
-                )
-            })?,
-            Some(_) => {
-                return Err(ChatStreamError::malformed_event(
-                    "upstream choice index must be a non-negative integer",
-                ));
-            }
-            None => 0,
-        };
+        let index = normalized_choice_index(index)?;
 
         Ok(json!({
             "id": string_field(upstream, "id").unwrap_or(&self.fallback_id),
@@ -593,6 +810,18 @@ impl OpenAiChatStreamTransformer {
 enum StreamOutput {
     Json(Value),
     Done,
+}
+
+fn normalized_choice_index(index: Option<&Value>) -> Result<u64, ChatStreamError> {
+    match index {
+        Some(Value::Number(number)) => number.as_u64().ok_or_else(|| {
+            ChatStreamError::malformed_event("upstream choice index must be a non-negative integer")
+        }),
+        Some(_) => Err(ChatStreamError::malformed_event(
+            "upstream choice index must be a non-negative integer",
+        )),
+        None => Ok(0),
+    }
 }
 
 fn normalized_finish_reason(value: Option<&Value>) -> Result<Value, ChatStreamError> {
@@ -1120,6 +1349,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_route_returns_buffered_non_streaming_completion() {
+        let response = chat_response(
+            "chat-route-non-streaming-success",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+            vec![
+                MockStreamFrame::Text("Hello"),
+                MockStreamFrame::Text(" world"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(HEADER_PROXY_E2EE).unwrap(),
+            "verified"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["id"], "chatcmpl-upstream-test");
+        assert_eq!(body["created"], 1_717_171_717);
+        assert_eq!(body["model"], "e2ee-test");
+        assert_eq!(body["choices"][0]["index"], 0);
+        assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert!(body["usage"].is_null());
+    }
+
+    #[tokio::test]
+    async fn chat_route_treats_omitted_stream_as_buffered_non_streaming() {
+        let response = chat_response(
+            "chat-route-omitted-stream",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}]}"#,
+            vec![MockStreamFrame::Text("Hello"), MockStreamFrame::Done],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn chat_route_non_streaming_fails_closed_on_upstream_error_response() {
+        let response = chat_response_with_upstream_status(
+            "chat-route-non-streaming-upstream-error",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(HEADER_PROXY_ERROR_CODE).unwrap(),
+            "upstream_status_error"
+        );
+        let body = error_body(response).await;
+        assert_eq!(body.error.kind, "proxy_upstream_error");
+        assert_eq!(body.error.code, "upstream_status_error");
+    }
+
+    #[tokio::test]
+    async fn chat_route_non_streaming_fails_closed_on_malformed_upstream_payload() {
+        let response = chat_response(
+            "chat-route-non-streaming-malformed",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+            vec![MockStreamFrame::Raw("data: {\"choices\":\"bad\"}\n\n")],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(HEADER_PROXY_ERROR_CODE).unwrap(),
+            "upstream_malformed_response"
+        );
+        let body = error_body(response).await;
+        assert_eq!(body.error.kind, "proxy_upstream_error");
+        assert_eq!(body.error.code, "upstream_malformed_response");
+    }
+
+    #[tokio::test]
+    async fn chat_route_non_streaming_fails_closed_on_missing_encrypted_content() {
+        let response = chat_response(
+            "chat-route-non-streaming-missing-content",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+            vec![MockStreamFrame::Finish("stop"), MockStreamFrame::Done],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(HEADER_PROXY_ERROR_CODE).unwrap(),
+            "e2ee_response_decryption_failed"
+        );
+        let body = error_body(response).await;
+        assert_eq!(body.error.kind, "proxy_e2ee_error");
+        assert_eq!(body.error.code, "e2ee_response_decryption_failed");
+    }
+
+    #[tokio::test]
+    async fn chat_route_non_streaming_fails_closed_on_decryption_failure() {
+        let response = chat_response(
+            "chat-route-non-streaming-decryption-failure",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+            vec![MockStreamFrame::TextForWrongRecipient(" secret"), MockStreamFrame::Done],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(HEADER_PROXY_ERROR_CODE).unwrap(),
+            "e2ee_response_decryption_failed"
+        );
+        let body = error_body(response).await;
+        assert_eq!(body.error.kind, "proxy_e2ee_error");
+        assert_eq!(body.error.code, "e2ee_response_decryption_failed");
+    }
+
+    #[tokio::test]
+    async fn chat_route_non_streaming_passes_through_usage_when_available() {
+        let response = chat_response(
+            "chat-route-non-streaming-usage",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+            vec![
+                MockStreamFrame::Text("Hello"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Usage,
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(body["usage"]["prompt_tokens"], 1);
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+        assert_eq!(body["usage"]["total_tokens"], 3);
+    }
+
+    #[tokio::test]
     async fn chat_route_fails_closed_on_upstream_stream_error_event() {
         let response = streaming_chat_response(
             "chat-route-upstream-error",
@@ -1316,8 +1690,35 @@ mod tests {
         request_body: &'static str,
         frames: Vec<MockStreamFrame>,
     ) -> Response {
+        chat_response(session_id, request_body, frames).await
+    }
+
+    async fn chat_response(
+        session_id: &'static str,
+        request_body: &'static str,
+        frames: Vec<MockStreamFrame>,
+    ) -> Response {
         let model_public_key = ProxyInstanceKey::generate().public_key_hex().to_owned();
         let base_url = spawn_streaming_venice_server(model_public_key, true, frames).await;
+        request_chat(session_id, request_body, base_url).await
+    }
+
+    async fn chat_response_with_upstream_status(
+        session_id: &'static str,
+        request_body: &'static str,
+        upstream_status: StatusCode,
+    ) -> Response {
+        let model_public_key = ProxyInstanceKey::generate().public_key_hex().to_owned();
+        let base_url =
+            spawn_venice_server_with_chat_status(model_public_key, upstream_status).await;
+        request_chat(session_id, request_body, base_url).await
+    }
+
+    async fn request_chat(
+        session_id: &'static str,
+        request_body: &'static str,
+        base_url: String,
+    ) -> Response {
         let app = router_with_venice_client(
             chat_config_with_basic_test_attestation(),
             test_venice_client_for_base_url(base_url),
@@ -1334,6 +1735,13 @@ mod tests {
         )
         .await
         .expect("request should complete")
+    }
+
+    async fn json_body(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should buffer");
+        serde_json::from_slice(&bytes).expect("response should be JSON")
     }
 
     async fn response_body(response: Response) -> String {
@@ -1435,6 +1843,49 @@ mod tests {
                         )
                     }
                 }),
+            );
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock Venice listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock Venice listener should have local address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock Venice server should run");
+        });
+
+        format!("http://{addr}/api/v1")
+    }
+
+    async fn spawn_venice_server_with_chat_status(
+        model_public_key: String,
+        upstream_status: StatusCode,
+    ) -> String {
+        let attestation_key = model_public_key.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/tee/attestation",
+                get(move |Query(query): Query<HashMap<String, String>>| {
+                    let model_public_key = attestation_key.clone();
+                    async move {
+                        Json(json!({
+                            "attestation": {
+                                "verified": true,
+                                "nonce": query.get("nonce").cloned().unwrap_or_default(),
+                                "model": query.get("model").cloned().unwrap_or_default(),
+                                "tee_provider": "tdx",
+                                "signing_key": model_public_key,
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/chat/completions",
+                post(move || async move { upstream_status }),
             );
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
