@@ -33,6 +33,7 @@ pub struct VeniceClient {
     http: reqwest::Client,
     base_url: Url,
     api_key: Arc<str>,
+    request_timeout: Duration,
 }
 
 impl VeniceClient {
@@ -52,7 +53,8 @@ impl VeniceClient {
     ) -> Result<Self, VeniceClientError> {
         let base_url = parse_base_url(base_url.as_ref())?;
         let http = reqwest::Client::builder()
-            .timeout(timeout)
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
             .build()
             .map_err(VeniceClientError::client_build)?;
 
@@ -60,6 +62,7 @@ impl VeniceClient {
             http,
             base_url,
             api_key: Arc::from(api_key.into()),
+            request_timeout: timeout,
         })
     }
 
@@ -70,6 +73,7 @@ impl VeniceClient {
             .get(url)
             .bearer_auth(self.api_key.as_ref())
             .header(ACCEPT, "application/json")
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(VeniceClientError::request_failure)?;
@@ -140,6 +144,7 @@ impl VeniceClient {
             .get(url)
             .bearer_auth(self.api_key.as_ref())
             .header(ACCEPT, "application/json")
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(VeniceClientError::request_failure)?;
@@ -407,6 +412,9 @@ impl VeniceCapabilities {
 mod tests {
     use super::*;
 
+    use axum::{Router, body::Body, response::IntoResponse, routing::post};
+    use tokio::net::TcpListener;
+
     #[test]
     fn maps_supported_venice_text_models_to_openai_shape() {
         let body = br#"
@@ -542,5 +550,73 @@ mod tests {
         assert!(debug.contains("/api/v1/"));
         assert!(debug.contains("[redacted]"));
         assert!(!debug.contains("super-secret-test-key"));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_can_outlive_configured_request_timeout_when_chunks_keep_arriving() {
+        async fn slow_streaming_chat() -> impl IntoResponse {
+            let stream = async_stream::stream! {
+                for index in 0..5 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    yield Ok::<_, std::io::Error>(format!("data: {index}\n\n"));
+                }
+                yield Ok::<_, std::io::Error>("data: [DONE]\n\n".to_owned());
+            };
+
+            (
+                [
+                    ("content-type", "text/event-stream"),
+                    ("cache-control", "no-cache"),
+                ],
+                Body::from_stream(stream),
+            )
+        }
+
+        let app = Router::new().route("/api/v1/chat/completions", post(slow_streaming_chat));
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should run");
+        });
+
+        let client = VeniceClient::new(
+            format!("http://{addr}/api/v1"),
+            "test-api-key",
+            Duration::from_millis(50),
+        )
+        .expect("client should build");
+        let request = VeniceE2eeChatRequest {
+            model: "e2ee-test".to_owned(),
+            messages: Vec::new(),
+            stream: true,
+            stream_options: crate::openai::chat::VeniceStreamOptions {
+                include_usage: false,
+            },
+            venice_parameters: crate::openai::chat::VeniceParameters::default(),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            stop: None,
+        };
+
+        let mut response = client
+            .create_chat_completion_stream(&request, "client-key", "model-key")
+            .await
+            .expect("stream response headers should arrive before timeout");
+        let mut chunks = 0;
+        while let Some(_chunk) = response
+            .chunk()
+            .await
+            .expect("frequent stream chunks should not hit total timeout")
+        {
+            chunks += 1;
+        }
+
+        assert!(chunks > 1);
     }
 }

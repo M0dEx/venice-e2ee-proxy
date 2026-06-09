@@ -1558,7 +1558,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         }
 
         if !finish_reason.is_null() && !self.sent_final_finish {
-            output.extend(self.flush_all_text(value, index)?);
+            output.extend(self.finish_pending_content(value, index)?);
             if !self.sent_final_finish {
                 output.push(StreamOutput::Json(self.chunk_with_choice(
                     value,
@@ -1660,16 +1660,49 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         self.emit_text(upstream, index, text)
     }
 
-    fn flush_all_text(
+    fn finish_pending_content(
         &mut self,
         upstream: &Value,
         index: u64,
     ) -> Result<Vec<StreamOutput>, ChatStreamError> {
         if self.tool_buffer.is_some() {
-            return Err(ChatStreamError::malformed_event(
-                "upstream stream ended with an incomplete tool call marker",
-            ));
+            return self.finish_incomplete_tool_call(upstream, index);
         }
+        self.flush_all_text(upstream, index)
+    }
+
+    fn finish_incomplete_tool_call(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        let Some(buffer) = self.tool_buffer.take() else {
+            return Ok(Vec::new());
+        };
+
+        let recovered_marker = format!("{}{}", buffer, self.tool_context.config().marker_end);
+        match self.tool_context.validate_marker(&recovered_marker) {
+            Ok(tool_call) => {
+                warn!("recovered streamed tool call with missing closing marker");
+                self.text_buffer.clear();
+                self.emit_tool_call(upstream, index, tool_call)
+            }
+            Err(error) => {
+                warn!(
+                    validation_error = %error,
+                    "discarding incomplete streamed tool call marker"
+                );
+                self.text_buffer.clear();
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn flush_all_text(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
         let text = std::mem::take(&mut self.text_buffer);
         self.emit_text(upstream, index, text)
     }
@@ -1759,7 +1792,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         upstream: Option<&Value>,
     ) -> Result<Vec<StreamOutput>, ChatStreamError> {
         let upstream = upstream.unwrap_or(&Value::Null);
-        let mut output = self.flush_all_text(upstream, 0)?;
+        let mut output = self.finish_pending_content(upstream, 0)?;
         if !self.sent_final_finish {
             output.push(StreamOutput::Json(self.chunk_with_choice(
                 upstream,
@@ -2547,6 +2580,66 @@ mod tests {
         let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
         assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(data[3], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn chat_route_recovers_streamed_tool_call_missing_closing_marker() {
+        let response = streaming_chat_response(
+            "chat-route-tool-stream-missing-close",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            vec![
+                MockStreamFrame::Text("I'll check that. "),
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 4);
+        let text_chunk: Value = serde_json::from_str(data[0]).expect("text chunk should be JSON");
+        assert_eq!(
+            text_chunk["choices"][0]["delta"]["content"],
+            "I'll check that. "
+        );
+        let tool_chunk: Value = serde_json::from_str(data[1]).expect("tool chunk should be JSON");
+        let tool_call = &tool_chunk["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tool_call["function"]["name"], "search_web");
+        assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
+        let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(data[3], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn chat_route_finishes_cleanly_on_unrecoverable_incomplete_tool_marker() {
+        let response = streaming_chat_response(
+            "chat-route-tool-stream-unrecoverable-marker",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            vec![
+                MockStreamFrame::Text("I'll check that. "),
+                MockStreamFrame::Text("<tool_call>{\"name\":"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 3);
+        let text_chunk: Value = serde_json::from_str(data[0]).expect("text chunk should be JSON");
+        assert_eq!(
+            text_chunk["choices"][0]["delta"]["content"],
+            "I'll check that. "
+        );
+        let final_chunk: Value = serde_json::from_str(data[1]).expect("final chunk should be JSON");
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+        assert_eq!(data[2], "[DONE]");
     }
 
     #[tokio::test]
