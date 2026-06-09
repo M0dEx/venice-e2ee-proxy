@@ -12,6 +12,9 @@ pub struct ChatCompletionRequest {
     pub stream_options: OpenAiStreamOptions,
     pub venice_parameters: VeniceParameters,
     pub passthrough: OpenAiPassthroughFields,
+    pub tools: Vec<ChatToolDefinition>,
+    pub tool_choice: ChatToolChoice,
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl ChatCompletionRequest {
@@ -33,6 +36,7 @@ impl ChatCompletionRequest {
                 "stop",
                 "tools",
                 "tool_choice",
+                "parallel_tool_calls",
                 "metadata",
                 "venice_parameters",
             ],
@@ -50,6 +54,11 @@ impl ChatCompletionRequest {
         let stream_options = OpenAiStreamOptions::parse(object.get("stream_options"))?;
         let venice_parameters = VeniceParameters::parse(object.get("venice_parameters"))?;
         let passthrough = OpenAiPassthroughFields::parse(object)?;
+        let tools = parse_tools(object.get("tools"))?;
+        validate_tools(&tools)?;
+        let tool_choice = parse_tool_choice(object.get("tool_choice"))?;
+        validate_tool_choice(&tool_choice)?;
+        let parallel_tool_calls = optional_bool(object, "parallel_tool_calls")?;
 
         Ok(Self {
             model,
@@ -58,6 +67,9 @@ impl ChatCompletionRequest {
             stream_options,
             venice_parameters,
             passthrough,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
         })
     }
 
@@ -66,9 +78,20 @@ impl ChatCompletionRequest {
         codec: &E2eeCodec,
         model_public_key_hex: &str,
     ) -> Result<PreparedVeniceChatRequest, ChatConstructionError> {
-        let encrypted_messages = self
-            .messages
+        self.into_venice_e2ee_request_with_messages(codec, model_public_key_hex, &[], &[])
+    }
+
+    pub fn into_venice_e2ee_request_with_messages(
+        &self,
+        codec: &E2eeCodec,
+        model_public_key_hex: &str,
+        prefix_messages: &[NormalizedChatMessage],
+        suffix_messages: &[NormalizedChatMessage],
+    ) -> Result<PreparedVeniceChatRequest, ChatConstructionError> {
+        let encrypted_messages = prefix_messages
             .iter()
+            .chain(self.messages.iter())
+            .chain(suffix_messages.iter())
             .map(|message| {
                 let content = codec
                     .encrypt_content(&message.content, model_public_key_hex)
@@ -105,12 +128,121 @@ pub struct NormalizedChatMessage {
 }
 
 impl NormalizedChatMessage {
-    fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
             content: content.into(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChatToolDefinition {
+    Function {
+        function: ChatToolFunctionDefinition,
+    },
+}
+
+impl ChatToolDefinition {
+    pub fn function(&self) -> &ChatToolFunctionDefinition {
+        match self {
+            Self::Function { function } => function,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.function().name
+    }
+
+    pub fn parameters_schema(&self) -> Option<&Map<String, Value>> {
+        self.function().parameters.as_ref().map(JsonSchema::as_map)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatToolFunctionDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<JsonSchema>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JsonSchema(Map<String, Value>);
+
+impl JsonSchema {
+    pub fn as_map(&self) -> &Map<String, Value> {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatToolChoice {
+    Auto,
+    None,
+    Required,
+    Function { name: String },
+}
+
+impl Default for ChatToolChoice {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl<'de> Deserialize<'de> for ChatToolChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        ChatToolChoiceWire::deserialize(deserializer).map(Self::from)
+    }
+}
+
+impl From<ChatToolChoiceWire> for ChatToolChoice {
+    fn from(value: ChatToolChoiceWire) -> Self {
+        match value {
+            ChatToolChoiceWire::Mode(ChatToolChoiceMode::Auto) => Self::Auto,
+            ChatToolChoiceWire::Mode(ChatToolChoiceMode::None) => Self::None,
+            ChatToolChoiceWire::Mode(ChatToolChoiceMode::Required) => Self::Required,
+            ChatToolChoiceWire::Object(ChatToolChoiceObject::Function { function }) => {
+                Self::Function {
+                    name: function.name,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum ChatToolChoiceWire {
+    Mode(ChatToolChoiceMode),
+    Object(ChatToolChoiceObject),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ChatToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ChatToolChoiceObject {
+    Function { function: ChatToolChoiceFunction },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatToolChoiceFunction {
+    name: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -374,27 +506,27 @@ impl ChatRequestError {
         }
     }
 
-    fn invalid(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::InvalidRequest {
             message: message.into(),
         }
     }
 
-    fn invalid_field(field: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_field(field: &'static str, message: impl Into<String>) -> Self {
         Self::InvalidField {
             field,
             message: message.into(),
         }
     }
 
-    fn unsupported_content(path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn unsupported_content(path: impl Into<String>, message: impl Into<String>) -> Self {
         Self::UnsupportedMessageContent {
             path: path.into(),
             message: message.into(),
         }
     }
 
-    fn invalid_tool_history(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_tool_history(message: impl Into<String>) -> Self {
         Self::InvalidToolCallHistory {
             message: message.into(),
         }
@@ -682,25 +814,46 @@ fn validate_raw_venice_parameter_types(
     Ok(())
 }
 
-fn validate_ignored_client_only_fields(
-    object: &Map<String, Value>,
-) -> Result<(), ChatRequestError> {
-    if let Some(tools) = object.get("tools")
-        && !tools.is_array()
-    {
+fn parse_tools(value: Option<&Value>) -> Result<Vec<ChatToolDefinition>, ChatRequestError> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(value) => deserialize_typed_value("tools", value),
+    }
+}
+
+fn parse_tool_choice(value: Option<&Value>) -> Result<ChatToolChoice, ChatRequestError> {
+    let Some(value) = value else {
+        return Ok(ChatToolChoice::default());
+    };
+    deserialize_typed_value::<Option<ChatToolChoice>>("tool_choice", value)
+        .map(|choice| choice.unwrap_or_default())
+}
+
+fn validate_tools(tools: &[ChatToolDefinition]) -> Result<(), ChatRequestError> {
+    if tools.iter().any(|tool| tool.name().trim().is_empty()) {
         return Err(ChatRequestError::invalid_field(
             "tools",
-            "tools must be an array when provided; tools are consumed locally and are not forwarded to Venice E2EE",
+            "function tool names must not be empty",
         ));
     }
-    if let Some(tool_choice) = object.get("tool_choice")
-        && !(tool_choice.is_string() || tool_choice.is_object() || tool_choice.is_null())
+    Ok(())
+}
+
+fn validate_tool_choice(tool_choice: &ChatToolChoice) -> Result<(), ChatRequestError> {
+    if let ChatToolChoice::Function { name } = tool_choice
+        && name.trim().is_empty()
     {
         return Err(ChatRequestError::invalid_field(
             "tool_choice",
-            "tool_choice must be a string, object, or null when provided; tool choice is consumed locally and is not forwarded to Venice E2EE",
+            "function tool_choice name must not be empty",
         ));
     }
+    Ok(())
+}
+
+fn validate_ignored_client_only_fields(
+    object: &Map<String, Value>,
+) -> Result<(), ChatRequestError> {
     if let Some(metadata) = object.get("metadata")
         && !(metadata.is_object() || metadata.is_null())
     {
@@ -975,6 +1128,146 @@ mod tests {
     }
 
     #[test]
+    fn parses_tools_into_typed_function_envelopes() {
+        let request = parse(json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "search_web",
+                    "description": "Search the web",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"]
+                    }
+                }
+            }]
+        }));
+
+        assert_eq!(request.tools.len(), 1);
+        let tool = &request.tools[0];
+        let function = tool.function();
+        assert_eq!(tool.name(), "search_web");
+        assert_eq!(function.description.as_deref(), Some("Search the web"));
+        assert_eq!(
+            tool.parameters_schema()
+                .and_then(|schema| schema.get("required")),
+            Some(&json!(["query"]))
+        );
+        assert_eq!(
+            serde_json::to_value(tool).expect("tool should serialize"),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "search_web",
+                    "description": "Search the web",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"]
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn parses_tool_choice_into_typed_shapes() {
+        let required = parse(json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tool_choice": "required"
+        }));
+        assert_eq!(required.tool_choice, ChatToolChoice::Required);
+
+        let specific = parse(json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tool_choice": {"type":"function", "function":{"name":"search_web"}}
+        }));
+        assert_eq!(
+            specific.tool_choice,
+            ChatToolChoice::Function {
+                name: "search_web".to_owned()
+            }
+        );
+
+        let null_choice = parse(json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tool_choice": null
+        }));
+        assert_eq!(null_choice.tool_choice, ChatToolChoice::Auto);
+    }
+
+    #[test]
+    fn rejects_invalid_tool_and_tool_choice_shapes() {
+        for body in [
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tools": ["not an object"]
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tools": [{"type":"web_search", "function":{"name":"search_web"}}]
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tools": [{"type":"function", "function":{"name":"search_web", "description": 42}}]
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tools": [{"type":"function", "function":{"name":"search_web", "parameters": []}}]
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tools": [{"type":"function", "function":{}}]
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tools": [{"type":"function", "function":{"name":""}}]
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tools": [{"type":"function", "function":{"name":"search_web", "extra": true}}]
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tool_choice": 42
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tool_choice": "always"
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tool_choice": {"type":"web_search", "function":{"name":"search_web"}}
+            }),
+            json!({
+                "model": "e2ee-test",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tool_choice": {"type":"function", "function":{"name":""}}
+            }),
+        ] {
+            let error = ChatCompletionRequest::parse(&body)
+                .expect_err("invalid tool shape should be rejected");
+            assert_eq!(error.api_error_code(), "invalid_request");
+        }
+    }
+
+    #[test]
     fn rejects_unsupported_roles_and_content_shapes() {
         let role_error = ChatCompletionRequest::parse(&json!({
             "model": "e2ee-test",
@@ -1128,5 +1421,55 @@ mod tests {
         assert!(prepared.client_stream);
         assert!(prepared.upstream.stream);
         assert!(!prepared.upstream.stream_options.include_usage);
+    }
+
+    #[test]
+    fn constructs_encrypted_request_with_tool_controller_and_retry_prompt() {
+        let model_key = SecretKey::random(&mut rand_core::OsRng);
+        let model_public_key = model_public_key_hex(&model_key);
+        let codec = E2eeCodec::default();
+        let request = parse(json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{"type":"function", "function":{"name":"search_web", "parameters":{"type":"object"}}}],
+            "tool_choice": "required"
+        }));
+        let controller = NormalizedChatMessage::new("system", "controller prompt");
+        let correction = NormalizedChatMessage::new("system", "retry prompt");
+
+        let prepared = request
+            .into_venice_e2ee_request_with_messages(
+                &codec,
+                &model_public_key,
+                &[controller.clone()],
+                &[correction.clone()],
+            )
+            .expect("request should encrypt");
+
+        assert_eq!(prepared.upstream.messages.len(), 3);
+        assert_eq!(prepared.upstream.messages[0].role, "system");
+        assert_eq!(prepared.upstream.messages[1].role, "user");
+        assert_eq!(prepared.upstream.messages[2].role, "system");
+
+        let decrypted = prepared
+            .upstream
+            .messages
+            .iter()
+            .map(|message| {
+                let payload = crate::e2ee::EncryptedPayload::from_hex(&message.content)
+                    .expect("message content should be encrypted hex");
+                codec
+                    .decrypt_content(&payload, &model_key)
+                    .expect("test model key should decrypt message content")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decrypted, vec!["controller prompt", "hi", "retry prompt"]);
+        assert!(
+            !serde_json::to_value(&prepared.upstream)
+                .expect("upstream request should serialize")
+                .as_object()
+                .expect("upstream request should be object")
+                .contains_key("tools")
+        );
     }
 }

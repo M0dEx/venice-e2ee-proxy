@@ -32,6 +32,7 @@ use crate::{
         chat::{ChatCompletionRequest, ChatConstructionError, ChatRequestError},
     },
     sessions::{AttestedModelState, SessionContext, SessionError, SessionManager, SessionRequest},
+    tools::{ToolEmulationContext, ToolOutputClassification, ValidatedToolCall},
     venice::{VeniceClient, VeniceClientError},
 };
 
@@ -158,6 +159,22 @@ async fn create_chat_completion(
 
     let codec =
         E2eeCodec::from_config(&state.config().e2ee).map_err(ChatConstructionError::E2ee)?;
+    let tool_context = ToolEmulationContext::from_request(&state.config().tools, &request)?;
+    let metadata = ProxyMetadataHeaders::for_verified_chat(state.config(), &session);
+
+    if let Some(tool_context) = tool_context {
+        return openai_tool_emulated_chat_response(
+            &state,
+            &request,
+            &tool_context,
+            codec,
+            proxy_instance_key.clone(),
+            model_public_key,
+            metadata,
+        )
+        .await;
+    }
+
     let prepared = request.into_venice_e2ee_request(&codec, model_public_key)?;
 
     let upstream = state
@@ -168,7 +185,6 @@ async fn create_chat_completion(
             model_public_key,
         )
         .await?;
-    let metadata = ProxyMetadataHeaders::for_verified_chat(state.config(), &session);
 
     if prepared.client_stream {
         Ok(openai_chat_sse_response(
@@ -227,6 +243,272 @@ async fn openai_chat_buffered_response(
     let mut response = Json(completion).into_response();
     metadata.apply(response.headers_mut());
     Ok(response)
+}
+
+async fn openai_tool_emulated_chat_response(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    tool_context: &ToolEmulationContext,
+    codec: E2eeCodec,
+    proxy_instance_key: ProxyInstanceKey,
+    model_public_key: &str,
+    metadata: ProxyMetadataHeaders,
+) -> Result<Response, ProxyError> {
+    let mut retries = 0;
+    let mut correction: Option<(String, String)> = None;
+
+    loop {
+        let controller_messages = [tool_context.controller_message()];
+        let correction_messages: Vec<_> = correction
+            .as_ref()
+            .map(|(validation_error, invalid_output)| {
+                tool_context.correction_message(validation_error, invalid_output)
+            })
+            .into_iter()
+            .collect();
+        let prepared = request.into_venice_e2ee_request_with_messages(
+            &codec,
+            model_public_key,
+            &controller_messages,
+            &correction_messages,
+        )?;
+        let upstream = state
+            .venice_client()
+            .create_chat_completion_stream(
+                &prepared.upstream,
+                proxy_instance_key.public_key_hex(),
+                model_public_key,
+            )
+            .await?;
+
+        let completion = match tokio::time::timeout(
+            tool_context.marker_timeout(),
+            buffer_openai_chat_completion(
+                upstream,
+                codec.clone(),
+                proxy_instance_key.clone(),
+                request.model.clone(),
+            ),
+        )
+        .await
+        {
+            Ok(completion) => completion?,
+            Err(_) => {
+                let validation_error = format!(
+                    "tool call marker did not close within {} ms",
+                    tool_context.config().tool_call_marker_timeout_ms
+                );
+                if retries >= tool_context.max_retries() {
+                    return Err(ProxyError::ToolCallRetryExhausted {
+                        max_retries: tool_context.max_retries(),
+                        last_validation_error: validation_error,
+                    });
+                }
+                retries += 1;
+                correction = Some((validation_error, String::new()));
+                continue;
+            }
+        };
+        let assistant_content = completion
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        match tool_context.classify_assistant_output(assistant_content) {
+            ToolOutputClassification::NormalText => {
+                let mut metadata = metadata.clone();
+                if retries > 0 {
+                    metadata.tool_retries = Some(retries);
+                }
+                return Ok(if request.stream {
+                    openai_chat_sse_response_from_completion(
+                        completion,
+                        request.stream_options.include_usage.unwrap_or(false),
+                        metadata,
+                    )
+                } else {
+                    let mut response = Json(completion).into_response();
+                    metadata.apply(response.headers_mut());
+                    response
+                });
+            }
+            ToolOutputClassification::ToolCall(tool_call) => {
+                let mut metadata = metadata.clone();
+                if retries > 0 {
+                    metadata.tool_retries = Some(retries);
+                }
+                return Ok(if request.stream {
+                    openai_tool_call_sse_response(completion, tool_call, metadata)
+                } else {
+                    let body = openai_tool_call_completion(completion, tool_call);
+                    let mut response = Json(body).into_response();
+                    metadata.apply(response.headers_mut());
+                    response
+                });
+            }
+            ToolOutputClassification::InvalidToolCall {
+                error,
+                invalid_output,
+            } => {
+                if retries >= tool_context.max_retries() {
+                    return Err(ProxyError::ToolCallRetryExhausted {
+                        max_retries: tool_context.max_retries(),
+                        last_validation_error: error.to_string(),
+                    });
+                }
+                retries += 1;
+                correction = Some((error.to_string(), invalid_output));
+            }
+        }
+    }
+}
+
+fn openai_chat_sse_response_from_completion(
+    completion: Value,
+    include_usage_requested: bool,
+    metadata: ProxyMetadataHeaders,
+) -> Response {
+    let mut events = Vec::new();
+    let choice = completion
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+    let content = choice
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !content.is_empty() {
+        events.push(openai_chunk_from_completion(
+            &completion,
+            index,
+            json!({"role": "assistant", "content": content}),
+            Value::Null,
+        ));
+    }
+    let finish_reason = choice
+        .get("finish_reason")
+        .cloned()
+        .unwrap_or_else(|| Value::String("stop".to_owned()));
+    events.push(openai_chunk_from_completion(
+        &completion,
+        index,
+        json!({}),
+        finish_reason,
+    ));
+    if include_usage_requested
+        && let Some(usage) = completion.get("usage")
+        && !usage.is_null()
+    {
+        events.push(json!({
+            "id": string_field(&completion, "id").unwrap_or("chatcmpl-local"),
+            "object": "chat.completion.chunk",
+            "created": integer_field(&completion, "created").unwrap_or_else(unix_timestamp_now),
+            "model": string_field(&completion, "model").unwrap_or("unknown"),
+            "choices": [],
+            "usage": usage,
+        }));
+    }
+
+    sse_response_from_json_events(events, metadata)
+}
+
+fn openai_tool_call_sse_response(
+    completion: Value,
+    tool_call: ValidatedToolCall,
+    metadata: ProxyMetadataHeaders,
+) -> Response {
+    let choice = completion
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+    let events = vec![
+        openai_chunk_from_completion(
+            &completion,
+            index,
+            json!({
+                "role": "assistant",
+                "tool_calls": [tool_call.to_openai_streaming_value()],
+            }),
+            Value::Null,
+        ),
+        openai_chunk_from_completion(
+            &completion,
+            index,
+            json!({}),
+            Value::String("tool_calls".to_owned()),
+        ),
+    ];
+
+    sse_response_from_json_events(events, metadata)
+}
+
+fn sse_response_from_json_events(events: Vec<Value>, metadata: ProxyMetadataHeaders) -> Response {
+    let stream = async_stream::stream! {
+        for event in events {
+            yield Ok::<Event, io::Error>(Event::default().data(event.to_string()));
+        }
+        yield Ok::<Event, io::Error>(Event::default().data("[DONE]"));
+    };
+    let mut response = Sse::new(stream).into_response();
+    metadata.apply(response.headers_mut());
+    response
+}
+
+fn openai_tool_call_completion(completion: Value, tool_call: ValidatedToolCall) -> Value {
+    let choice = completion
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+
+    json!({
+        "id": string_field(&completion, "id").unwrap_or("chatcmpl-local"),
+        "object": "chat.completion",
+        "created": integer_field(&completion, "created").unwrap_or_else(unix_timestamp_now),
+        "model": string_field(&completion, "model").unwrap_or("unknown"),
+        "choices": [{
+            "index": index,
+            "message": {
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [tool_call.to_openai_value()],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": completion.get("usage").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn openai_chunk_from_completion(
+    completion: &Value,
+    index: u64,
+    delta: Value,
+    finish_reason: Value,
+) -> Value {
+    json!({
+        "id": string_field(completion, "id").unwrap_or("chatcmpl-local"),
+        "object": "chat.completion.chunk",
+        "created": integer_field(completion, "created").unwrap_or_else(unix_timestamp_now),
+        "model": string_field(completion, "model").unwrap_or("unknown"),
+        "choices": [{
+            "index": index,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }],
+    })
 }
 
 async fn buffer_openai_chat_completion(
@@ -944,6 +1226,11 @@ pub enum ProxyError {
     ChatConstruction(#[from] ChatConstructionError),
     #[error(transparent)]
     ChatStream(#[from] ChatStreamError),
+    #[error("The model failed to produce a valid tool call after correction attempts.")]
+    ToolCallRetryExhausted {
+        max_retries: u32,
+        last_validation_error: String,
+    },
     #[error(
         "proxy instance key is unavailable; keys.generate_proxy_instance_key_on_startup must be enabled for E2EE chat requests"
     )]
@@ -971,7 +1258,9 @@ impl ProxyError {
             ) => StatusCode::BAD_REQUEST,
             Self::Session(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ChatRequest(_) => StatusCode::BAD_REQUEST,
-            Self::ChatConstruction(_) | Self::ChatStream(_) => StatusCode::BAD_GATEWAY,
+            Self::ChatConstruction(_)
+            | Self::ChatStream(_)
+            | Self::ToolCallRetryExhausted { .. } => StatusCode::BAD_GATEWAY,
             Self::ProxyInstanceKeyUnavailable | Self::MissingAttestedModelKey => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -992,6 +1281,7 @@ impl ProxyError {
             Self::ChatRequest(_) => "invalid_request_error",
             Self::ChatConstruction(_) => "proxy_e2ee_error",
             Self::ChatStream(error) => error.api_error_type(),
+            Self::ToolCallRetryExhausted { .. } => "proxy_tool_call_error",
             Self::ProxyInstanceKeyUnavailable => "proxy_configuration_error",
             Self::MissingAttestedModelKey => "proxy_attestation_error",
             Self::NotImplemented { .. } => "proxy_not_implemented",
@@ -1009,6 +1299,7 @@ impl ProxyError {
             Self::ChatRequest(error) => error.api_error_code(),
             Self::ChatConstruction(error) => error.api_error_code(),
             Self::ChatStream(error) => error.api_error_code(),
+            Self::ToolCallRetryExhausted { .. } => "invalid_tool_call",
             Self::ProxyInstanceKeyUnavailable => "proxy_instance_key_unavailable",
             Self::MissingAttestedModelKey => "attestation_failed",
             Self::NotImplemented { .. } => "not_implemented",
@@ -1022,8 +1313,27 @@ impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = self.status();
         let error_code = self.code();
-        let body = ErrorResponse::new(self.to_string(), self.error_type(), error_code);
-        let mut response = (status, Json(body)).into_response();
+        let mut response = if let Self::ToolCallRetryExhausted {
+            max_retries,
+            last_validation_error,
+        } = &self
+        {
+            let body = json!({
+                "error": {
+                    "message": self.to_string(),
+                    "type": self.error_type(),
+                    "code": error_code,
+                    "details": {
+                        "max_retries": max_retries,
+                        "last_validation_error": last_validation_error,
+                    },
+                }
+            });
+            (status, Json(body)).into_response()
+        } else {
+            let body = ErrorResponse::new(self.to_string(), self.error_type(), error_code);
+            (status, Json(body)).into_response()
+        };
         apply_error_headers(response.headers_mut(), error_code);
         response
     }
@@ -1173,7 +1483,11 @@ fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashMap, time::Duration};
+    use std::{
+        collections::{HashMap, VecDeque},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use axum::{
         body::Body,
@@ -1393,6 +1707,172 @@ mod tests {
         assert_eq!(body["object"], "chat.completion");
         assert_eq!(body["choices"][0]["message"]["content"], "Hello");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn chat_route_streams_tool_call_chunks() {
+        let response = streaming_chat_response(
+            "chat-route-tool-stream",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_call>\n{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}\n</tool_call>"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 3);
+        let tool_chunk: Value = serde_json::from_str(data[0]).expect("tool chunk should be JSON");
+        assert_eq!(tool_chunk["choices"][0]["delta"]["role"], "assistant");
+        let tool_call = &tool_chunk["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tool_call["index"], 0);
+        assert!(tool_call["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(tool_call["type"], "function");
+        assert_eq!(tool_call["function"]["name"], "search_web");
+        assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
+        assert!(tool_chunk["choices"][0]["finish_reason"].is_null());
+        let final_chunk: Value = serde_json::from_str(data[1]).expect("final chunk should be JSON");
+        assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(data[2], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn chat_route_returns_non_streaming_tool_call_body() {
+        let response = chat_response(
+            "chat-route-tool-non-stream",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":false,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}</tool_call>"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["object"], "chat.completion");
+        assert!(body["choices"][0]["message"]["content"].is_null());
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        let tool_call = &body["choices"][0]["message"]["tool_calls"][0];
+        assert!(tool_call["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(tool_call["type"], "function");
+        assert_eq!(tool_call["function"]["name"], "search_web");
+        assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
+    }
+
+    #[tokio::test]
+    async fn chat_route_tool_mode_leaves_normal_text_unaffected() {
+        let response = streaming_chat_response(
+            "chat-route-tool-normal-text",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object"}}}]}"#,
+            vec![
+                MockStreamFrame::Text("Hello without tools"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
+        assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(
+            first["choices"][0]["delta"]["content"],
+            "Hello without tools"
+        );
+        assert!(first["choices"][0]["delta"].get("tool_calls").is_none());
+        assert_eq!(data.last().copied(), Some("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn chat_route_treats_marker_like_non_protocol_text_as_normal_text() {
+        let response = streaming_chat_response(
+            "chat-route-tool-marker-like-text",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object"}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_cal>{not actually a marker}"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
+        assert_eq!(
+            first["choices"][0]["delta"]["content"],
+            "<tool_cal>{not actually a marker}"
+        );
+        assert!(first["choices"][0]["delta"].get("tool_calls").is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_route_retries_invalid_tool_call_and_returns_success() {
+        let response = chat_response_sequence(
+            "chat-route-tool-retry-success",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":false,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}]}"#,
+            vec![
+                vec![
+                    MockStreamFrame::Text("<tool_call>{\"name\":\"unknown\",\"arguments\":{\"query\":\"example\"}}</tool_call>"),
+                    MockStreamFrame::Done,
+                ],
+                vec![
+                    MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}</tool_call>"),
+                    MockStreamFrame::Done,
+                ],
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(HEADER_PROXY_TOOL_RETRIES).unwrap(),
+            "1"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "search_web"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_route_returns_retry_failure_error_shape() {
+        let response = chat_response(
+            "chat-route-tool-retry-failure",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":false,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_call>{\"name\":\"unknown\",\"arguments\":{}}</tool_call>"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(HEADER_PROXY_ERROR_CODE).unwrap(),
+            "invalid_tool_call"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "proxy_tool_call_error");
+        assert_eq!(body["error"]["code"], "invalid_tool_call");
+        assert_eq!(body["error"]["details"]["max_retries"], 2);
+        assert!(
+            body["error"]["details"]["last_validation_error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown tool name")
+        );
     }
 
     #[tokio::test]
@@ -1703,6 +2183,17 @@ mod tests {
         request_chat(session_id, request_body, base_url).await
     }
 
+    async fn chat_response_sequence(
+        session_id: &'static str,
+        request_body: &'static str,
+        attempts: Vec<Vec<MockStreamFrame>>,
+    ) -> Response {
+        let model_public_key = ProxyInstanceKey::generate().public_key_hex().to_owned();
+        let base_url =
+            spawn_streaming_venice_server_sequence(model_public_key, true, attempts).await;
+        request_chat(session_id, request_body, base_url).await
+    }
+
     async fn chat_response_with_upstream_status(
         session_id: &'static str,
         request_body: &'static str,
@@ -1771,7 +2262,15 @@ mod tests {
         verified: bool,
         frames: Vec<MockStreamFrame>,
     ) -> String {
-        let chat_frames = frames.clone();
+        spawn_streaming_venice_server_sequence(model_public_key, verified, vec![frames]).await
+    }
+
+    async fn spawn_streaming_venice_server_sequence(
+        model_public_key: String,
+        verified: bool,
+        attempts: Vec<Vec<MockStreamFrame>>,
+    ) -> String {
+        let chat_attempts = Arc::new(Mutex::new(VecDeque::from(attempts)));
         let attestation_key = model_public_key.clone();
         let app = Router::new()
             .route(
@@ -1794,7 +2293,7 @@ mod tests {
             .route(
                 "/api/v1/chat/completions",
                 post(move |headers: HeaderMap, Json(body): Json<Value>| {
-                    let frames = chat_frames.clone();
+                    let chat_attempts = chat_attempts.clone();
                     async move {
                         let Some(client_public_key) = headers
                             .get(crate::venice::HEADER_VENICE_TEE_CLIENT_PUB_KEY)
@@ -1835,6 +2334,17 @@ mod tests {
                                 "messages must be encrypted message objects".to_owned(),
                             );
                         }
+
+                        let frames = {
+                            let mut attempts = chat_attempts
+                                .lock()
+                                .expect("mock chat attempts mutex should not be poisoned");
+                            if attempts.len() > 1 {
+                                attempts.pop_front().expect("attempts length checked above")
+                            } else {
+                                attempts.front().cloned().unwrap_or_default()
+                            }
+                        };
 
                         (
                             StatusCode::OK,

@@ -92,10 +92,16 @@ impl ProxyConfig {
                 "must differ from tools.marker_start",
             ));
         }
-        if self.tools.max_calls_per_turn == 0 {
+        if self.tools.max_calls_per_turn != 1 {
             return Err(ConfigError::invalid(
                 "tools.max_calls_per_turn",
-                "must be greater than zero",
+                "must be 1; v0.1 supports exactly one tool call per assistant turn",
+            ));
+        }
+        if self.tools.allow_parallel {
+            return Err(ConfigError::invalid(
+                "tools.allow_parallel",
+                "must be false; v0.1 does not support parallel tool calls",
             ));
         }
         if self.tools.initial_marker_scan_bytes == 0 {
@@ -114,6 +120,12 @@ impl ProxyConfig {
             return Err(ConfigError::invalid(
                 "tools.tool_call_marker_timeout_ms",
                 "must be greater than zero",
+            ));
+        }
+        if !self.tools.emit_tool_call_arguments_single_chunk {
+            return Err(ConfigError::invalid(
+                "tools.emit_tool_call_arguments_single_chunk",
+                "must be true; v0.1 emits complete tool-call arguments in one chunk",
             ));
         }
 
@@ -601,6 +613,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn validation_rejects_unsupported_v0_1_tool_modes() {
+        for (field, toml) in [
+            ("tools.max_calls_per_turn", "max_calls_per_turn = 2"),
+            ("tools.allow_parallel", "allow_parallel = true"),
+            (
+                "tools.emit_tool_call_arguments_single_chunk",
+                "emit_tool_call_arguments_single_chunk = false",
+            ),
+        ] {
+            let err = ProxyConfig::from_toml_str(&format!("[tools]\n{toml}\n"))
+                .expect_err("unsupported v0.1 tool mode should be rejected");
+            assert!(matches!(
+                err,
+                ConfigError::InvalidValue { field: actual, .. } if actual == field
+            ));
+        }
     }
 
     #[test]
