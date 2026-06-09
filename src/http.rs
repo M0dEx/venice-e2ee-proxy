@@ -1096,14 +1096,7 @@ impl OpenAiChatCompletionBuffer {
 
         let finish_reason = normalized_finish_reason(choice.get("finish_reason"))?;
         let delta = choice.get("delta").unwrap_or(&Value::Null);
-        let content = delta
-            .get("content")
-            .map(|content| {
-                content.as_str().ok_or_else(|| {
-                    ChatStreamError::malformed_event("upstream delta.content must be a string")
-                })
-            })
-            .transpose()?;
+        let content = encrypted_delta_content(delta)?;
         debug!(
             choice_index = index,
             has_encrypted_content = content.is_some(),
@@ -1330,14 +1323,7 @@ impl OpenAiChatStreamTransformer {
         })?;
         let finish_reason = normalized_finish_reason(choice.get("finish_reason"))?;
         let delta = choice.get("delta").unwrap_or(&Value::Null);
-        let content = delta
-            .get("content")
-            .map(|content| {
-                content.as_str().ok_or_else(|| {
-                    ChatStreamError::malformed_event("upstream delta.content must be a string")
-                })
-            })
-            .transpose()?;
+        let content = encrypted_delta_content(delta)?;
         debug!(
             has_encrypted_content = content.is_some(),
             has_finish_reason = !finish_reason.is_null(),
@@ -1558,14 +1544,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         let index = normalized_choice_index(choice.get("index"))?;
         let finish_reason = normalized_finish_reason(choice.get("finish_reason"))?;
         let delta = choice.get("delta").unwrap_or(&Value::Null);
-        let content = delta
-            .get("content")
-            .map(|content| {
-                content.as_str().ok_or_else(|| {
-                    ChatStreamError::malformed_event("upstream delta.content must be a string")
-                })
-            })
-            .transpose()?;
+        let content = encrypted_delta_content(delta)?;
 
         let mut output = Vec::new();
         if let Some(content) = content {
@@ -1850,11 +1829,25 @@ fn normalized_choice_index(index: Option<&Value>) -> Result<u64, ChatStreamError
 
 fn normalized_finish_reason(value: Option<&Value>) -> Result<Value, ChatStreamError> {
     match value {
-        None | Some(Value::Null) => Ok(Value::Null),
-        Some(Value::String(value)) => Ok(Value::String(value.clone())),
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(Value::String(reason)) => Ok(Value::String(reason.clone())),
         Some(_) => Err(ChatStreamError::malformed_event(
             "upstream finish_reason must be a string or null",
         )),
+    }
+}
+
+fn encrypted_delta_content(delta: &Value) -> Result<Option<&str>, ChatStreamError> {
+    match delta.get("content") {
+        Some(Value::String(content)) if content.is_empty() => {
+            debug!("ignoring empty upstream delta.content");
+            Ok(None)
+        }
+        Some(Value::String(content)) => Ok(Some(content.as_str())),
+        Some(_) => Err(ChatStreamError::malformed_event(
+            "upstream delta.content must be a string",
+        )),
+        None => Ok(None),
     }
 }
 
@@ -2339,6 +2332,7 @@ mod tests {
             "chat-route-test",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
             vec![
+                MockStreamFrame::EmptyContent,
                 MockStreamFrame::Text("Hello"),
                 MockStreamFrame::Finish("stop"),
                 MockStreamFrame::Done,
@@ -2430,6 +2424,7 @@ mod tests {
             "chat-route-non-streaming-success",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
             vec![
+                MockStreamFrame::EmptyContent,
                 MockStreamFrame::Text("Hello"),
                 MockStreamFrame::Text(" world"),
                 MockStreamFrame::Finish("stop"),
@@ -2456,8 +2451,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_route_treats_omitted_stream_as_streaming() {
-        let response = streaming_chat_response(
+    async fn chat_route_treats_omitted_stream_as_buffered_non_streaming() {
+        let response = chat_response(
             "chat-route-omitted-stream",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}]}"#,
             vec![MockStreamFrame::Text("Hello"), MockStreamFrame::Done],
@@ -2465,16 +2460,10 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let data = sse_data(&body);
-        assert_eq!(data.len(), 3);
-        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
-        assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
-        assert_eq!(first["choices"][0]["delta"]["content"], "Hello");
-        let final_chunk: Value = serde_json::from_str(data[1]).expect("final chunk should be JSON");
-        assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
-        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
-        assert_eq!(data[2], "[DONE]");
+        let body = json_body(response).await;
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
     }
 
     #[tokio::test]
@@ -2987,6 +2976,7 @@ mod tests {
     #[derive(Debug, Clone)]
     enum MockStreamFrame {
         Role,
+        EmptyContent,
         Text(&'static str),
         TextForWrongRecipient(&'static str),
         Finish(&'static str),
@@ -3251,6 +3241,12 @@ mod tests {
             match frame {
                 MockStreamFrame::Role => {
                     output.push_str(&format!("data: {}\n\n", upstream_role_chunk()));
+                }
+                MockStreamFrame::EmptyContent => {
+                    output.push_str(&format!(
+                        "data: {}\n\n",
+                        upstream_content_chunk(String::new())
+                    ));
                 }
                 MockStreamFrame::Text(content) => {
                     let encrypted = codec
