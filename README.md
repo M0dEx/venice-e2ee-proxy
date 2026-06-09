@@ -33,7 +33,7 @@ Use direct Cargo commands only.
 | All tests | `cargo test --all-targets --all-features` |
 | Baseline validation | Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` |
 
-The proxy requires a TOML config path. Configure the Venice API key either as `venice.api_key` in TOML or with the Figment environment override `VENICE_E2EE_PROXY__VENICE__API_KEY`. The checked-in `config/default.toml` exposes all default values and is copied into the image at `/etc/venice-e2ee-proxy/config.toml`; mount over that path to provide a container config file. Use direct Cargo commands only; this project intentionally does not use a Makefile.
+The proxy requires a TOML config path. Configure the Venice API key either as `venice.api_key` in TOML or with the Figment environment override `VENICE_E2EE_PROXY__VENICE__API_KEY`. Configure stdout tracing with `logging.level`; it accepts simple levels like `info`/`debug` or full tracing filter directives like `venice_e2ee_proxy=debug,tower_http=warn`, and can be overridden with `VENICE_E2EE_PROXY__LOGGING__LEVEL`. The checked-in `config/default.toml` exposes all default values and is copied into the image at `/etc/venice-e2ee-proxy/config.toml`; mount over that path to provide a container config file. Use direct Cargo commands only; this project intentionally does not use a Makefile.
 
 
 ## Module boundaries

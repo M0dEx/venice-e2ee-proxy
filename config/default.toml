@@ -2,6 +2,9 @@
 host = "0.0.0.0"
 port = 8080
 
+[logging]
+level = "info"
+
 [venice]
 base_url = "https://api.venice.ai/api/v1"
 api_key = ""

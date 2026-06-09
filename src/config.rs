@@ -13,12 +13,14 @@ use figment::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use thiserror::Error;
+use tracing_subscriber::EnvFilter;
 
 /// Top-level proxy configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyConfig {
     pub server: ServerConfig,
+    pub logging: LoggingConfig,
     pub venice: VeniceConfig,
     pub keys: KeysConfig,
     pub session: SessionConfig,
@@ -57,6 +59,8 @@ impl ProxyConfig {
     /// Validates a fully materialized configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_non_empty("server.host", &self.server.host)?;
+        validate_non_empty("logging.level", &self.logging.level)?;
+        validate_env_filter("logging.level", &self.logging.level)?;
         validate_http_url("venice.base_url", &self.venice.base_url, false)?;
 
         if self.session.idle_ttl_seconds == 0 {
@@ -163,6 +167,23 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_owned(),
             port: 8080,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// Tracing filter directive. Accepts simple levels like `info` or full
+    /// `tracing_subscriber::EnvFilter` directives like
+    /// `venice_e2ee_proxy=debug,tower_http=warn`.
+    pub level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_owned(),
         }
     }
 }
@@ -470,6 +491,21 @@ fn validate_header_name(field: &'static str, value: &str) -> Result<(), ConfigEr
     Ok(())
 }
 
+fn validate_env_filter(field: &'static str, value: &str) -> Result<(), ConfigError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+
+    EnvFilter::try_new(value).map_err(|source| {
+        ConfigError::invalid(
+            field,
+            format!("must be a valid tracing env filter: {source}"),
+        )
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +513,7 @@ mod tests {
     fn assert_default_config_values(config: &ProxyConfig) {
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
+        assert_eq!(config.logging.level, "info");
         assert_eq!(config.venice.base_url, "https://api.venice.ai/api/v1");
         assert_eq!(config.venice.api_key.expose_secret(), "");
         assert!(config.keys.generate_proxy_instance_key_on_startup);
@@ -554,6 +591,7 @@ mod tests {
 
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
+        assert_eq!(config.logging.level, "info");
         assert_eq!(config.venice.api_key.expose_secret(), "");
         assert!(!config.tools.enabled);
         assert_eq!(config.tools.mode, ToolMode::None);
@@ -574,6 +612,62 @@ mod tests {
             err,
             ConfigError::InvalidValue {
                 field: "venice.base_url",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn logging_config_accepts_level_or_env_filter_and_rejects_invalid_filters() {
+        let config = ProxyConfig::from_toml_str(
+            r#"
+            [logging]
+            level = "debug"
+            "#,
+        )
+        .expect("logging level config should load");
+        assert_eq!(config.logging.level, "debug");
+
+        let config = ProxyConfig::from_toml_str(
+            r#"
+            [logging]
+            level = "venice_e2ee_proxy=debug,tower_http=warn"
+            "#,
+        )
+        .expect("logging env filter config should load");
+        assert_eq!(
+            config.logging.level,
+            "venice_e2ee_proxy=debug,tower_http=warn"
+        );
+
+        for level in ["", "   "] {
+            let err = ProxyConfig::from_toml_str(&format!(
+                r#"
+                [logging]
+                level = {level:?}
+                "#
+            ))
+            .expect_err("empty logging level should be rejected");
+            assert!(matches!(
+                err,
+                ConfigError::InvalidValue {
+                    field: "logging.level",
+                    ..
+                }
+            ));
+        }
+
+        let err = ProxyConfig::from_toml_str(
+            r#"
+            [logging]
+            level = "venice_e2ee_proxy=[debug"
+            "#,
+        )
+        .expect_err("invalid tracing env filter should be rejected");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue {
+                field: "logging.level",
                 ..
             }
         ));
