@@ -287,9 +287,7 @@ impl SessionManager {
         if now >= session.expires_at {
             return Some(SessionExpirationReason::MaxTtl);
         }
-        if elapsed_since(session.last_used_at, now)
-            >= Duration::from_secs(self.config.idle_ttl_seconds)
-        {
+        if elapsed_since(session.last_used_at, now) >= self.config.idle_ttl {
             return Some(SessionExpirationReason::IdleTtl);
         }
         None
@@ -348,7 +346,7 @@ impl SessionRecord {
             scope,
             created_at: now,
             last_used_at: now,
-            expires_at: now + Duration::from_secs(config.max_ttl_seconds),
+            expires_at: now + config.max_ttl,
             request_count: 1,
             attested_model_public_key: None,
             attestation_report: None,
@@ -442,8 +440,8 @@ mod tests {
 
     fn test_config() -> SessionConfig {
         SessionConfig {
-            idle_ttl_seconds: 10,
-            max_ttl_seconds: 30,
+            idle_ttl: Duration::from_secs(10),
+            max_ttl: Duration::from_secs(30),
             max_requests: 3,
             fallback_scope: SessionFallbackScope::Request,
             headers: Default::default(),
@@ -578,8 +576,8 @@ mod tests {
     #[test]
     fn max_ttl_expiration_discards_old_session_and_creates_fresh_one() {
         let mut config = test_config();
-        config.idle_ttl_seconds = 20;
-        config.max_ttl_seconds = 30;
+        config.idle_ttl = Duration::from_secs(20);
+        config.max_ttl = Duration::from_secs(30);
         let manager = SessionManager::new(config);
         let mut headers = HeaderMap::new();
         headers.insert(

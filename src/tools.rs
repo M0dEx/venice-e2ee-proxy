@@ -122,7 +122,7 @@ impl ToolEmulationContext {
     }
 
     pub fn marker_timeout(&self) -> Duration {
-        Duration::from_millis(self.config.tool_call_marker_timeout_ms)
+        self.config.tool_call_marker_timeout
     }
 
     pub fn controller_message(&self) -> NormalizedChatMessage {
@@ -514,10 +514,10 @@ impl ToolCallMarkerBuffer {
         elapsed: Duration,
     ) -> Result<ToolCallBufferStatus, ToolCallValidationError> {
         self.elapsed = elapsed;
-        if self.elapsed > Duration::from_millis(self.config.tool_call_marker_timeout_ms) {
+        if self.elapsed > self.config.tool_call_marker_timeout {
             return Err(ToolCallValidationError::new(format!(
-                "tool call marker did not close within {} ms",
-                self.config.tool_call_marker_timeout_ms
+                "tool call marker did not close within {}",
+                humantime::format_duration(self.config.tool_call_marker_timeout)
             )));
         }
         self.output.push_str(chunk);
@@ -854,7 +854,7 @@ mod tests {
     fn buffers_complete_marker_and_reports_limits() {
         let config = ToolsConfig {
             tool_call_max_bytes: 64,
-            tool_call_marker_timeout_ms: 50,
+            tool_call_marker_timeout: Duration::from_millis(50),
             ..ToolsConfig::default()
         };
         let mut buffer = ToolCallMarkerBuffer::new(&config);

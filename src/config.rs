@@ -3,7 +3,7 @@
 //! This module provides a typed representation of the proxy configuration,
 //! default values, validation, and redacted handling for the Venice API key.
 
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, time::Duration};
 
 use axum::http::HeaderName;
 use figment::{
@@ -11,7 +11,7 @@ use figment::{
     providers::{Env, Format, Toml},
 };
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 
@@ -62,23 +62,14 @@ impl ProxyConfig {
         validate_non_empty("logging.level", &self.logging.level)?;
         validate_env_filter("logging.level", &self.logging.level)?;
         validate_http_url("venice.base_url", &self.venice.base_url, false)?;
+        validate_duration_non_zero("venice.request_timeout", self.venice.request_timeout)?;
 
-        if self.session.idle_ttl_seconds == 0 {
+        validate_duration_non_zero("session.idle_ttl", self.session.idle_ttl)?;
+        validate_duration_non_zero("session.max_ttl", self.session.max_ttl)?;
+        if self.session.idle_ttl > self.session.max_ttl {
             return Err(ConfigError::invalid(
-                "session.idle_ttl_seconds",
-                "must be greater than zero",
-            ));
-        }
-        if self.session.max_ttl_seconds == 0 {
-            return Err(ConfigError::invalid(
-                "session.max_ttl_seconds",
-                "must be greater than zero",
-            ));
-        }
-        if self.session.idle_ttl_seconds > self.session.max_ttl_seconds {
-            return Err(ConfigError::invalid(
-                "session.idle_ttl_seconds",
-                "must be less than or equal to session.max_ttl_seconds",
+                "session.idle_ttl",
+                "must be less than or equal to session.max_ttl",
             ));
         }
         if self.session.max_requests == 0 {
@@ -130,12 +121,10 @@ impl ProxyConfig {
                 "must be greater than zero",
             ));
         }
-        if self.tools.tool_call_marker_timeout_ms == 0 {
-            return Err(ConfigError::invalid(
-                "tools.tool_call_marker_timeout_ms",
-                "must be greater than zero",
-            ));
-        }
+        validate_duration_non_zero(
+            "tools.tool_call_marker_timeout",
+            self.tools.tool_call_marker_timeout,
+        )?;
         if !self.tools.emit_tool_call_arguments_single_chunk {
             return Err(ConfigError::invalid(
                 "tools.emit_tool_call_arguments_single_chunk",
@@ -193,6 +182,8 @@ impl Default for LoggingConfig {
 pub struct VeniceConfig {
     pub base_url: String,
     pub api_key: SecretString,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub request_timeout: Duration,
 }
 
 impl Default for VeniceConfig {
@@ -200,6 +191,7 @@ impl Default for VeniceConfig {
         Self {
             base_url: "https://api.venice.ai/api/v1".to_owned(),
             api_key: SecretString::default(),
+            request_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -221,8 +213,10 @@ impl Default for KeysConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionConfig {
-    pub idle_ttl_seconds: u64,
-    pub max_ttl_seconds: u64,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub idle_ttl: Duration,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub max_ttl: Duration,
     pub max_requests: u64,
     pub fallback_scope: SessionFallbackScope,
     pub headers: SessionHeadersConfig,
@@ -231,8 +225,8 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            idle_ttl_seconds: 600,
-            max_ttl_seconds: 1_800,
+            idle_ttl: Duration::from_secs(600),
+            max_ttl: Duration::from_secs(1_800),
             max_requests: 100,
             fallback_scope: SessionFallbackScope::Request,
             headers: SessionHeadersConfig::default(),
@@ -379,7 +373,8 @@ pub struct ToolsConfig {
     pub allow_parallel: bool,
     pub initial_marker_scan_bytes: usize,
     pub tool_call_max_bytes: usize,
-    pub tool_call_marker_timeout_ms: u64,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub tool_call_marker_timeout: Duration,
     pub validate_json_schema: bool,
     pub emit_tool_call_arguments_single_chunk: bool,
 }
@@ -396,7 +391,7 @@ impl Default for ToolsConfig {
             allow_parallel: false,
             initial_marker_scan_bytes: 128,
             tool_call_max_bytes: 65_536,
-            tool_call_marker_timeout_ms: 30_000,
+            tool_call_marker_timeout: Duration::from_secs(30),
             validate_json_schema: true,
             emit_tool_call_arguments_single_chunk: true,
         }
@@ -491,6 +486,21 @@ fn validate_header_name(field: &'static str, value: &str) -> Result<(), ConfigEr
     Ok(())
 }
 
+fn validate_duration_non_zero(field: &'static str, value: Duration) -> Result<(), ConfigError> {
+    if value == Duration::ZERO {
+        return Err(ConfigError::invalid(field, "must be greater than zero"));
+    }
+    Ok(())
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    humantime::parse_duration(&value).map_err(de::Error::custom)
+}
+
 fn validate_env_filter(field: &'static str, value: &str) -> Result<(), ConfigError> {
     let value = value.trim();
     if value.is_empty() {
@@ -516,9 +526,10 @@ mod tests {
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.venice.base_url, "https://api.venice.ai/api/v1");
         assert_eq!(config.venice.api_key.expose_secret(), "");
+        assert_eq!(config.venice.request_timeout, Duration::from_secs(10));
         assert!(config.keys.generate_proxy_instance_key_on_startup);
-        assert_eq!(config.session.idle_ttl_seconds, 600);
-        assert_eq!(config.session.max_ttl_seconds, 1_800);
+        assert_eq!(config.session.idle_ttl, Duration::from_secs(600));
+        assert_eq!(config.session.max_ttl, Duration::from_secs(1_800));
         assert_eq!(config.session.max_requests, 100);
         assert_eq!(config.session.fallback_scope, SessionFallbackScope::Request);
         assert_eq!(SessionFallbackScope::Disabled.as_str(), "disabled");
@@ -552,7 +563,10 @@ mod tests {
         assert!(!config.tools.allow_parallel);
         assert_eq!(config.tools.initial_marker_scan_bytes, 128);
         assert_eq!(config.tools.tool_call_max_bytes, 65_536);
-        assert_eq!(config.tools.tool_call_marker_timeout_ms, 30_000);
+        assert_eq!(
+            config.tools.tool_call_marker_timeout,
+            Duration::from_secs(30)
+        );
         assert!(config.tools.validate_json_schema);
         assert!(config.tools.emit_tool_call_arguments_single_chunk);
 
@@ -593,6 +607,7 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.venice.api_key.expose_secret(), "");
+        assert_eq!(config.venice.request_timeout, Duration::from_secs(10));
         assert!(!config.tools.enabled);
         assert_eq!(config.tools.mode, ToolMode::None);
         assert_eq!(config.tools.marker_start, "<tool_call>");
@@ -612,6 +627,22 @@ mod tests {
             err,
             ConfigError::InvalidValue {
                 field: "venice.base_url",
+                ..
+            }
+        ));
+
+        let err = ProxyConfig::from_toml_str(
+            r#"
+            [venice]
+            request_timeout = "0s"
+            "#,
+        )
+        .expect_err("zero Venice timeout should be rejected");
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue {
+                field: "venice.request_timeout",
                 ..
             }
         ));

@@ -366,8 +366,8 @@ async fn openai_tool_emulated_chat_response(
             Ok(completion) => completion?,
             Err(_) => {
                 let validation_error = format!(
-                    "tool call marker did not close within {} ms",
-                    tool_context.config().tool_call_marker_timeout_ms
+                    "tool call marker did not close within {}",
+                    humantime::format_duration(tool_context.config().tool_call_marker_timeout)
                 );
                 if retries >= tool_context.max_retries() {
                     return Err(ProxyError::ToolCallRetryExhausted {

@@ -42,7 +42,7 @@ impl VeniceClient {
         Self::new(
             &config.venice.base_url,
             api_key.expose_secret(),
-            DEFAULT_REQUEST_TIMEOUT,
+            config.venice.request_timeout,
         )
     }
 
