@@ -1,6 +1,8 @@
 //! Configuration loading and validation.
 //!
-//! from the configured environment variable.
+//! This module provides a typed representation of the proxy configuration,
+//! default values, validation, and safe lookup of the Venice API key from the
+//! configured environment variable.
 
 use std::{
     env::{self, VarError},
@@ -523,7 +525,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_matches_spec_draft() {
+    fn default_config_matches_expected_values() {
         let config = ProxyConfig::default();
 
         assert_eq!(config.server.host, "127.0.0.1");

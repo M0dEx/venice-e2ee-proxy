@@ -180,18 +180,15 @@ impl JsonSchema {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ChatToolChoice {
+    #[default]
     Auto,
     None,
     Required,
-    Function { name: String },
-}
-
-impl Default for ChatToolChoice {
-    fn default() -> Self {
-        Self::Auto
-    }
+    Function {
+        name: String,
+    },
 }
 
 impl<'de> Deserialize<'de> for ChatToolChoice {
@@ -669,7 +666,7 @@ fn normalize_assistant_tool_calls(
     }
     if tool_calls.len() > 1 {
         return Err(ChatRequestError::invalid_tool_history(
-            "parallel assistant tool_calls are not supported in the E2EE proxy MVP",
+            "parallel assistant tool_calls are not supported by the E2EE proxy",
         ));
     }
 
@@ -1441,8 +1438,8 @@ mod tests {
             .into_venice_e2ee_request_with_messages(
                 &codec,
                 &model_public_key,
-                &[controller.clone()],
-                &[correction.clone()],
+                std::slice::from_ref(&controller),
+                std::slice::from_ref(&correction),
             )
             .expect("request should encrypt");
 

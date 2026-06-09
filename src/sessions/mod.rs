@@ -2,7 +2,8 @@
 //!
 //! Sessions are keyed by `model_id:agent_session_id`, with identifiers resolved
 //! from configured headers, Open WebUI headers, request metadata, or configured
-//! fallback behavior. Expired sessions are discarded before reuse so later E2EE
+//! fallback behavior. Expired sessions are discarded before reuse so E2EE and
+//! attestation state can be refreshed safely.
 
 use std::{
     collections::HashMap,
@@ -74,6 +75,7 @@ pub struct SessionResolution {
     pub replaced_expired: Option<SessionExpirationReason>,
 }
 
+/// Attestation/model-key state cached with a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestedModelState {
     pub model_public_key: String,

@@ -1,5 +1,6 @@
 //! Venice E2EE encryption/decryption codec.
 //!
+//! Implements the Venice E2EE field codec:
 //!
 //! ```text
 //! ephemeral_public_key[65 bytes] || nonce[12 bytes] || ciphertext_and_gcm_tag
@@ -318,6 +319,7 @@ impl fmt::Debug for Nonce {
     }
 }
 
+/// Venice encrypted payload serialized as a lowercase hex string.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EncryptedPayload(String);

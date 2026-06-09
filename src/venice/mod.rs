@@ -1,6 +1,7 @@
 //! Venice upstream API client and model mapping.
 //!
-//! filtering, and mapping into the OpenAI-compatible `/v1/models` response.
+//! Implements authenticated Venice model-list retrieval, E2EE model filtering,
+//! and mapping into the OpenAI-compatible `/v1/models` response.
 
 use std::{fmt, sync::Arc, time::Duration};
 

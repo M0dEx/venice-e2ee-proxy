@@ -2,6 +2,7 @@
 
 Local OpenAI-compatible proxy for Venice.AI E2EE models.
 
+The repository implements a local HTTP proxy shell, typed configuration loading, route registration, shared OpenAI-style errors, safe response-header helpers, the Venice HTTP client, Venice model mapping, `GET /v1/models`, proxy key/session lifecycle, the Venice E2EE codec, attestation fetch/policy checks, request-side chat normalization/E2EE request construction, streaming and buffered non-streaming encrypted chat, marker-based tool-call emulation, and mocked proxy integration tests.
 
 ## Stack
 
@@ -9,6 +10,7 @@ Local OpenAI-compatible proxy for Venice.AI E2EE models.
 - HTTP/runtime: async Rust with `tokio` and `axum` for the OpenAI-compatible HTTP server.
 - Upstream/client direction: typed JSON with `serde`, `reqwest` for Venice HTTP calls, and `toml`/environment configuration.
 - Crate layout: one binary entrypoint in `src/main.rs` plus a library surface in `src/lib.rs` for implementation modules.
+- Dependency policy: keep dependencies minimal and add new crates only when they support implemented behavior.
 
 ## Commands
 
@@ -24,14 +26,17 @@ Use direct Cargo commands only.
 | Lint | `cargo clippy --all-targets --all-features -- -D warnings` |
 | Typecheck | `cargo check --all-targets --all-features` |
 | Unit tests | `cargo test --lib` |
-| Baseline integration test | `cargo test --test baseline` |
 | Mocked models integration tests | `cargo test --test models` |
+| Mocked proxy integration tests | `cargo test --test proxy_integration` |
 | All tests | `cargo test --all-targets --all-features` |
 | Baseline validation | Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` |
+
+`cargo run` starts the local proxy using the default config and requires the configured Venice API key environment variable (`VENICE_API_KEY` by default). To provide a TOML config file, run `cargo run -- path/to/config.toml`. Use direct Cargo commands only; this project intentionally does not use a Makefile.
 
 
 ## Module boundaries
 
+The module boundaries are:
 
 - `src/config`: configuration loading and validation.
 - `src/http`: HTTP server, route wiring, shared headers, and route errors.
@@ -43,12 +48,14 @@ Use direct Cargo commands only.
 - `src/openai`: OpenAI-compatible request/response formatting.
 - `src/tools`: OpenAI-style tool-call emulation.
 
+Implementation should continue using these modules rather than creating parallel subsystems.
 
 ## Attestation v0.1 notes
 
 - `src/attestation` generates a fresh 32-byte nonce and fetches `/tee/attestation` per verification call; it does not maintain an internal cache. Successful results are intended to be cached only by session state according to the session TTL/request limits.
 - Basic envelope checks, secp256k1 signing-key normalization, Ethereum-style signing-address checks, debug-policy gates, and TDX/NVIDIA policy surfaces are implemented fail-closed.
 - Full Intel DCAP/QVL and NVIDIA NRAS cryptographic verifier backends are not linked in v0.1. When `attestation.require_tdx = true` or NVIDIA evidence is required/present under verification policy, the verifier returns a structured `attestation_verifier_unavailable` error rather than allowing encrypted chat.
+- Measurement allowlists are intentionally not implemented for v0.1.
 
 ## Tests
 
@@ -56,9 +63,9 @@ Use direct Cargo commands only.
 - Unit tests in `src/venice` cover Venice-to-OpenAI model mapping, missing optional metadata defaults, malformed upstream model payloads, and API-key redaction in debug output.
 - Unit tests in `src/attestation` cover valid evidence, missing fields, debug evidence, required TDX/NVIDIA failures, malformed upstream evidence, and upstream fetch failures.
 - Unit tests in `src/openai/chat` cover chat message normalization, unsupported request shapes, Venice parameter policy, and encrypted Venice request construction.
-- Unit tests in `src/http` cover route registration, streaming encrypted chat success/fail-closed paths, chat request construction gating, unknown routes/methods, Axum JSON extractor rejections for malformed/non-object JSON, and safe header helpers.
+- Unit tests in `src/http` cover route registration, streaming and buffered encrypted chat success/fail-closed paths, tool-call response/retry handling, chat request construction gating, unknown routes/methods, Axum JSON extractor rejections for malformed/non-object JSON, and safe header helpers.
 - Unit tests in `src/main.rs` cover the optional config path CLI shape.
 - `src/lib.rs` still verifies the module boundary list.
-- `tests/baseline.rs` verifies the Cargo integration test harness is wired.
 - `tests/models.rs` verifies mocked Venice success, authentication failures, server errors, malformed payloads, and upstream timeout handling for `GET /v1/models`.
+- `tests/proxy_integration.rs` provides a mocked Venice harness covering model listing, streaming and non-streaming chat, attestation success/failure, encrypted response success/failure, tool-call emulation with correction retry headers, fail-closed startup/upstream/protocol paths, and proxy metadata response-header expectations.
 

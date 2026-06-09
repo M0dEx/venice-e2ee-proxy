@@ -1,7 +1,7 @@
 //! OpenAI-compatible request and response formatting.
 //!
-//! alongside the shared OpenAI-style error envelope used by fail-closed
-//! validation responses.
+//! Includes the typed model-list response used by `GET /v1/models` and the
+//! shared OpenAI-style error envelope used by fail-closed validation responses.
 
 use serde::{Deserialize, Serialize};
 

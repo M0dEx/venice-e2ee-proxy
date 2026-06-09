@@ -140,8 +140,12 @@ impl ToolEmulationContext {
             )
         };
 
+        // Venice E2EE rejects repeated tool-controller `system` prompts when a
+        // multi-turn request includes prior assistant/tool history. Keep the
+        // controller instruction model-visible as a user message so real
+        // OpenAI-style tool conversations can continue across turns.
         NormalizedChatMessage::new(
-            "system",
+            "user",
             format!(
                 "You have access to tools.\n\n{requirement}\n\n{}\n{}\n{}\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- arguments must be valid JSON and must satisfy the tool schema.\n- Call at most one tool.\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
                 self.config.marker_start,
@@ -837,8 +841,10 @@ mod tests {
             "type": "object",
             "required": ["query"]
         }));
-        let mut config = ToolsConfig::default();
-        config.validate_json_schema = false;
+        let config = ToolsConfig {
+            validate_json_schema: false,
+            ..ToolsConfig::default()
+        };
         let context = ToolEmulationContext::from_request(&config, &request)
             .expect("tool context should build")
             .expect("tools should activate");
@@ -881,7 +887,7 @@ mod tests {
         let context = context_for_request(&request);
 
         let controller = context.controller_message();
-        assert_eq!(controller.role, "system");
+        assert_eq!(controller.role, "user");
         assert!(
             controller
                 .content

@@ -1,6 +1,7 @@
 //! HTTP server, route wiring, shared headers, and route errors.
 //!
-//! construction, and encrypted response transformation.
+//! Routes include Venice-backed model listing, encrypted chat request
+//! construction, response transformation, and OpenAI-compatible errors/headers.
 
 use std::{
     io,
@@ -1040,8 +1041,9 @@ impl OpenAiChatStreamTransformer {
             ));
         };
 
-        // usage event, this streaming path omits usage rather than synthesizing
-        // unverifiable token counts.
+        // If a client requests include_usage but Venice omits a usage event,
+        // this streaming path omits usage rather than synthesizing unverifiable
+        // token counts.
         if !self.include_usage_requested {
             return Ok(Vec::new());
         }
@@ -1339,6 +1341,7 @@ impl IntoResponse for ProxyError {
     }
 }
 
+/// Safe proxy metadata headers.
 ///
 /// Fields are optional so handlers never claim E2EE, attestation, key-binding,
 /// or session verification that has not happened yet.
@@ -1359,8 +1362,8 @@ pub struct ProxyMetadataHeaders {
 }
 
 impl ProxyMetadataHeaders {
-    /// Creates safe non-assertive metadata from config for later handlers to
-    /// extend once they have real verification/session state.
+    /// Creates safe non-assertive metadata from config before a route has
+    /// verification/session state.
     pub fn from_config(config: &ProxyConfig) -> Self {
         Self {
             attestation_mode: Some(config.attestation.mode.as_str().to_owned()),

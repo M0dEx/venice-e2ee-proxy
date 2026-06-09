@@ -1,8 +1,8 @@
 //! Startup proxy-instance key management.
 //!
 //! The proxy generates one secp256k1 keypair per process when configured to do
-//! so. Later E2EE code uses the private key to decrypt Venice response chunks
-//! and sends the uncompressed public key hex in Venice E2EE request headers.
+//! so. E2EE code uses the private key to decrypt Venice response chunks and
+//! sends the uncompressed public key hex in Venice E2EE request headers.
 
 use std::{fmt, sync::Arc};
 
@@ -19,6 +19,7 @@ pub struct ProxyInstanceKey {
 }
 
 struct ProxyInstanceKeyInner {
+    // Stored for E2EE response decryption while the public key is sent upstream.
     private_key: ProxyInstancePrivateKey,
     public_key_hex: String,
 }

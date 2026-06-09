@@ -1,8 +1,9 @@
 //! Attestation fetch, verification policy, and fail-closed checks.
 //!
-//! This module intentionally does not cache attestation results internally. The
-//! lifetime, so callers should store a successful [`VerifiedAttestation`] in the
-//! session manager only for that session's TTL/request budget. Calling
+//! This module intentionally does not cache attestation results internally.
+//! Attestation/model-key state is tied to the session lifetime, so callers should
+//! store a successful [`VerifiedAttestation`] in the session manager only for
+//! that session's TTL/request budget. Calling
 //! [`AttestationVerifier::verify_model_attestation`] always generates a fresh
 //! nonce and fetches fresh Venice evidence.
 //!
@@ -10,8 +11,9 @@
 //! or NVIDIA claims. It verifies the basic Venice attestation envelope, performs
 //! local key/address validation, enforces debug-mode policy where evidence exposes
 //! it, and exposes strict fail-closed gates for required TDX/NRAS verification.
-//! Full DCAP/QVL and NRAS cryptographic verification is not linked in this
-//! closed with [`AttestationError::ExternalVerifierUnavailable`].
+//! Full DCAP/QVL and NRAS cryptographic verification is not linked; when those
+//! verifiers are required by policy, verification fails closed with
+//! [`AttestationError::ExternalVerifierUnavailable`].
 
 use std::{fmt, time::SystemTime};
 
@@ -397,9 +399,6 @@ fn evaluate_tdx_policy(
     }
 
     if policy.require_tdx {
-        // TODO: Integrate an independent Intel DCAP/QVL verifier that validates the
-        // quote signature chain, TCB/collateral, nonce freshness, and REPORTDATA
-        // key binding before allowing strict TDX policy to pass.
         let message = if policy.pccs_url.trim().is_empty() {
             "attestation.require_tdx=true requires independent DCAP/QVL quote verification, but no DCAP verifier is linked and attestation.pccs_url is empty".to_owned()
         } else {
@@ -438,9 +437,6 @@ fn evaluate_nvidia_policy(
             verified: NvidiaVerificationStatus::IgnoredByPolicy,
         }),
         (_, Some(Value::Object(_))) | (_, Some(Value::String(_))) => {
-            // TODO: Integrate NVIDIA NRAS or a local NVIDIA attestation verifier and
-            // validate payload freshness, nonce binding, and key binding before
-            // accepting present/required NVIDIA evidence.
             Err(AttestationError::ExternalVerifierUnavailable {
                 verifier: "nvidia-nras",
                 message: "NVIDIA attestation payload is present and policy requires verification, but this v0.1 verifier has no NRAS/local NVIDIA verifier backend linked".to_owned(),
