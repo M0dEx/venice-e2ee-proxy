@@ -1936,8 +1936,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_route_treats_omitted_stream_as_buffered_non_streaming() {
-        let response = chat_response(
+    async fn chat_route_treats_omitted_stream_as_streaming() {
+        let response = streaming_chat_response(
             "chat-route-omitted-stream",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}]}"#,
             vec![MockStreamFrame::Text("Hello"), MockStreamFrame::Done],
@@ -1945,10 +1945,16 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
-        assert_eq!(body["object"], "chat.completion");
-        assert_eq!(body["choices"][0]["message"]["content"], "Hello");
-        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 3);
+        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
+        assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(first["choices"][0]["delta"]["content"], "Hello");
+        let final_chunk: Value = serde_json::from_str(data[1]).expect("final chunk should be JSON");
+        assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+        assert_eq!(data[2], "[DONE]");
     }
 
     #[tokio::test]

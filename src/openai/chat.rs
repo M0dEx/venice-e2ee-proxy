@@ -50,7 +50,7 @@ impl ChatCompletionRequest {
             .get("messages")
             .ok_or(ChatRequestError::MissingField { field: "messages" })?;
         let messages = normalize_messages(messages_value)?;
-        let stream = optional_bool(object, "stream")?.unwrap_or(false);
+        let stream = optional_bool(object, "stream")?.unwrap_or(true);
         let stream_options = OpenAiStreamOptions::parse(object.get("stream_options"))?;
         let venice_parameters = VeniceParameters::parse(object.get("venice_parameters"))?;
         let passthrough = OpenAiPassthroughFields::parse(object)?;
@@ -1407,7 +1407,6 @@ mod tests {
         let request = parse(json!({
             "model": "e2ee-test",
             "messages": [{"role":"user", "content":"hi"}],
-            "stream": true,
             "stream_options": {"include_usage": false}
         }));
 
