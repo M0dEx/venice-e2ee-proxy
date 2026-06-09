@@ -1,21 +1,21 @@
 //! Configuration loading and validation.
 //!
 //! This module provides a typed representation of the proxy configuration,
-//! default values, validation, and safe lookup of the Venice API key from the
-//! configured environment variable.
+//! default values, validation, and redacted handling for the Venice API key.
 
-use std::{
-    env::{self, VarError},
-    fmt, fs, io,
-    path::{Path, PathBuf},
-};
+use std::{fmt, path::Path};
 
 use axum::http::HeaderName;
+use figment::{
+    Figment,
+    providers::{Env, Format, Toml},
+};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use thiserror::Error;
 
 /// Top-level proxy configuration.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyConfig {
     pub server: ServerConfig,
@@ -28,19 +28,28 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
-    /// Loads configuration from a TOML file and validates it.
+    pub const ENV_PREFIX: &'static str = "VENICE_E2EE_PROXY__";
+
+    /// Loads configuration from a TOML file with environment overrides.
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
-        let contents = fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Self::from_toml_str(&contents)
+        Self::from_figment(
+            Figment::new()
+                .merge(Toml::file(path.as_ref()))
+                .merge(Self::env_provider()),
+        )
     }
 
-    /// Parses TOML configuration, applies defaults, and validates the result.
+    /// Parses TOML configuration and validates the result.
     pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(contents).map_err(ConfigError::ParseToml)?;
+        Self::from_figment(Figment::new().merge(Toml::string(contents)))
+    }
+
+    fn env_provider() -> Env {
+        Env::prefixed(Self::ENV_PREFIX).split("__")
+    }
+
+    fn from_figment(figment: Figment) -> Result<Self, ConfigError> {
+        let config: Self = figment.extract()?;
         config.validate()?;
         Ok(config)
     }
@@ -49,7 +58,6 @@ impl ProxyConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_non_empty("server.host", &self.server.host)?;
         validate_http_url("venice.base_url", &self.venice.base_url, false)?;
-        validate_env_var_name("venice.api_key_env", &self.venice.api_key_env)?;
 
         if self.session.idle_ttl_seconds == 0 {
             return Err(ConfigError::invalid(
@@ -134,29 +142,12 @@ impl ProxyConfig {
         Ok(())
     }
 
-    /// Looks up the Venice API key from the configured environment variable.
-    ///
-    /// The secret is returned in a wrapper whose debug representation is
-    /// redacted. Callers that need to send the key upstream must explicitly call
-    /// [`VeniceApiKey::expose_secret`].
-    pub fn venice_api_key_from_env(&self) -> Result<VeniceApiKey, ConfigError> {
-        self.venice_api_key_from_env_with(|name| env::var(name))
-    }
-
-    /// Testable variant of [`Self::venice_api_key_from_env`].
-    pub fn venice_api_key_from_env_with<F>(&self, lookup: F) -> Result<VeniceApiKey, ConfigError>
-    where
-        F: FnOnce(&str) -> Result<String, VarError>,
-    {
-        match lookup(&self.venice.api_key_env) {
-            Ok(value) if !value.trim().is_empty() => Ok(VeniceApiKey(value)),
-            Ok(_) | Err(VarError::NotPresent) => Err(ConfigError::MissingApiKeyEnv {
-                env_var: self.venice.api_key_env.clone(),
-            }),
-            Err(VarError::NotUnicode(_)) => Err(ConfigError::UnreadableApiKeyEnv {
-                env_var: self.venice.api_key_env.clone(),
-            }),
+    /// Returns the configured Venice API key.
+    pub fn venice_api_key(&self) -> Result<&SecretString, ConfigError> {
+        if self.venice.api_key.expose_secret().trim().is_empty() {
+            return Err(ConfigError::MissingApiKey);
         }
+        Ok(&self.venice.api_key)
     }
 }
 
@@ -170,24 +161,24 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".to_owned(),
-            port: 11_434,
+            host: "0.0.0.0".to_owned(),
+            port: 8080,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VeniceConfig {
     pub base_url: String,
-    pub api_key_env: String,
+    pub api_key: SecretString,
 }
 
 impl Default for VeniceConfig {
     fn default() -> Self {
         Self {
             base_url: "https://api.venice.ai/api/v1".to_owned(),
-            api_key_env: "VENICE_API_KEY".to_owned(),
+            api_key: SecretString::default(),
         }
     }
 }
@@ -414,41 +405,23 @@ impl fmt::Display for ToolMode {
     }
 }
 
-/// A Venice API key loaded from the configured environment variable.
-#[derive(Clone, PartialEq, Eq)]
-pub struct VeniceApiKey(String);
-
-impl VeniceApiKey {
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for VeniceApiKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("VeniceApiKey([redacted])")
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("failed to read config {path}: {source}")]
-    ReadFile {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to parse config TOML: {0}")]
-    ParseToml(#[from] toml::de::Error),
+    #[error("failed to load config: {0}")]
+    Figment(#[source] Box<figment::Error>),
+    #[error("Venice API key is not configured")]
+    MissingApiKey,
     #[error("invalid config value for {field}: {message}")]
     InvalidValue {
         field: &'static str,
         message: String,
     },
-    #[error("Venice API key environment variable {env_var} is not set")]
-    MissingApiKeyEnv { env_var: String },
-    #[error("Venice API key environment variable {env_var} is not valid Unicode")]
-    UnreadableApiKeyEnv { env_var: String },
+}
+
+impl From<figment::Error> for ConfigError {
+    fn from(error: figment::Error) -> Self {
+        Self::Figment(Box::new(error))
+    }
 }
 
 impl ConfigError {
@@ -490,29 +463,6 @@ fn validate_http_url(
     Ok(())
 }
 
-fn validate_env_var_name(field: &'static str, value: &str) -> Result<(), ConfigError> {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return Err(ConfigError::invalid(field, "must not be empty"));
-    };
-
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return Err(ConfigError::invalid(
-            field,
-            "must start with an ASCII letter or underscore",
-        ));
-    }
-
-    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
-        return Err(ConfigError::invalid(
-            field,
-            "must contain only ASCII letters, digits, and underscores",
-        ));
-    }
-
-    Ok(())
-}
-
 fn validate_header_name(field: &'static str, value: &str) -> Result<(), ConfigError> {
     validate_non_empty(field, value)?;
     HeaderName::from_bytes(value.as_bytes())
@@ -524,14 +474,11 @@ fn validate_header_name(field: &'static str, value: &str) -> Result<(), ConfigEr
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_config_matches_expected_values() {
-        let config = ProxyConfig::default();
-
-        assert_eq!(config.server.host, "127.0.0.1");
-        assert_eq!(config.server.port, 11_434);
+    fn assert_default_config_values(config: &ProxyConfig) {
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8080);
         assert_eq!(config.venice.base_url, "https://api.venice.ai/api/v1");
-        assert_eq!(config.venice.api_key_env, "VENICE_API_KEY");
+        assert_eq!(config.venice.api_key.expose_secret(), "");
         assert!(config.keys.generate_proxy_instance_key_on_startup);
         assert_eq!(config.session.idle_ttl_seconds, 600);
         assert_eq!(config.session.max_ttl_seconds, 1_800);
@@ -576,6 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn default_config_matches_expected_values() {
+        let config = ProxyConfig::default();
+
+        assert_default_config_values(&config);
+    }
+
+    #[test]
+    fn checked_in_default_config_matches_code_defaults() {
+        let config = ProxyConfig::from_toml_str(include_str!("../config/default.toml"))
+            .expect("checked-in default config should load");
+
+        assert_default_config_values(&config);
+    }
+
+    #[test]
     fn toml_config_applies_defaults_for_missing_sections() {
         let config = ProxyConfig::from_toml_str(
             r#"
@@ -592,7 +554,7 @@ mod tests {
 
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
-        assert_eq!(config.venice.api_key_env, "VENICE_API_KEY");
+        assert_eq!(config.venice.api_key.expose_secret(), "");
         assert!(!config.tools.enabled);
         assert_eq!(config.tools.mode, ToolMode::None);
         assert_eq!(config.tools.marker_start, "<tool_call>");
@@ -603,15 +565,15 @@ mod tests {
         let err = ProxyConfig::from_toml_str(
             r#"
             [venice]
-            api_key_env = "not-valid-env-name"
+            base_url = "not-valid-url"
             "#,
         )
-        .expect_err("invalid env var name should be rejected");
+        .expect_err("invalid base URL should be rejected");
 
         assert!(matches!(
             err,
             ConfigError::InvalidValue {
-                field: "venice.api_key_env",
+                field: "venice.base_url",
                 ..
             }
         ));
@@ -637,30 +599,29 @@ mod tests {
     }
 
     #[test]
-    fn missing_api_key_environment_variable_is_reported() {
+    fn missing_api_key_is_reported() {
         let config = ProxyConfig::default();
         let err = config
-            .venice_api_key_from_env_with(|_| Err(VarError::NotPresent))
-            .expect_err("missing env var should be reported");
+            .venice_api_key()
+            .expect_err("missing API key should be reported");
 
-        assert!(matches!(
-            err,
-            ConfigError::MissingApiKeyEnv { ref env_var } if env_var == "VENICE_API_KEY"
-        ));
-        assert_eq!(
-            err.to_string(),
-            "Venice API key environment variable VENICE_API_KEY is not set"
-        );
+        assert!(matches!(err, ConfigError::MissingApiKey));
+        assert_eq!(err.to_string(), "Venice API key is not configured");
     }
 
     #[test]
     fn api_key_debug_output_is_redacted() {
-        let config = ProxyConfig::default();
-        let key = config
-            .venice_api_key_from_env_with(|_| Ok("super-secret-test-key".to_owned()))
-            .expect("test key should load");
+        let config = ProxyConfig::from_toml_str(
+            r#"
+            [venice]
+            api_key = "super-secret-test-key"
+            "#,
+        )
+        .expect("config should load");
+        let key = config.venice_api_key().expect("test key should load");
 
         assert_eq!(key.expose_secret(), "super-secret-test-key");
-        assert_eq!(format!("{key:?}"), "VeniceApiKey([redacted])");
+        assert!(!format!("{key:?}").contains("super-secret-test-key"));
+        assert!(!format!("{config:?}").contains("super-secret-test-key"));
     }
 }

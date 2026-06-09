@@ -19,8 +19,10 @@ Use direct Cargo commands only.
 | Purpose | Command |
 | --- | --- |
 | Install/fetch dependencies | `cargo fetch` |
-| Local development entrypoint with defaults | `cargo run` |
-| Local development entrypoint with config | `cargo run -- path/to/config.toml` |
+| Local development entrypoint | `VENICE_E2EE_PROXY__VENICE__API_KEY=... cargo run -- config/default.toml` |
+| Local development entrypoint with custom config | `VENICE_E2EE_PROXY__VENICE__API_KEY=... cargo run -- path/to/config.toml` |
+| Build container image | `docker build -t venice-e2ee-proxy:local .` |
+| Run container image | `docker run --rm -p 8080:8080 -e VENICE_E2EE_PROXY__VENICE__API_KEY=... venice-e2ee-proxy:local` |
 | Format code | `cargo fmt` |
 | Check formatting | `cargo fmt --check` |
 | Lint | `cargo clippy --all-targets --all-features -- -D warnings` |
@@ -31,7 +33,7 @@ Use direct Cargo commands only.
 | All tests | `cargo test --all-targets --all-features` |
 | Baseline validation | Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` |
 
-`cargo run` starts the local proxy using the default config and requires the configured Venice API key environment variable (`VENICE_API_KEY` by default). To provide a TOML config file, run `cargo run -- path/to/config.toml`. Use direct Cargo commands only; this project intentionally does not use a Makefile.
+The proxy requires a TOML config path. Configure the Venice API key either as `venice.api_key` in TOML or with the Figment environment override `VENICE_E2EE_PROXY__VENICE__API_KEY`. The checked-in `config/default.toml` exposes all default values and is copied into the image at `/etc/venice-e2ee-proxy/config.toml`; mount over that path to provide a container config file. Use direct Cargo commands only; this project intentionally does not use a Makefile.
 
 
 ## Module boundaries

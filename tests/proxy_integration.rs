@@ -233,10 +233,8 @@ async fn tool_call_emulation_retries_invalid_marker_then_returns_openai_tool_cal
 
 #[tokio::test]
 async fn missing_api_key_fails_closed_before_router_starts() {
-    let mut config = ProxyConfig::default();
-    config.venice.api_key_env = "VENICE_E2EE_PROXY_TEST_MISSING_API_KEY_DO_NOT_SET".to_owned();
-
-    let error = http::router(config).expect_err("router startup must require an upstream API key");
+    let error = http::router(ProxyConfig::default())
+        .expect_err("router startup must require an upstream API key");
 
     assert_eq!(error.api_error_type(), "proxy_configuration_error");
     assert_eq!(error.api_error_code(), "venice_api_key_missing");

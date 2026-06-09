@@ -15,8 +15,8 @@ use venice_e2ee_proxy::{
     about = "Local OpenAI-compatible proxy shell for Venice E2EE models"
 )]
 struct Cli {
-    /// Optional path to a TOML configuration file. Defaults are used when omitted.
-    config: Option<PathBuf>,
+    /// Path to a TOML configuration file.
+    config: PathBuf,
 }
 
 #[tokio::main]
@@ -29,7 +29,7 @@ async fn main() {
 
 async fn run() -> Result<(), RunError> {
     let cli = Cli::parse();
-    let config = load_config(cli.config)?;
+    let config = ProxyConfig::load_from_path(cli.config)?;
     let bind_host = config.server.host.clone();
     let bind_port = config.server.port;
     let app = http::router(config)?;
@@ -39,17 +39,6 @@ async fn run() -> Result<(), RunError> {
     eprintln!("venice-e2ee-proxy listening on http://{local_addr}");
     http::serve(listener, app).await?;
     Ok(())
-}
-
-fn load_config(config_path: Option<PathBuf>) -> Result<ProxyConfig, ConfigError> {
-    match config_path {
-        Some(path) => ProxyConfig::load_from_path(path),
-        None => {
-            let config = ProxyConfig::default();
-            config.validate()?;
-            Ok(config)
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -67,16 +56,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_accepts_no_config_path() {
-        let cli = Cli::try_parse_from(["venice-e2ee-proxy"]).expect("CLI should parse");
-        assert_eq!(cli.config, None);
+    fn cli_rejects_missing_config_path() {
+        let result = Cli::try_parse_from(["venice-e2ee-proxy"]);
+        assert!(result.is_err());
     }
 
     #[test]
     fn cli_accepts_one_config_path() {
         let cli =
             Cli::try_parse_from(["venice-e2ee-proxy", "config.toml"]).expect("CLI should parse");
-        assert_eq!(cli.config, Some(PathBuf::from("config.toml")));
+        assert_eq!(cli.config, PathBuf::from("config.toml"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use reqwest::{
     Url,
     header::{ACCEPT, CONTENT_TYPE},
 };
+use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -36,7 +37,7 @@ pub struct VeniceClient {
 
 impl VeniceClient {
     pub fn from_config(config: &ProxyConfig) -> Result<Self, VeniceClientError> {
-        let api_key = config.venice_api_key_from_env()?;
+        let api_key = config.venice_api_key()?;
         Self::new(
             &config.venice.base_url,
             api_key.expose_secret(),
@@ -261,8 +262,7 @@ impl VeniceClientError {
 
     pub fn api_error_code(&self) -> &'static str {
         match self {
-            Self::Config(ConfigError::MissingApiKeyEnv { .. }) => "venice_api_key_missing",
-            Self::Config(ConfigError::UnreadableApiKeyEnv { .. }) => "venice_api_key_unreadable",
+            Self::Config(ConfigError::MissingApiKey) => "venice_api_key_missing",
             Self::Config(_)
             | Self::InvalidBaseUrl { .. }
             | Self::ClientBuild { .. }
