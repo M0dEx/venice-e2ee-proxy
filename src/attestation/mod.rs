@@ -461,12 +461,7 @@ struct ParsedTdxQuote {
 }
 
 fn parse_tdx_quote(value: &str) -> Result<ParsedTdxQuote, AttestationError> {
-    let bytes = general_purpose::STANDARD.decode(value).map_err(|source| {
-        AttestationError::PolicyViolation {
-            code: AttestationFailureCode::InvalidTdxEvidence,
-            message: format!("intel_quote is not valid base64: {source}"),
-        }
-    })?;
+    let bytes = decode_tdx_quote(value)?;
 
     if bytes.len() < TDX_REPORT_DATA_END {
         return policy_error(
@@ -491,6 +486,27 @@ fn parse_tdx_quote(value: &str) -> Result<ParsedTdxQuote, AttestationError> {
     let debug = td_attributes & 1 == 1;
 
     Ok(ParsedTdxQuote { tee_type, debug })
+}
+
+fn decode_tdx_quote(value: &str) -> Result<Vec<u8>, AttestationError> {
+    let value = value.trim();
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    if !hex.is_empty()
+        && hex.len().is_multiple_of(2)
+        && hex.as_bytes().iter().all(|byte| hex_value(*byte).is_some())
+    {
+        return decode_hex(hex).map_err(|message| AttestationError::PolicyViolation {
+            code: AttestationFailureCode::InvalidTdxEvidence,
+            message: format!("intel_quote is not valid hex: {message}"),
+        });
+    }
+
+    general_purpose::STANDARD
+        .decode(value)
+        .map_err(|source| AttestationError::PolicyViolation {
+            code: AttestationFailureCode::InvalidTdxEvidence,
+            message: format!("intel_quote is neither hex nor valid base64: {source}"),
+        })
 }
 
 fn verify_reportdata_binding(
@@ -892,7 +908,7 @@ mod tests {
         evidence
             .as_object_mut()
             .unwrap()
-            .insert("intel_quote".to_owned(), json!("not base64"));
+            .insert("intel_quote".to_owned(), json!("not quote encoding"));
 
         let error = verifier(AttestationConfig {
             require_tdx: true,
@@ -916,7 +932,7 @@ mod tests {
         let mut evidence = valid_evidence();
         evidence.as_object_mut().unwrap().insert(
             "intel_quote".to_owned(),
-            json!(tdx_quote_base64(true, TDX_TEE_TYPE)),
+            json!(tdx_quote_hex(true, TDX_TEE_TYPE)),
         );
 
         let error = verifier(AttestationConfig {
@@ -938,11 +954,31 @@ mod tests {
     }
 
     #[test]
-    fn tdx_required_mode_fails_closed_when_dcap_verifier_is_unavailable() {
+    fn tdx_optional_mode_accepts_legacy_base64_quote_encoding() {
         let mut evidence = valid_evidence();
         evidence.as_object_mut().unwrap().insert(
             "intel_quote".to_owned(),
             json!(tdx_quote_base64(false, TDX_TEE_TYPE)),
+        );
+
+        let result = verifier(AttestationConfig {
+            require_tdx: false,
+            require_nvidia: NvidiaRequirement::Never,
+            ..AttestationConfig::default()
+        })
+        .verify_evidence(MODEL, NONCE, evidence)
+        .expect("legacy base64-encoded TDX quote should parse when TDX is optional");
+
+        assert!(result.tdx.present);
+        assert_eq!(result.tdx.tee_type, Some(TDX_TEE_TYPE));
+    }
+
+    #[test]
+    fn tdx_required_mode_fails_closed_when_dcap_verifier_is_unavailable() {
+        let mut evidence = valid_evidence();
+        evidence.as_object_mut().unwrap().insert(
+            "intel_quote".to_owned(),
+            json!(tdx_quote_hex(false, TDX_TEE_TYPE)),
         );
 
         let error = verifier(AttestationConfig {
@@ -1149,14 +1185,22 @@ mod tests {
         assert_eq!(error.api_error_code(), "attestation_fetch_failed");
     }
 
+    fn tdx_quote_hex(debug: bool, tee_type: u32) -> String {
+        encode_lower_hex(&tdx_quote_bytes(debug, tee_type))
+    }
+
     fn tdx_quote_base64(debug: bool, tee_type: u32) -> String {
+        general_purpose::STANDARD.encode(tdx_quote_bytes(debug, tee_type))
+    }
+
+    fn tdx_quote_bytes(debug: bool, tee_type: u32) -> Vec<u8> {
         let mut bytes = vec![0_u8; TDX_REPORT_DATA_END];
         bytes[TDX_QUOTE_TEE_TYPE_OFFSET..TDX_QUOTE_TEE_TYPE_END]
             .copy_from_slice(&tee_type.to_le_bytes());
         let td_attributes = if debug { 1_u64 } else { 0_u64 };
         bytes[TDX_REPORT_TD_ATTRIBUTES_OFFSET..TDX_REPORT_TD_ATTRIBUTES_END]
             .copy_from_slice(&td_attributes.to_le_bytes());
-        general_purpose::STANDARD.encode(bytes)
+        bytes
     }
 
     async fn spawn_attestation_server<F>(handler: F) -> String

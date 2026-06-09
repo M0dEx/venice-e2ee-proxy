@@ -66,15 +66,23 @@ impl ChatCompletionRequest {
         codec: &E2eeCodec,
         model_public_key_hex: &str,
     ) -> Result<PreparedVeniceChatRequest, ChatConstructionError> {
-        let encrypted_messages = codec
-            .encrypt_json_payload(&self.messages, model_public_key_hex)
-            .map_err(ChatConstructionError::E2ee)?;
+        let encrypted_messages = self
+            .messages
+            .iter()
+            .map(|message| {
+                let content = codec
+                    .encrypt_content(&message.content, model_public_key_hex)
+                    .map_err(ChatConstructionError::E2ee)?
+                    .into_hex();
+                Ok(NormalizedChatMessage::new(message.role.clone(), content))
+            })
+            .collect::<Result<Vec<_>, ChatConstructionError>>()?;
 
         Ok(PreparedVeniceChatRequest {
             client_stream: self.stream,
             upstream: VeniceE2eeChatRequest {
                 model: self.model.clone(),
-                messages: encrypted_messages.into_hex(),
+                messages: encrypted_messages,
                 stream: true,
                 stream_options: VeniceStreamOptions {
                     include_usage: self.stream_options.include_usage.unwrap_or(true),
@@ -135,6 +143,7 @@ impl OpenAiStreamOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VeniceParameters {
+    pub enable_e2ee: bool,
     pub include_venice_system_prompt: bool,
     pub enable_web_search: String,
 }
@@ -142,6 +151,7 @@ pub struct VeniceParameters {
 impl Default for VeniceParameters {
     fn default() -> Self {
         Self {
+            enable_e2ee: true,
             include_venice_system_prompt: false,
             enable_web_search: "off".to_owned(),
         }
@@ -161,12 +171,24 @@ impl VeniceParameters {
         })?;
         reject_unknown_fields(
             object,
-            &["include_venice_system_prompt", "enable_web_search"],
+            &[
+                "enable_e2ee",
+                "include_venice_system_prompt",
+                "enable_web_search",
+            ],
             "venice_parameters",
         )?;
         validate_raw_venice_parameter_types(object)?;
 
         let raw: RawVeniceParameters = deserialize_typed_field("venice_parameters", value)?;
+        let enable_e2ee = raw.enable_e2ee.unwrap_or(true);
+        if !enable_e2ee {
+            return Err(ChatRequestError::UnsupportedVeniceParameter {
+                field: "venice_parameters.enable_e2ee",
+                message: "Venice E2EE must remain enabled for encrypted proxy requests".to_owned(),
+            });
+        }
+
         let include_venice_system_prompt = raw.include_venice_system_prompt.unwrap_or(false);
         if include_venice_system_prompt {
             return Err(ChatRequestError::UnsupportedVeniceParameter {
@@ -196,6 +218,7 @@ impl VeniceParameters {
         };
 
         Ok(Self {
+            enable_e2ee,
             include_venice_system_prompt,
             enable_web_search,
         })
@@ -232,7 +255,7 @@ pub struct PreparedVeniceChatRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VeniceE2eeChatRequest {
     pub model: String,
-    pub messages: String,
+    pub messages: Vec<NormalizedChatMessage>,
     pub stream: bool,
     pub stream_options: VeniceStreamOptions,
     pub venice_parameters: VeniceParameters,
@@ -263,6 +286,8 @@ pub struct VeniceStreamOptions {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVeniceParameters {
+    #[serde(default, deserialize_with = "deserialize_optional_bool_reject_null")]
+    enable_e2ee: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_bool_reject_null")]
     include_venice_system_prompt: Option<bool>,
     #[serde(
@@ -624,6 +649,14 @@ fn normalize_text_parts(parts: &[Value], path: &str) -> Result<String, ChatReque
 fn validate_raw_venice_parameter_types(
     object: &Map<String, Value>,
 ) -> Result<(), ChatRequestError> {
+    if let Some(enable_e2ee) = object.get("enable_e2ee")
+        && !enable_e2ee.is_boolean()
+    {
+        return Err(ChatRequestError::invalid_field(
+            "venice_parameters.enable_e2ee",
+            format!("expected boolean, got {}", json_kind(enable_e2ee)),
+        ));
+    }
     if let Some(include_venice_system_prompt) = object.get("include_venice_system_prompt")
         && !include_venice_system_prompt.is_boolean()
     {
@@ -1061,14 +1094,19 @@ mod tests {
             VeniceParameters::default()
         );
 
-        let payload = crate::e2ee::EncryptedPayload::from_hex(&prepared.upstream.messages)
-            .expect("messages should be encrypted hex");
+        assert_eq!(prepared.upstream.messages.len(), request.messages.len());
+        assert_eq!(prepared.upstream.messages[0].role, "user");
+        assert_ne!(
+            prepared.upstream.messages[0].content,
+            request.messages[0].content
+        );
+        let payload =
+            crate::e2ee::EncryptedPayload::from_hex(&prepared.upstream.messages[0].content)
+                .expect("message content should be encrypted hex");
         let plaintext = codec
             .decrypt_content(&payload, &model_key)
-            .expect("test model key should decrypt messages");
-        let messages: Vec<NormalizedChatMessage> = serde_json::from_str(&plaintext)
-            .expect("encrypted messages should contain normalized JSON");
-        assert_eq!(messages, request.messages);
+            .expect("test model key should decrypt message content");
+        assert_eq!(plaintext, request.messages[0].content);
     }
 
     #[test]

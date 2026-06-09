@@ -469,14 +469,16 @@ impl OpenAiChatStreamTransformer {
             .transpose()?;
 
         let mut output = Vec::new();
-        if content.is_none() && !finish_reason.is_null() {
-            output.push(StreamOutput::Json(self.chunk_with_choice(
-                value,
-                choice.get("index"),
-                json!({}),
-                finish_reason,
-            )?));
-            self.sent_final_finish = true;
+        if content.is_none() {
+            if !finish_reason.is_null() {
+                output.push(StreamOutput::Json(self.chunk_with_choice(
+                    value,
+                    choice.get("index"),
+                    json!({}),
+                    finish_reason,
+                )?));
+                self.sent_final_finish = true;
+            }
             return Ok(output);
         }
 
@@ -1003,6 +1005,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_route_ignores_upstream_role_only_chunk_before_encrypted_content() {
+        let response = streaming_chat_response(
+            "chat-route-role-only",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+            vec![
+                MockStreamFrame::Role,
+                MockStreamFrame::Text("Hello"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 3);
+        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
+        assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(first["choices"][0]["delta"]["content"], "Hello");
+        assert_eq!(data[2], "[DONE]");
+    }
+
+    #[tokio::test]
     async fn chat_route_streams_decrypted_normal_assistant_text() {
         let response = streaming_chat_response(
             "chat-route-test",
@@ -1275,6 +1301,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     enum MockStreamFrame {
+        Role,
         Text(&'static str),
         TextForWrongRecipient(&'static str),
         Finish(&'static str),
@@ -1378,11 +1405,26 @@ mod tests {
                                 "upstream request must stream".to_owned(),
                             );
                         }
-                        if !body.get("messages").is_some_and(Value::is_string) {
+                        let messages = body.get("messages").and_then(Value::as_array);
+                        if messages.is_none_or(|messages| {
+                            messages.is_empty()
+                                || !messages.iter().all(|message| {
+                                    message.get("role").and_then(Value::as_str).is_some()
+                                        && message
+                                            .get("content")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|content| {
+                                                !content.is_empty()
+                                                    && content
+                                                        .chars()
+                                                        .all(|ch| ch.is_ascii_hexdigit())
+                                            })
+                                })
+                        }) {
                             return (
                                 StatusCode::BAD_REQUEST,
                                 [("content-type", "text/plain")],
-                                "messages must be encrypted".to_owned(),
+                                "messages must be encrypted message objects".to_owned(),
                             );
                         }
 
@@ -1415,6 +1457,9 @@ mod tests {
         let mut output = String::new();
         for frame in frames {
             match frame {
+                MockStreamFrame::Role => {
+                    output.push_str(&format!("data: {}\n\n", upstream_role_chunk()));
+                }
                 MockStreamFrame::Text(content) => {
                     let encrypted = codec
                         .encrypt_content(content, client_public_key)
@@ -1447,6 +1492,20 @@ mod tests {
             }
         }
         output
+    }
+
+    fn upstream_role_chunk() -> Value {
+        json!({
+            "id": "chatcmpl-upstream-test",
+            "object": "chat.completion.chunk",
+            "created": 1_717_171_717,
+            "model": "e2ee-test",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant" },
+                "finish_reason": null,
+            }],
+        })
     }
 
     fn upstream_content_chunk(encrypted_content: String) -> Value {
