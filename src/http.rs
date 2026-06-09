@@ -1839,13 +1839,17 @@ fn normalized_finish_reason(value: Option<&Value>) -> Result<Value, ChatStreamEr
 
 fn encrypted_delta_content(delta: &Value) -> Result<Option<&str>, ChatStreamError> {
     match delta.get("content") {
+        Some(Value::Null) => {
+            debug!("ignoring null upstream delta.content");
+            Ok(None)
+        }
         Some(Value::String(content)) if content.is_empty() => {
             debug!("ignoring empty upstream delta.content");
             Ok(None)
         }
         Some(Value::String(content)) => Ok(Some(content.as_str())),
         Some(_) => Err(ChatStreamError::malformed_event(
-            "upstream delta.content must be a string",
+            "upstream delta.content must be a string or null",
         )),
         None => Ok(None),
     }
@@ -2332,6 +2336,7 @@ mod tests {
             "chat-route-test",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
             vec![
+                MockStreamFrame::NullContent,
                 MockStreamFrame::EmptyContent,
                 MockStreamFrame::Text("Hello"),
                 MockStreamFrame::Finish("stop"),
@@ -2424,6 +2429,7 @@ mod tests {
             "chat-route-non-streaming-success",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
             vec![
+                MockStreamFrame::NullContent,
                 MockStreamFrame::EmptyContent,
                 MockStreamFrame::Text("Hello"),
                 MockStreamFrame::Text(" world"),
@@ -2504,6 +2510,8 @@ mod tests {
             "chat-route-tool-stream-mixed-text",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
             vec![
+                MockStreamFrame::NullContent,
+                MockStreamFrame::EmptyContent,
                 MockStreamFrame::Text("I'll check that. "),
                 MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}"),
                 MockStreamFrame::Text("</tool_call>"),
@@ -2976,6 +2984,7 @@ mod tests {
     #[derive(Debug, Clone)]
     enum MockStreamFrame {
         Role,
+        NullContent,
         EmptyContent,
         Text(&'static str),
         TextForWrongRecipient(&'static str),
@@ -3242,6 +3251,9 @@ mod tests {
                 MockStreamFrame::Role => {
                     output.push_str(&format!("data: {}\n\n", upstream_role_chunk()));
                 }
+                MockStreamFrame::NullContent => {
+                    output.push_str(&format!("data: {}\n\n", upstream_null_content_chunk()));
+                }
                 MockStreamFrame::EmptyContent => {
                     output.push_str(&format!(
                         "data: {}\n\n",
@@ -3305,6 +3317,20 @@ mod tests {
             "choices": [{
                 "index": 0,
                 "delta": { "content": encrypted_content },
+                "finish_reason": null,
+            }],
+        })
+    }
+
+    fn upstream_null_content_chunk() -> Value {
+        json!({
+            "id": "chatcmpl-upstream-test",
+            "object": "chat.completion.chunk",
+            "created": 1_717_171_717,
+            "model": "e2ee-test",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": Value::Null },
                 "finish_reason": null,
             }],
         })
