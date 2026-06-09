@@ -297,6 +297,34 @@ async fn openai_tool_emulated_chat_response(
         max_retries = tool_context.max_retries(),
         "starting tool-emulated chat completion"
     );
+    if request.stream {
+        let controller_messages = [tool_context.controller_message()];
+        let prepared = request.into_venice_e2ee_request_with_messages(
+            &codec,
+            model_public_key,
+            &controller_messages,
+            &[],
+        )?;
+        let upstream = state
+            .venice_client()
+            .create_chat_completion_stream(
+                &prepared.upstream,
+                proxy_instance_key.public_key_hex(),
+                model_public_key,
+            )
+            .await?;
+
+        return Ok(openai_tool_emulated_chat_sse_response(
+            upstream,
+            tool_context.clone(),
+            codec,
+            proxy_instance_key,
+            request.model.clone(),
+            request.stream_options.include_usage.unwrap_or(false),
+            metadata,
+        ));
+    }
+
     let mut retries = 0;
     let mut correction: Option<(String, String)> = None;
 
@@ -756,6 +784,129 @@ fn openai_chat_event_stream(
                 event_count,
                 output_count,
                 "streaming upstream stream ended before DONE"
+            );
+            parser.finish().map_err(box_chat_stream_error)?;
+            Err::<(), axum::BoxError>(box_chat_stream_error(ChatStreamError::malformed_event(
+                "upstream stream ended before data: [DONE]",
+            )))?;
+        }
+    }
+}
+
+fn openai_tool_emulated_chat_sse_response(
+    upstream: reqwest::Response,
+    tool_context: ToolEmulationContext,
+    codec: E2eeCodec,
+    proxy_instance_key: ProxyInstanceKey,
+    fallback_model: String,
+    include_usage_requested: bool,
+    metadata: ProxyMetadataHeaders,
+) -> Response {
+    let stream = openai_tool_emulated_chat_event_stream(
+        upstream,
+        tool_context,
+        codec,
+        proxy_instance_key,
+        fallback_model,
+        include_usage_requested,
+    );
+    let mut response = Sse::new(stream).into_response();
+    metadata.apply(response.headers_mut());
+    response
+}
+
+fn openai_tool_emulated_chat_event_stream(
+    mut upstream: reqwest::Response,
+    tool_context: ToolEmulationContext,
+    codec: E2eeCodec,
+    proxy_instance_key: ProxyInstanceKey,
+    fallback_model: String,
+    include_usage_requested: bool,
+) -> impl futures_core::Stream<Item = Result<Event, axum::BoxError>> {
+    async_stream::try_stream! {
+        info!(
+            model = %fallback_model,
+            include_usage_requested,
+            "starting tool-emulated upstream chat SSE transformation"
+        );
+        let mut parser = SseEventParser::default();
+        let mut transformer = OpenAiToolEmulatedChatStreamTransformer::new(
+            tool_context,
+            codec,
+            proxy_instance_key,
+            fallback_model.clone(),
+            include_usage_requested,
+        );
+        let mut upstream_done = false;
+        let mut chunk_count = 0_u64;
+        let mut event_count = 0_u64;
+        let mut output_count = 0_u64;
+
+        while let Some(chunk) = upstream
+            .chunk()
+            .await
+            .map_err(ChatStreamError::upstream_stream)
+            .map_err(box_chat_stream_error)?
+        {
+            chunk_count += 1;
+            let chunk = std::str::from_utf8(&chunk)
+                .map_err(ChatStreamError::invalid_utf8)
+                .map_err(box_chat_stream_error)?;
+            let events = parser.push(chunk).map_err(box_chat_stream_error)?;
+            event_count += events.len() as u64;
+            debug!(
+                model = %fallback_model,
+                chunk_count,
+                parsed_events = events.len(),
+                total_events = event_count,
+                "parsed tool-emulated upstream SSE chunk"
+            );
+
+            for event in events {
+                let outputs = transformer.handle_event(event).map_err(box_chat_stream_error)?;
+                output_count += outputs.len() as u64;
+                debug!(
+                    model = %fallback_model,
+                    emitted_outputs = outputs.len(),
+                    total_outputs = output_count,
+                    "transformed tool-emulated upstream SSE event"
+                );
+
+                for output in outputs {
+                    match output {
+                        StreamOutput::Json(value) => yield Event::default().data(value.to_string()),
+                        StreamOutput::Done => {
+                            upstream_done = true;
+                            info!(
+                                model = %fallback_model,
+                                chunk_count,
+                                event_count,
+                                output_count,
+                                "completed tool-emulated upstream chat SSE transformation"
+                            );
+                            yield Event::default().data("[DONE]");
+                            break;
+                        }
+                    }
+                }
+
+                if upstream_done {
+                    break;
+                }
+            }
+
+            if upstream_done {
+                break;
+            }
+        }
+
+        if !upstream_done {
+            warn!(
+                model = %fallback_model,
+                chunk_count,
+                event_count,
+                output_count,
+                "tool-emulated upstream stream ended before DONE"
             );
             parser.finish().map_err(box_chat_stream_error)?;
             Err::<(), axum::BoxError>(box_chat_stream_error(ChatStreamError::malformed_event(
@@ -1308,6 +1459,375 @@ impl OpenAiChatStreamTransformer {
             }],
         }))
     }
+}
+
+struct OpenAiToolEmulatedChatStreamTransformer {
+    tool_context: ToolEmulationContext,
+    codec: E2eeCodec,
+    proxy_instance_key: ProxyInstanceKey,
+    fallback_id: String,
+    fallback_created: i64,
+    fallback_model: String,
+    include_usage_requested: bool,
+    sent_role: bool,
+    sent_final_finish: bool,
+    text_buffer: String,
+    tool_buffer: Option<String>,
+}
+
+impl OpenAiToolEmulatedChatStreamTransformer {
+    fn new(
+        tool_context: ToolEmulationContext,
+        codec: E2eeCodec,
+        proxy_instance_key: ProxyInstanceKey,
+        fallback_model: String,
+        include_usage_requested: bool,
+    ) -> Self {
+        Self {
+            tool_context,
+            codec,
+            proxy_instance_key,
+            fallback_id: format!("chatcmpl-local-{}", uuid::Uuid::new_v4()),
+            fallback_created: unix_timestamp_now(),
+            fallback_model,
+            include_usage_requested,
+            sent_role: false,
+            sent_final_finish: false,
+            text_buffer: String::new(),
+            tool_buffer: None,
+        }
+    }
+
+    fn handle_event(&mut self, event: RawSseEvent) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        let event_type = event.event.as_deref().unwrap_or("message");
+        let is_done = event.data.trim() == "[DONE]";
+        debug!(
+            event_type,
+            is_done, "transforming tool-emulated streaming upstream SSE event"
+        );
+
+        if event.event.as_deref() == Some("error") {
+            warn!("upstream SSE error event while streaming tool-emulated response");
+            return Err(ChatStreamError::upstream_event(event.data));
+        }
+
+        if is_done {
+            info!("received upstream DONE while streaming tool-emulated response");
+            return self.finish_stream(None);
+        }
+
+        let value: Value =
+            serde_json::from_str(&event.data).map_err(ChatStreamError::json_event)?;
+        if let Some(error) = value.get("error") {
+            warn!("upstream JSON error chunk while streaming tool-emulated response");
+            return Err(ChatStreamError::upstream_event(error.to_string()));
+        }
+
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            warn!("tool-emulated upstream chat chunk is missing choices array");
+            return Err(ChatStreamError::malformed_event(
+                "upstream chat chunk is missing choices array",
+            ));
+        };
+
+        if choices.is_empty() {
+            return self.handle_usage_chunk(&value);
+        }
+        if choices.len() != 1 {
+            warn!(
+                choice_count = choices.len(),
+                "unexpected tool-emulated upstream choice count"
+            );
+            return Err(ChatStreamError::malformed_event(format!(
+                "expected exactly one upstream choice, got {}",
+                choices.len(),
+            )));
+        }
+
+        self.handle_choice_chunk(&value, &choices[0])
+    }
+
+    fn handle_choice_chunk(
+        &mut self,
+        value: &Value,
+        choice: &Value,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        let choice = choice.as_object().ok_or_else(|| {
+            ChatStreamError::malformed_event("upstream choice must be a JSON object")
+        })?;
+        let index = normalized_choice_index(choice.get("index"))?;
+        let finish_reason = normalized_finish_reason(choice.get("finish_reason"))?;
+        let delta = choice.get("delta").unwrap_or(&Value::Null);
+        let content = delta
+            .get("content")
+            .map(|content| {
+                content.as_str().ok_or_else(|| {
+                    ChatStreamError::malformed_event("upstream delta.content must be a string")
+                })
+            })
+            .transpose()?;
+
+        let mut output = Vec::new();
+        if let Some(content) = content {
+            let decrypted = self
+                .codec
+                .decrypt_response_content(Some(content), self.proxy_instance_key.private_key())
+                .map_err(ChatStreamError::decryption)?;
+            if let Some(content) = decrypted {
+                output.extend(self.handle_decrypted_content(value, index, &content)?);
+            }
+        }
+
+        if !finish_reason.is_null() && !self.sent_final_finish {
+            output.extend(self.flush_all_text(value, index)?);
+            if !self.sent_final_finish {
+                output.push(StreamOutput::Json(self.chunk_with_choice(
+                    value,
+                    index,
+                    json!({}),
+                    finish_reason,
+                )?));
+                self.sent_final_finish = true;
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn handle_decrypted_content(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+        content: &str,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        if self.sent_final_finish {
+            return Ok(Vec::new());
+        }
+
+        if self.tool_buffer.is_some() {
+            if let Some(buffer) = self.tool_buffer.as_mut() {
+                buffer.push_str(content);
+            }
+            return self.try_emit_tool_call(upstream, index);
+        }
+
+        self.text_buffer.push_str(content);
+        let marker_start = self.tool_context.config().marker_start.clone();
+        if let Some(marker_index) = self.text_buffer.find(&marker_start) {
+            let before_marker = self.text_buffer[..marker_index].to_owned();
+            let marker_and_after = self.text_buffer[marker_index..].to_owned();
+            self.text_buffer.clear();
+
+            let mut output = self.emit_text(upstream, index, before_marker)?;
+            self.tool_buffer = Some(marker_and_after);
+            output.extend(self.try_emit_tool_call(upstream, index)?);
+            return Ok(output);
+        }
+
+        self.flush_safe_text(upstream, index)
+    }
+
+    fn try_emit_tool_call(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        let Some(buffer) = self.tool_buffer.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if buffer.len() > self.tool_context.config().tool_call_max_bytes {
+            return Err(ChatStreamError::malformed_event(format!(
+                "tool call marker exceeded max size of {} bytes",
+                self.tool_context.config().tool_call_max_bytes
+            )));
+        }
+
+        let marker_end = self.tool_context.config().marker_end.clone();
+        let Some(end_start) = buffer.find(&marker_end) else {
+            return Ok(Vec::new());
+        };
+        let end = end_start + marker_end.len();
+        let marker = buffer[..end].to_owned();
+        let trailing = buffer[end..].trim().to_owned();
+        if !trailing.is_empty() {
+            warn!("discarding text after streamed tool call marker");
+        }
+
+        let tool_call = self
+            .tool_context
+            .validate_marker(&marker)
+            .map_err(|error| {
+                ChatStreamError::malformed_event(format!("tool call marker is invalid: {error}"))
+            })?;
+        self.tool_buffer = None;
+        self.text_buffer.clear();
+        self.emit_tool_call(upstream, index, tool_call)
+    }
+
+    fn flush_safe_text(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        let marker_start = self.tool_context.config().marker_start.as_str();
+        let keep_len = marker_prefix_suffix_len(&self.text_buffer, marker_start);
+        let flush_len = self.text_buffer.len().saturating_sub(keep_len);
+        if flush_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let text = self.text_buffer[..flush_len].to_owned();
+        self.text_buffer.drain(..flush_len);
+        self.emit_text(upstream, index, text)
+    }
+
+    fn flush_all_text(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        if self.tool_buffer.is_some() {
+            return Err(ChatStreamError::malformed_event(
+                "upstream stream ended with an incomplete tool call marker",
+            ));
+        }
+        let text = std::mem::take(&mut self.text_buffer);
+        self.emit_text(upstream, index, text)
+    }
+
+    fn emit_text(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+        text: String,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut delta = serde_json::Map::new();
+        if !self.sent_role {
+            delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
+            self.sent_role = true;
+        }
+        delta.insert("content".to_owned(), Value::String(text));
+
+        Ok(vec![StreamOutput::Json(self.chunk_with_choice(
+            upstream,
+            index,
+            Value::Object(delta),
+            Value::Null,
+        )?)])
+    }
+
+    fn emit_tool_call(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+        tool_call: ValidatedToolCall,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        let mut delta = serde_json::Map::new();
+        if !self.sent_role {
+            delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
+            self.sent_role = true;
+        }
+        delta.insert(
+            "tool_calls".to_owned(),
+            Value::Array(vec![tool_call.to_openai_streaming_value()]),
+        );
+
+        self.sent_final_finish = true;
+        Ok(vec![
+            StreamOutput::Json(self.chunk_with_choice(
+                upstream,
+                index,
+                Value::Object(delta),
+                Value::Null,
+            )?),
+            StreamOutput::Json(self.chunk_with_choice(
+                upstream,
+                index,
+                json!({}),
+                Value::String("tool_calls".to_owned()),
+            )?),
+        ])
+    }
+
+    fn handle_usage_chunk(&self, value: &Value) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        let Some(usage) = value.get("usage") else {
+            warn!("tool-emulated upstream chunk has no choices and no usage");
+            return Err(ChatStreamError::malformed_event(
+                "upstream chunk has no choices and no usage",
+            ));
+        };
+
+        if !self.include_usage_requested || self.sent_final_finish {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![StreamOutput::Json(json!({
+            "id": string_field(value, "id").unwrap_or(&self.fallback_id),
+            "object": string_field(value, "object").unwrap_or("chat.completion.chunk"),
+            "created": integer_field(value, "created").unwrap_or(self.fallback_created),
+            "model": string_field(value, "model").unwrap_or(&self.fallback_model),
+            "choices": [],
+            "usage": usage,
+        }))])
+    }
+
+    fn finish_stream(
+        &mut self,
+        upstream: Option<&Value>,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        let upstream = upstream.unwrap_or(&Value::Null);
+        let mut output = self.flush_all_text(upstream, 0)?;
+        if !self.sent_final_finish {
+            output.push(StreamOutput::Json(self.chunk_with_choice(
+                upstream,
+                0,
+                json!({}),
+                Value::String("stop".to_owned()),
+            )?));
+            self.sent_final_finish = true;
+        }
+        output.push(StreamOutput::Done);
+        Ok(output)
+    }
+
+    fn chunk_with_choice(
+        &self,
+        upstream: &Value,
+        index: u64,
+        delta: Value,
+        finish_reason: Value,
+    ) -> Result<Value, ChatStreamError> {
+        Ok(json!({
+            "id": string_field(upstream, "id").unwrap_or(&self.fallback_id),
+            "object": string_field(upstream, "object").unwrap_or("chat.completion.chunk"),
+            "created": integer_field(upstream, "created").unwrap_or(self.fallback_created),
+            "model": string_field(upstream, "model").unwrap_or(&self.fallback_model),
+            "choices": [{
+                "index": index,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }],
+        }))
+    }
+}
+
+fn marker_prefix_suffix_len(buffer: &str, marker: &str) -> usize {
+    if buffer.is_empty() || marker.is_empty() {
+        return 0;
+    }
+
+    let mut best = 0;
+    for (index, _) in buffer.char_indices() {
+        let suffix = &buffer[index..];
+        if suffix.len() < marker.len() && marker.starts_with(suffix) {
+            best = best.max(suffix.len());
+        }
+    }
+    best
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1987,6 +2507,69 @@ mod tests {
         assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
         assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(data[2], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn chat_route_streams_text_then_buffers_and_emits_tool_call() {
+        let response = streaming_chat_response(
+            "chat-route-tool-stream-mixed-text",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            vec![
+                MockStreamFrame::Text("I'll check that. "),
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}"),
+                MockStreamFrame::Text("</tool_call>"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 4);
+        let text_chunk: Value = serde_json::from_str(data[0]).expect("text chunk should be JSON");
+        assert_eq!(text_chunk["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(
+            text_chunk["choices"][0]["delta"]["content"],
+            "I'll check that. "
+        );
+        assert!(
+            text_chunk["choices"][0]["delta"]
+                .get("tool_calls")
+                .is_none()
+        );
+
+        let tool_chunk: Value = serde_json::from_str(data[1]).expect("tool chunk should be JSON");
+        assert!(tool_chunk["choices"][0]["delta"].get("role").is_none());
+        assert!(tool_chunk["choices"][0]["delta"].get("content").is_none());
+        let tool_call = &tool_chunk["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tool_call["function"]["name"], "search_web");
+        assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
+
+        let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(data[3], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn chat_route_returns_non_streaming_tool_call_body_from_mixed_text() {
+        let response = chat_response(
+            "chat-route-tool-non-stream-mixed-text",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":false,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}]}"#,
+            vec![
+                MockStreamFrame::Text("I'll check that. <tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}</tool_call>"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        let tool_call = &body["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tool_call["function"]["name"], "search_web");
+        assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
     }
 
     #[tokio::test]

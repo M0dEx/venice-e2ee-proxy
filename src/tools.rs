@@ -174,6 +174,25 @@ impl ToolEmulationContext {
     }
 
     pub fn classify_assistant_output(&self, output: &str) -> ToolOutputClassification {
+        match self.tool_call_marker_block(output) {
+            Ok(Some(marker)) => {
+                return match self.validate_marker(marker) {
+                    Ok(tool_call) => ToolOutputClassification::ToolCall(tool_call),
+                    Err(error) => ToolOutputClassification::InvalidToolCall {
+                        error,
+                        invalid_output: output.to_owned(),
+                    },
+                };
+            }
+            Err(error) => {
+                return ToolOutputClassification::InvalidToolCall {
+                    error,
+                    invalid_output: output.to_owned(),
+                };
+            }
+            Ok(None) => {}
+        }
+
         match scan_initial_marker_prefix(output, &self.config) {
             InitialMarkerScan::ToolCall => match self.validate_marker(output) {
                 Ok(tool_call) => ToolOutputClassification::ToolCall(tool_call),
@@ -186,7 +205,7 @@ impl ToolEmulationContext {
                 if self.require_tool_call {
                     ToolOutputClassification::InvalidToolCall {
                         error: ToolCallValidationError::new(
-                            "expected the assistant response to begin with a tool_call marker",
+                            "expected the assistant response to include a tool_call marker",
                         ),
                         invalid_output: output.to_owned(),
                     }
@@ -195,6 +214,24 @@ impl ToolEmulationContext {
                 }
             }
         }
+    }
+
+    fn tool_call_marker_block<'a>(
+        &self,
+        output: &'a str,
+    ) -> Result<Option<&'a str>, ToolCallValidationError> {
+        let Some(start) = output.find(&self.config.marker_start) else {
+            return Ok(None);
+        };
+        let after_start = &output[start..];
+        let Some(end_start) = after_start.find(&self.config.marker_end) else {
+            return Err(ToolCallValidationError::new(format!(
+                "tool call must end with {}",
+                self.config.marker_end
+            )));
+        };
+        let end = start + end_start + self.config.marker_end.len();
+        Ok(Some(&output[start..end]))
     }
 
     pub fn validate_marker(
