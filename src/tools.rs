@@ -275,15 +275,7 @@ impl ToolEmulationContext {
         let object = value
             .as_object()
             .ok_or_else(|| ToolCallValidationError::new("tool call JSON must be an object"))?;
-        if object.len() != 2 || !object.contains_key("name") || !object.contains_key("arguments") {
-            return Err(ToolCallValidationError::new(
-                "tool call JSON must contain exactly name and arguments fields",
-            ));
-        }
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolCallValidationError::new("tool call name must be a string"))?;
+        let (name, arguments) = extract_tool_call_name_and_arguments(object)?;
         if name.trim().is_empty() {
             return Err(ToolCallValidationError::new(
                 "tool call name must not be empty",
@@ -294,26 +286,19 @@ impl ToolEmulationContext {
             .iter()
             .find(|tool| tool.name() == name)
             .ok_or_else(|| ToolCallValidationError::new(format!("unknown tool name {name:?}")))?;
-        let arguments = object
-            .get("arguments")
-            .ok_or_else(|| ToolCallValidationError::new("tool call arguments field is missing"))?;
-        if !arguments.is_object() {
-            return Err(ToolCallValidationError::new(
-                "tool call arguments must be a JSON object",
-            ));
-        }
+        let arguments = normalize_tool_call_arguments(arguments)?;
 
         if self.config.validate_json_schema
             && let Some(schema) = tool.parameters_schema()
         {
-            validate_value_against_schema(arguments, schema, "arguments").map_err(|message| {
+            validate_value_against_schema(&arguments, schema, "arguments").map_err(|message| {
                 ToolCallValidationError::new(format!(
                     "tool call arguments do not satisfy schema: {message}"
                 ))
             })?;
         }
 
-        let arguments_json = serde_json::to_string(arguments).map_err(|source| {
+        let arguments_json = serde_json::to_string(&arguments).map_err(|source| {
             ToolCallValidationError::new(format!(
                 "tool call arguments could not be serialized as JSON: {source}"
             ))
@@ -324,6 +309,80 @@ impl ToolEmulationContext {
             name: name.to_owned(),
             arguments_json,
         })
+    }
+}
+
+fn extract_tool_call_name_and_arguments<'a>(
+    object: &'a Map<String, Value>,
+) -> Result<(&'a str, &'a Value), ToolCallValidationError> {
+    if let Some(function) = object.get("function") {
+        let function = function.as_object().ok_or_else(|| {
+            ToolCallValidationError::new("tool call function field must be an object")
+        })?;
+        let name = string_member(function, &["name"])?;
+        let arguments = value_member(function, &["arguments", "parameters"])?;
+        return Ok((name, arguments));
+    }
+
+    let name = string_member(object, &["name", "tool_name", "tool"])?;
+    let arguments = value_member(object, &["arguments", "parameters"])?;
+    Ok((name, arguments))
+}
+
+fn string_member<'a>(
+    object: &'a Map<String, Value>,
+    names: &[&'static str],
+) -> Result<&'a str, ToolCallValidationError> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return value.as_str().ok_or_else(|| {
+                ToolCallValidationError::new(format!("tool call {name} field must be a string"))
+            });
+        }
+    }
+
+    Err(ToolCallValidationError::new(format!(
+        "tool call is missing {} field",
+        names.join(" or ")
+    )))
+}
+
+fn value_member<'a>(
+    object: &'a Map<String, Value>,
+    names: &[&'static str],
+) -> Result<&'a Value, ToolCallValidationError> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return Ok(value);
+        }
+    }
+
+    Err(ToolCallValidationError::new(format!(
+        "tool call is missing {} field",
+        names.join(" or ")
+    )))
+}
+
+fn normalize_tool_call_arguments(arguments: &Value) -> Result<Value, ToolCallValidationError> {
+    match arguments {
+        Value::Object(_) => Ok(arguments.clone()),
+        Value::String(arguments) => {
+            let value: Value = serde_json::from_str(arguments).map_err(|source| {
+                ToolCallValidationError::new(format!(
+                    "tool call arguments JSON is invalid: {source}"
+                ))
+            })?;
+            if value.is_object() {
+                Ok(value)
+            } else {
+                Err(ToolCallValidationError::new(
+                    "tool call arguments JSON string must decode to an object",
+                ))
+            }
+        }
+        _ => Err(ToolCallValidationError::new(
+            "tool call arguments must be a JSON object or JSON object string",
+        )),
     }
 }
 
@@ -840,6 +899,31 @@ mod tests {
         };
         assert_eq!(tool_call.name, "search_web");
         assert_eq!(tool_call.arguments_json, "{\"query\":\"Venice\"}");
+    }
+
+    #[test]
+    fn validates_common_tool_call_marker_variants() {
+        let request = request_with_tool(json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": false
+        }));
+        let context = context_for_request(&request);
+
+        for marker in [
+            r#"<tool_call>{"name":"search_web","parameters":{"query":"Venice"}}</tool_call>"#,
+            r#"<tool_call>{"tool_name":"search_web","arguments":{"query":"Venice"}}</tool_call>"#,
+            r#"<tool_call>{"function":{"name":"search_web","arguments":{"query":"Venice"}}}</tool_call>"#,
+            r#"<tool_call>{"function":{"name":"search_web","parameters":{"query":"Venice"}}}</tool_call>"#,
+            r#"<tool_call>{"type":"function","name":"search_web","arguments":"{\"query\":\"Venice\"}"}</tool_call>"#,
+        ] {
+            let tool_call = context
+                .validate_marker(marker)
+                .expect("common marker variant should validate");
+            assert_eq!(tool_call.name, "search_web");
+            assert_eq!(tool_call.arguments_json, "{\"query\":\"Venice\"}");
+        }
     }
 
     #[test]
