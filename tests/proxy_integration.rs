@@ -232,6 +232,76 @@ async fn tool_call_emulation_retries_invalid_marker_then_returns_openai_tool_cal
 }
 
 #[tokio::test]
+async fn tool_call_emulation_returns_multiple_openai_tool_calls() {
+    let mock = MockVeniceServer::spawn(MockVeniceOptions::with_attempts(vec![vec![
+        MockStreamFrame::Text(
+            r#"<tool_call>{"name":"search_web","arguments":{"query":"first"}}</tool_call>"#,
+        ),
+        MockStreamFrame::Text(
+            r#"<tool_call>{"name":"search_web","arguments":{"query":"second"}}</tool_call>"#,
+        ),
+        MockStreamFrame::Done,
+    ]]))
+    .await;
+    let app = proxy_app(&mock.base_url, Duration::from_secs(1));
+
+    let response = request_chat(
+        app,
+        TEST_SESSION_ID,
+        json!({
+            "model": TEST_MODEL,
+            "messages": [{"role": "user", "content": "search"}],
+            "stream": false,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "search_web",
+                    "description": "Search the web",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                }
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_verified_chat_headers(&response, TEST_SESSION_ID, None);
+
+    let body: Value = response_json(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], Value::Null);
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    let tool_calls = body["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls should be an array");
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0]["function"]["name"], "search_web");
+    assert_eq!(
+        tool_calls[0]["function"]["arguments"],
+        r#"{"query":"first"}"#
+    );
+    assert_eq!(tool_calls[1]["function"]["name"], "search_web");
+    assert_eq!(
+        tool_calls[1]["function"]["arguments"],
+        r#"{"query":"second"}"#
+    );
+    assert_ne!(tool_calls[0]["id"], tool_calls[1]["id"]);
+
+    assert_eq!(
+        mock.counts(),
+        MockCounts {
+            attestations: 1,
+            chats: 1,
+            ..Default::default()
+        }
+    );
+}
+
+#[tokio::test]
 async fn missing_api_key_fails_closed_before_router_starts() {
     let error = http::router(ProxyConfig::default())
         .expect_err("router startup must require an upstream API key");

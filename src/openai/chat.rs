@@ -664,15 +664,18 @@ fn normalize_assistant_tool_calls(
             "assistant tool_calls must not be empty when provided",
         ));
     }
-    if tool_calls.len() > 1 {
-        return Err(ChatRequestError::invalid_tool_history(
-            "parallel assistant tool_calls are not supported by the E2EE proxy",
-        ));
-    }
 
-    let tool_call = tool_calls
-        .first()
-        .expect("tool_calls is known to contain one element");
+    let rendered = tool_calls
+        .iter()
+        .map(render_assistant_tool_call)
+        .collect::<Result<Vec<String>, ChatRequestError>>()?;
+
+    Ok(Some(rendered.join("\n")))
+}
+
+fn render_assistant_tool_call(
+    tool_call: &RawAssistantToolCall,
+) -> Result<String, ChatRequestError> {
     let id = non_empty_typed_string(&tool_call.id, "tool_call.id")?;
     if tool_call.kind != "function" {
         return Err(ChatRequestError::invalid_tool_history(format!(
@@ -696,12 +699,12 @@ fn normalize_assistant_tool_calls(
         ))
     })?;
 
-    Ok(Some(format!(
+    Ok(format!(
         "<previous_tool_call id=\"{}\" name=\"{}\">\n{}\n</previous_tool_call>",
         xml_escape_attr(id),
         xml_escape_attr(name),
         canonical_arguments,
-    )))
+    ))
 }
 
 fn required_content_text(value: Option<&Value>, path: &str) -> Result<String, ChatRequestError> {
@@ -1102,6 +1105,45 @@ mod tests {
             NormalizedChatMessage::new(
                 "assistant",
                 "<previous_tool_call id=\"call_abc\" name=\"search_web\">\n{\"query\":\"Venice E2EE\"}\n</previous_tool_call>",
+            )
+        );
+    }
+
+    #[test]
+    fn normalizes_parallel_assistant_tool_call_history() {
+        let request = parse(json!({
+            "model": "e2ee-test",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_one",
+                            "type": "function",
+                            "function": {
+                                "name": "search_web",
+                                "arguments": "{\"query\":\"Venice E2EE\"}"
+                            }
+                        },
+                        {
+                            "id": "call_two",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"city\":\"Venice\"}"
+                            }
+                        }
+                    ]
+                }
+            ]
+        }));
+
+        assert_eq!(
+            request.messages[0],
+            NormalizedChatMessage::new(
+                "assistant",
+                "<previous_tool_call id=\"call_one\" name=\"search_web\">\n{\"query\":\"Venice E2EE\"}\n</previous_tool_call>\n<previous_tool_call id=\"call_two\" name=\"get_weather\">\n{\"city\":\"Venice\"}\n</previous_tool_call>",
             )
         );
     }

@@ -97,18 +97,6 @@ impl ProxyConfig {
                 "must differ from tools.marker_start",
             ));
         }
-        if self.tools.max_calls_per_turn != 1 {
-            return Err(ConfigError::invalid(
-                "tools.max_calls_per_turn",
-                "must be 1; v0.1 supports exactly one tool call per assistant turn",
-            ));
-        }
-        if self.tools.allow_parallel {
-            return Err(ConfigError::invalid(
-                "tools.allow_parallel",
-                "must be false; v0.1 does not support parallel tool calls",
-            ));
-        }
         if self.tools.initial_marker_scan_bytes == 0 {
             return Err(ConfigError::invalid(
                 "tools.initial_marker_scan_bytes",
@@ -369,8 +357,6 @@ pub struct ToolsConfig {
     pub marker_start: String,
     pub marker_end: String,
     pub max_retries: u32,
-    pub max_calls_per_turn: u32,
-    pub allow_parallel: bool,
     pub initial_marker_scan_bytes: usize,
     pub tool_call_max_bytes: usize,
     #[serde(deserialize_with = "deserialize_duration")]
@@ -387,8 +373,6 @@ impl Default for ToolsConfig {
             marker_start: "<tool_call>".to_owned(),
             marker_end: "</tool_call>".to_owned(),
             max_retries: 2,
-            max_calls_per_turn: 1,
-            allow_parallel: false,
             initial_marker_scan_bytes: 128,
             tool_call_max_bytes: 65_536,
             tool_call_marker_timeout: Duration::from_secs(30),
@@ -526,7 +510,7 @@ mod tests {
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.venice.base_url, "https://api.venice.ai/api/v1");
         assert_eq!(config.venice.api_key.expose_secret(), "");
-        assert_eq!(config.venice.request_timeout, Duration::from_secs(10));
+        assert_eq!(config.venice.request_timeout, Duration::from_secs(30));
         assert!(config.keys.generate_proxy_instance_key_on_startup);
         assert_eq!(config.session.idle_ttl, Duration::from_secs(600));
         assert_eq!(config.session.max_ttl, Duration::from_secs(1_800));
@@ -559,8 +543,6 @@ mod tests {
         assert_eq!(config.tools.marker_start, "<tool_call>");
         assert_eq!(config.tools.marker_end, "</tool_call>");
         assert_eq!(config.tools.max_retries, 2);
-        assert_eq!(config.tools.max_calls_per_turn, 1);
-        assert!(!config.tools.allow_parallel);
         assert_eq!(config.tools.initial_marker_scan_bytes, 128);
         assert_eq!(config.tools.tool_call_max_bytes, 65_536);
         assert_eq!(
@@ -607,7 +589,7 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.venice.api_key.expose_secret(), "");
-        assert_eq!(config.venice.request_timeout, Duration::from_secs(10));
+        assert_eq!(config.venice.request_timeout, Duration::from_secs(30));
         assert!(!config.tools.enabled);
         assert_eq!(config.tools.mode, ToolMode::None);
         assert_eq!(config.tools.marker_start, "<tool_call>");
@@ -706,14 +688,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_unsupported_v0_1_tool_modes() {
-        for (field, toml) in [
-            ("tools.max_calls_per_turn", "max_calls_per_turn = 2"),
-            ("tools.allow_parallel", "allow_parallel = true"),
-            (
-                "tools.emit_tool_call_arguments_single_chunk",
-                "emit_tool_call_arguments_single_chunk = false",
-            ),
-        ] {
+        for (field, toml) in [(
+            "tools.emit_tool_call_arguments_single_chunk",
+            "emit_tool_call_arguments_single_chunk = false",
+        )] {
             let err = ProxyConfig::from_toml_str(&format!("[tools]\n{toml}\n"))
                 .expect_err("unsupported v0.1 tool mode should be rejected");
             assert!(matches!(

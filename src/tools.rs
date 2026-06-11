@@ -8,6 +8,7 @@
 use std::{collections::HashSet, time::Duration};
 
 use serde_json::{Map, Value};
+use tracing::warn;
 
 use crate::{
     config::{ToolMode, ToolsConfig},
@@ -23,6 +24,7 @@ pub struct ToolEmulationContext {
     tools: Vec<ChatToolDefinition>,
     tool_schemas_json: String,
     require_tool_call: bool,
+    single_tool_call: bool,
 }
 
 impl ToolEmulationContext {
@@ -48,12 +50,9 @@ impl ToolEmulationContext {
             }
             return Ok(None);
         }
-        if request.parallel_tool_calls == Some(true) {
-            return Err(ChatRequestError::invalid_field(
-                "parallel_tool_calls",
-                "parallel tool calls are not supported by the E2EE proxy v0.1 tool emulator",
-            ));
-        }
+        // OpenAI semantics: `parallel_tool_calls: false` asks for at most one
+        // tool call per assistant turn. There is no upper limit otherwise.
+        let single_tool_call = request.parallel_tool_calls == Some(false);
 
         let mut seen_names = HashSet::new();
         for tool in &request.tools {
@@ -110,6 +109,7 @@ impl ToolEmulationContext {
             tools,
             tool_schemas_json,
             require_tool_call,
+            single_tool_call,
         }))
     }
 
@@ -125,11 +125,32 @@ impl ToolEmulationContext {
         self.config.tool_call_marker_timeout
     }
 
+    /// Returns true when the request restricts the assistant to at most one
+    /// tool call per turn (`parallel_tool_calls: false`).
+    pub fn single_tool_call(&self) -> bool {
+        self.single_tool_call
+    }
+
     pub fn controller_message(&self) -> NormalizedChatMessage {
-        let requirement = if self.require_tool_call {
-            "You must call exactly one tool. Do not answer the user directly. Output exactly one tool call using this format and nothing else:"
+        let multiple = !self.single_tool_call;
+        let requirement = match (self.require_tool_call, multiple) {
+            (true, false) => {
+                "You must call exactly one tool. Do not answer the user directly. Output exactly one tool call using this format and nothing else:"
+            }
+            (true, true) => {
+                "You must call at least one tool. Do not answer the user directly. Output each tool call using this format and nothing else:"
+            }
+            (false, false) => {
+                "If a tool is required, do not answer the user directly. Output exactly one tool call using this format and nothing else:"
+            }
+            (false, true) => {
+                "If tools are required, do not answer the user directly. Output each tool call using this format and nothing else:"
+            }
+        };
+        let call_count_rule = if multiple {
+            "Emit one marker block per tool call."
         } else {
-            "If a tool is required, do not answer the user directly. Output exactly one tool call using this format and nothing else:"
+            "Call at most one tool."
         };
         let optional_rule = if self.require_tool_call {
             String::new()
@@ -147,7 +168,7 @@ impl ToolEmulationContext {
         NormalizedChatMessage::new(
             "user",
             format!(
-                "You have access to tools.\n\n{requirement}\n\n{}\n{}\n{}\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- arguments must be valid JSON and must satisfy the tool schema.\n- Call at most one tool.\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
+                "You have access to tools.\n\n{requirement}\n\n{}\n{}\n{}\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- arguments must be valid JSON and must satisfy the tool schema.\n- {call_count_rule}\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
                 self.config.marker_start,
                 r#"{"name":"TOOL_NAME","arguments":{...}}"#,
                 self.config.marker_end,
@@ -161,10 +182,15 @@ impl ToolEmulationContext {
         validation_error: &str,
         invalid_output: &str,
     ) -> NormalizedChatMessage {
+        let requirement = if self.single_tool_call {
+            "You must now return exactly one valid tool call and nothing else."
+        } else {
+            "You must now return only valid tool calls and nothing else."
+        };
         NormalizedChatMessage::new(
             "system",
             format!(
-                "Your previous response attempted a tool call, but it was invalid.\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}\n\nYou must now return exactly one valid tool call and nothing else.\n\nUse this exact format:\n\n{}\n{}\n{}\n\nRules:\n- TOOL_NAME must exactly match one of the available tools.\n- arguments must be a JSON object.\n- arguments must satisfy the tool schema.\n- Do not include markdown fences.\n- Do not include explanations.\n- Do not answer the user directly.\n\nAvailable tools:\n{}",
+                "Your previous response attempted a tool call, but it was invalid.\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}\n\n{requirement}\n\nUse this exact format:\n\n{}\n{}\n{}\n\nRules:\n- TOOL_NAME must exactly match one of the available tools.\n- arguments must be a JSON object.\n- arguments must satisfy the tool schema.\n- Do not include markdown fences.\n- Do not include explanations.\n- Do not answer the user directly.\n\nAvailable tools:\n{}",
                 self.config.marker_start,
                 r#"{"name":"TOOL_NAME","arguments":{...}}"#,
                 self.config.marker_end,
@@ -174,64 +200,78 @@ impl ToolEmulationContext {
     }
 
     pub fn classify_assistant_output(&self, output: &str) -> ToolOutputClassification {
-        match self.tool_call_marker_block(output) {
-            Ok(Some(marker)) => {
-                return match self.validate_marker(marker) {
-                    Ok(tool_call) => ToolOutputClassification::ToolCall(tool_call),
-                    Err(error) => ToolOutputClassification::InvalidToolCall {
-                        error,
-                        invalid_output: output.to_owned(),
-                    },
-                };
-            }
-            Err(error) => {
-                return ToolOutputClassification::InvalidToolCall {
-                    error,
+        let blocks = self.marker_blocks(output);
+        if blocks.is_empty() {
+            return if self.require_tool_call {
+                ToolOutputClassification::InvalidToolCall {
+                    error: ToolCallValidationError::new(
+                        "expected the assistant response to include a tool_call marker",
+                    ),
                     invalid_output: output.to_owned(),
-                };
-            }
-            Ok(None) => {}
+                }
+            } else {
+                ToolOutputClassification::NormalText
+            };
         }
 
-        match scan_initial_marker_prefix(output, &self.config) {
-            InitialMarkerScan::ToolCall => match self.validate_marker(output) {
-                Ok(tool_call) => ToolOutputClassification::ToolCall(tool_call),
-                Err(error) => ToolOutputClassification::InvalidToolCall {
-                    error,
-                    invalid_output: output.to_owned(),
-                },
-            },
-            InitialMarkerScan::NormalText | InitialMarkerScan::Pending => {
-                if self.require_tool_call {
-                    ToolOutputClassification::InvalidToolCall {
-                        error: ToolCallValidationError::new(
-                            "expected the assistant response to include a tool_call marker",
-                        ),
+        let keep = if self.single_tool_call {
+            1
+        } else {
+            blocks.len()
+        };
+        if blocks.len() > keep {
+            warn!(
+                found = blocks.len(),
+                "discarding extra tool call markers; the request set parallel_tool_calls to false"
+            );
+        }
+
+        let mut tool_calls = Vec::new();
+        for block in blocks.iter().take(keep) {
+            match self.validate_marker(block) {
+                Ok(tool_call) => tool_calls.push(tool_call),
+                Err(error) => {
+                    return ToolOutputClassification::InvalidToolCall {
+                        error,
                         invalid_output: output.to_owned(),
-                    }
-                } else {
-                    ToolOutputClassification::NormalText
+                    };
                 }
             }
         }
+        ToolOutputClassification::ToolCalls(tool_calls)
     }
 
-    fn tool_call_marker_block<'a>(
-        &self,
-        output: &'a str,
-    ) -> Result<Option<&'a str>, ToolCallValidationError> {
-        let Some(start) = output.find(&self.config.marker_start) else {
-            return Ok(None);
-        };
-        let after_start = &output[start..];
-        let Some(end_start) = after_start.find(&self.config.marker_end) else {
-            return Err(ToolCallValidationError::new(format!(
-                "tool call must end with {}",
-                self.config.marker_end
-            )));
-        };
-        let end = start + end_start + self.config.marker_end.len();
-        Ok(Some(&output[start..end]))
+    /// Splits assistant output into tool-call marker blocks using lenient
+    /// boundaries: a block ends at the first closing marker, but a new opening
+    /// marker (or the end of output) implicitly closes the current block when
+    /// the model omitted the closing marker.
+    pub fn marker_blocks(&self, output: &str) -> Vec<String> {
+        let start_tag = self.config.marker_start.as_str();
+        let end_tag = self.config.marker_end.as_str();
+        let mut blocks = Vec::new();
+        let mut rest = output;
+        while let Some(start) = rest.find(start_tag) {
+            let body_start = start + start_tag.len();
+            let body = &rest[body_start..];
+            let next_start = body.find(start_tag);
+            let next_end = body.find(end_tag);
+            match (next_end, next_start) {
+                (Some(end), next_start) if next_start.is_none() || next_start > Some(end) => {
+                    let block_end = body_start + end + end_tag.len();
+                    blocks.push(rest[start..block_end].to_owned());
+                    rest = &rest[block_end..];
+                }
+                (_, Some(next)) => {
+                    blocks.push(format!("{}{end_tag}", &rest[start..body_start + next]));
+                    rest = &rest[body_start + next..];
+                }
+                (_, None) => {
+                    blocks.push(format!("{}{end_tag}", &rest[start..]));
+                    rest = "";
+                }
+            }
+        }
+        blocks
     }
 
     pub fn validate_marker(
@@ -258,14 +298,6 @@ impl ToolEmulationContext {
                 self.config.marker_end
             )));
         }
-        if trimmed.matches(&self.config.marker_start).count() != 1
-            || trimmed.matches(&self.config.marker_end).count() != 1
-        {
-            return Err(ToolCallValidationError::new(
-                "expected exactly one tool_call marker",
-            ));
-        }
-
         let inner_start = self.config.marker_start.len();
         let inner_end = trimmed.len() - self.config.marker_end.len();
         let inner = trimmed[inner_start..inner_end].trim();
@@ -397,7 +429,7 @@ fn normalize_tool_call_arguments(arguments: &Value) -> Result<Value, ToolCallVal
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOutputClassification {
     NormalText,
-    ToolCall(ValidatedToolCall),
+    ToolCalls(Vec<ValidatedToolCall>),
     InvalidToolCall {
         error: ToolCallValidationError,
         invalid_output: String,
@@ -423,9 +455,9 @@ impl ValidatedToolCall {
         })
     }
 
-    pub fn to_openai_streaming_value(&self) -> Value {
+    pub fn to_openai_streaming_value(&self, index: u64) -> Value {
         serde_json::json!({
-            "index": 0,
+            "index": index,
             "id": self.id,
             "type": "function",
             "function": {
@@ -902,11 +934,12 @@ mod tests {
             "\n<tool_call>\n{\"name\":\"search_web\",\"arguments\":{\"query\":\"Venice\"}}\n</tool_call>\n",
         );
 
-        let ToolOutputClassification::ToolCall(tool_call) = classification else {
+        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
             panic!("expected valid tool call");
         };
-        assert_eq!(tool_call.name, "search_web");
-        assert_eq!(tool_call.arguments_json, "{\"query\":\"Venice\"}");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "search_web");
+        assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"Venice\"}");
     }
 
     #[test]
@@ -987,14 +1020,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_markers_and_non_object_arguments() {
+    fn rejects_non_object_arguments() {
         let request = request_with_tool(json!({"type": "object"}));
         let context = context_for_request(&request);
-
-        let multiple = context
-            .validate_marker("<tool_call>{\"name\":\"search_web\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"search_web\",\"arguments\":{}}</tool_call>")
-            .unwrap_err();
-        assert!(multiple.message().contains("exactly one"));
 
         let arguments = context
             .validate_marker("<tool_call>{\"name\":\"search_web\",\"arguments\":[]}</tool_call>")
@@ -1004,6 +1032,67 @@ mod tests {
                 .message()
                 .contains("arguments must be a JSON object")
         );
+    }
+
+    #[test]
+    fn splits_multiple_markers_leniently() {
+        let request = request_with_tool(json!({"type": "object"}));
+        let context = context_for_request(&request);
+
+        // Two well-formed marker blocks.
+        let classification = context.classify_assistant_output(
+            "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}</tool_call>\n<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"b\"}}</tool_call>",
+        );
+        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
+            panic!("expected two valid tool calls");
+        };
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"a\"}");
+        assert_eq!(tool_calls[1].arguments_json, "{\"query\":\"b\"}");
+
+        // A new opening marker implicitly closes the previous block, and a
+        // trailing unclosed block is implicitly closed at end of output.
+        let classification = context.classify_assistant_output(
+            "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}\n<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"b\"}}",
+        );
+        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
+            panic!("expected two leniently split tool calls");
+        };
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"a\"}");
+        assert_eq!(tool_calls[1].arguments_json, "{\"query\":\"b\"}");
+    }
+
+    #[test]
+    fn request_parallel_tool_calls_false_keeps_only_first_call() {
+        let request = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "parallel_tool_calls": false,
+            "tools": [{"type":"function", "function":{"name":"search_web", "parameters":{"type":"object"}}}]
+        }))
+        .expect("request should parse");
+        let context = context_for_request(&request);
+        assert!(context.single_tool_call());
+
+        let classification = context.classify_assistant_output(
+            "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}</tool_call><tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"b\"}}</tool_call>",
+        );
+        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
+            panic!("expected the first tool call to be kept");
+        };
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"a\"}");
+
+        let request = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "parallel_tool_calls": true,
+            "tools": [{"type":"function", "function":{"name":"search_web", "parameters":{"type":"object"}}}]
+        }))
+        .expect("request should parse");
+        let context = context_for_request(&request);
+        assert!(!context.single_tool_call());
     }
 
     #[test]
@@ -1022,7 +1111,12 @@ mod tests {
         assert!(
             controller
                 .content
-                .contains("You must call exactly one tool")
+                .contains("You must call at least one tool")
+        );
+        assert!(
+            controller
+                .content
+                .contains("Emit one marker block per tool call")
         );
         assert!(controller.content.contains("search_web"));
 
@@ -1036,6 +1130,28 @@ mod tests {
         );
         assert!(
             correction
+                .content
+                .contains("You must now return only valid tool calls")
+        );
+
+        let single_call_request = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tool_choice": "required",
+            "parallel_tool_calls": false,
+            "tools": [{"type":"function", "function":{"name":"search_web", "parameters":{"type":"object"}}}]
+        }))
+        .expect("request should parse");
+        let single = context_for_request(&single_call_request);
+        assert!(
+            single
+                .controller_message()
+                .content
+                .contains("You must call exactly one tool")
+        );
+        assert!(
+            single
+                .correction_message("bad name", "<tool_call>{}</tool_call>")
                 .content
                 .contains("You must now return exactly one valid tool call")
         );

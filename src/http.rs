@@ -414,21 +414,21 @@ async fn openai_tool_emulated_chat_response(
                     response
                 });
             }
-            ToolOutputClassification::ToolCall(tool_call) => {
+            ToolOutputClassification::ToolCalls(tool_calls) => {
                 info!(
                     model = %request.model,
-                    tool_name = %tool_call.name,
+                    tool_calls = tool_calls.len(),
                     retries,
-                    "tool emulation produced tool call"
+                    "tool emulation produced tool calls"
                 );
                 let mut metadata = metadata.clone();
                 if retries > 0 {
                     metadata.tool_retries = Some(retries);
                 }
                 return Ok(if request.stream {
-                    openai_tool_call_sse_response(completion, tool_call, metadata)
+                    openai_tool_call_sse_response(completion, tool_calls, metadata)
                 } else {
-                    let body = openai_tool_call_completion(completion, tool_call);
+                    let body = openai_tool_call_completion(completion, tool_calls);
                     let mut response = Json(body).into_response();
                     metadata.apply(response.headers_mut());
                     response
@@ -519,7 +519,7 @@ fn openai_chat_sse_response_from_completion(
 
 fn openai_tool_call_sse_response(
     completion: Value,
-    tool_call: ValidatedToolCall,
+    tool_calls: Vec<ValidatedToolCall>,
     metadata: ProxyMetadataHeaders,
 ) -> Response {
     let choice = completion
@@ -529,13 +529,18 @@ fn openai_tool_call_sse_response(
         .cloned()
         .unwrap_or(Value::Null);
     let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+    let streamed_tool_calls: Vec<Value> = tool_calls
+        .iter()
+        .enumerate()
+        .map(|(tool_index, tool_call)| tool_call.to_openai_streaming_value(tool_index as u64))
+        .collect();
     let events = vec![
         openai_chunk_from_completion(
             &completion,
             index,
             json!({
                 "role": "assistant",
-                "tool_calls": [tool_call.to_openai_streaming_value()],
+                "tool_calls": streamed_tool_calls,
             }),
             Value::Null,
         ),
@@ -562,7 +567,7 @@ fn sse_response_from_json_events(events: Vec<Value>, metadata: ProxyMetadataHead
     response
 }
 
-fn openai_tool_call_completion(completion: Value, tool_call: ValidatedToolCall) -> Value {
+fn openai_tool_call_completion(completion: Value, tool_calls: Vec<ValidatedToolCall>) -> Value {
     let choice = completion
         .get("choices")
         .and_then(Value::as_array)
@@ -570,6 +575,10 @@ fn openai_tool_call_completion(completion: Value, tool_call: ValidatedToolCall) 
         .cloned()
         .unwrap_or(Value::Null);
     let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+    let tool_call_values: Vec<Value> = tool_calls
+        .iter()
+        .map(ValidatedToolCall::to_openai_value)
+        .collect();
 
     json!({
         "id": string_field(&completion, "id").unwrap_or("chatcmpl-local"),
@@ -581,7 +590,7 @@ fn openai_tool_call_completion(completion: Value, tool_call: ValidatedToolCall) 
             "message": {
                 "role": "assistant",
                 "content": Value::Null,
-                "tool_calls": [tool_call.to_openai_value()],
+                "tool_calls": tool_call_values,
             },
             "finish_reason": "tool_calls",
         }],
@@ -1459,6 +1468,8 @@ struct OpenAiToolEmulatedChatStreamTransformer {
     sent_final_finish: bool,
     text_buffer: String,
     tool_buffer: Option<String>,
+    /// Number of tool calls emitted so far; doubles as the next tool-call index.
+    emitted_tool_calls: u64,
 }
 
 impl OpenAiToolEmulatedChatStreamTransformer {
@@ -1481,6 +1492,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             sent_final_finish: false,
             text_buffer: String::new(),
             tool_buffer: None,
+            emitted_tool_calls: 0,
         }
     }
 
@@ -1559,15 +1571,18 @@ impl OpenAiToolEmulatedChatStreamTransformer {
 
         if !finish_reason.is_null() && !self.sent_final_finish {
             output.extend(self.finish_pending_content(value, index)?);
-            if !self.sent_final_finish {
-                output.push(StreamOutput::Json(self.chunk_with_choice(
-                    value,
-                    index,
-                    json!({}),
-                    finish_reason,
-                )?));
-                self.sent_final_finish = true;
-            }
+            let finish_reason = if self.emitted_tool_calls > 0 {
+                Value::String("tool_calls".to_owned())
+            } else {
+                finish_reason
+            };
+            output.push(StreamOutput::Json(self.chunk_with_choice(
+                value,
+                index,
+                json!({}),
+                finish_reason,
+            )?));
+            self.sent_final_finish = true;
         }
 
         Ok(output)
@@ -1611,36 +1626,73 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         upstream: &Value,
         index: u64,
     ) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        let Some(buffer) = self.tool_buffer.as_ref() else {
-            return Ok(Vec::new());
-        };
-        if buffer.len() > self.tool_context.config().tool_call_max_bytes {
-            return Err(ChatStreamError::malformed_event(format!(
-                "tool call marker exceeded max size of {} bytes",
-                self.tool_context.config().tool_call_max_bytes
-            )));
-        }
-
+        let marker_start = self.tool_context.config().marker_start.clone();
         let marker_end = self.tool_context.config().marker_end.clone();
-        let Some(end_start) = buffer.find(&marker_end) else {
-            return Ok(Vec::new());
-        };
-        let end = end_start + marker_end.len();
-        let marker = buffer[..end].to_owned();
-        let trailing = buffer[end..].trim().to_owned();
-        if !trailing.is_empty() {
-            warn!("discarding text after streamed tool call marker");
-        }
+        let mut output = Vec::new();
 
-        let tool_call = self
-            .tool_context
-            .validate_marker(&marker)
-            .map_err(|error| {
-                ChatStreamError::malformed_event(format!("tool call marker is invalid: {error}"))
-            })?;
-        self.tool_buffer = None;
-        self.text_buffer.clear();
-        self.emit_tool_call(upstream, index, tool_call)
+        // The tool buffer always begins with `marker_start`. Drain complete
+        // blocks leniently: a block ends at the first closing marker, but a new
+        // opening marker implicitly closes a block whose closing marker the
+        // model omitted.
+        loop {
+            let Some(buffer) = self.tool_buffer.as_ref() else {
+                return Ok(output);
+            };
+            if buffer.len() > self.tool_context.config().tool_call_max_bytes {
+                return Err(ChatStreamError::malformed_event(format!(
+                    "tool call marker exceeded max size of {} bytes",
+                    self.tool_context.config().tool_call_max_bytes
+                )));
+            }
+
+            let body = &buffer[marker_start.len()..];
+            let next_end = body.find(&marker_end);
+            let next_start = body.find(&marker_start);
+            let (block, rest, rest_is_marker) = match (next_end, next_start) {
+                (Some(end), next_start) if next_start.is_none() || next_start > Some(end) => {
+                    let block_end = marker_start.len() + end + marker_end.len();
+                    (
+                        buffer[..block_end].to_owned(),
+                        buffer[block_end..].to_owned(),
+                        false,
+                    )
+                }
+                (_, Some(next)) => {
+                    let split = marker_start.len() + next;
+                    (
+                        format!("{}{marker_end}", &buffer[..split]),
+                        buffer[split..].to_owned(),
+                        true,
+                    )
+                }
+                (_, None) => return Ok(output),
+            };
+
+            if self.tool_context.single_tool_call() && self.emitted_tool_calls > 0 {
+                warn!(
+                    "discarding extra streamed tool call marker; the request set parallel_tool_calls to false"
+                );
+            } else {
+                let tool_call = self.tool_context.validate_marker(&block).map_err(|error| {
+                    ChatStreamError::malformed_event(format!(
+                        "tool call marker is invalid: {error}"
+                    ))
+                })?;
+                output.extend(self.emit_tool_call(upstream, index, tool_call)?);
+            }
+
+            if rest_is_marker {
+                // The remainder starts at the next opening marker; keep
+                // draining in tool-buffer mode.
+                self.tool_buffer = Some(rest);
+            } else {
+                // Re-process the remainder through normal content handling so
+                // trailing text and further markers are handled uniformly.
+                self.tool_buffer = None;
+                output.extend(self.handle_decrypted_content(upstream, index, &rest)?);
+                return Ok(output);
+            }
+        }
     }
 
     fn flush_safe_text(
@@ -1680,6 +1732,14 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             return Ok(Vec::new());
         };
 
+        if self.tool_context.single_tool_call() && self.emitted_tool_calls > 0 {
+            warn!(
+                "discarding extra streamed tool call marker; the request set parallel_tool_calls to false"
+            );
+            self.text_buffer.clear();
+            return Ok(Vec::new());
+        }
+
         let recovered_marker = format!("{}{}", buffer, self.tool_context.config().marker_end);
         match self.tool_context.validate_marker(&recovered_marker) {
             Ok(tool_call) => {
@@ -1716,6 +1776,12 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         if text.is_empty() {
             return Ok(Vec::new());
         }
+        if self.emitted_tool_calls > 0 {
+            if !text.trim().is_empty() {
+                warn!("discarding text after streamed tool call marker");
+            }
+            return Ok(Vec::new());
+        }
 
         let mut delta = serde_json::Map::new();
         if !self.sent_role {
@@ -1745,24 +1811,18 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         }
         delta.insert(
             "tool_calls".to_owned(),
-            Value::Array(vec![tool_call.to_openai_streaming_value()]),
+            Value::Array(vec![
+                tool_call.to_openai_streaming_value(self.emitted_tool_calls),
+            ]),
         );
+        self.emitted_tool_calls += 1;
 
-        self.sent_final_finish = true;
-        Ok(vec![
-            StreamOutput::Json(self.chunk_with_choice(
-                upstream,
-                index,
-                Value::Object(delta),
-                Value::Null,
-            )?),
-            StreamOutput::Json(self.chunk_with_choice(
-                upstream,
-                index,
-                json!({}),
-                Value::String("tool_calls".to_owned()),
-            )?),
-        ])
+        Ok(vec![StreamOutput::Json(self.chunk_with_choice(
+            upstream,
+            index,
+            Value::Object(delta),
+            Value::Null,
+        )?)])
     }
 
     fn handle_usage_chunk(&self, value: &Value) -> Result<Vec<StreamOutput>, ChatStreamError> {
@@ -1794,11 +1854,16 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         let upstream = upstream.unwrap_or(&Value::Null);
         let mut output = self.finish_pending_content(upstream, 0)?;
         if !self.sent_final_finish {
+            let finish_reason = if self.emitted_tool_calls > 0 {
+                "tool_calls"
+            } else {
+                "stop"
+            };
             output.push(StreamOutput::Json(self.chunk_with_choice(
                 upstream,
                 0,
                 json!({}),
-                Value::String("stop".to_owned()),
+                Value::String(finish_reason.to_owned()),
             )?));
             self.sent_final_finish = true;
         }
@@ -2615,6 +2680,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_route_streams_multiple_tool_calls_split_across_chunks() {
+        let response = streaming_chat_response(
+            "chat-route-tool-stream-multiple-calls",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"first\"}}"),
+                MockStreamFrame::Text("</tool_call><tool_call>{\"name\":\"search_web\",\"arguments\":"),
+                MockStreamFrame::Text("{\"query\":\"second\"}}</tool_call>"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 4);
+
+        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
+        assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
+        let first_call = &first["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(first_call["index"], 0);
+        assert_eq!(first_call["function"]["name"], "search_web");
+        assert_eq!(first_call["function"]["arguments"], r#"{"query":"first"}"#);
+
+        let second: Value = serde_json::from_str(data[1]).expect("second chunk should be JSON");
+        assert!(second["choices"][0]["delta"].get("role").is_none());
+        let second_call = &second["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(second_call["index"], 1);
+        assert_eq!(second_call["function"]["name"], "search_web");
+        assert_eq!(
+            second_call["function"]["arguments"],
+            r#"{"query":"second"}"#
+        );
+
+        let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
+        assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(data[3], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn chat_route_streams_lenient_split_when_first_closing_marker_is_missing() {
+        let response = streaming_chat_response(
+            "chat-route-tool-stream-lenient-split",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"first\"}}\n<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"second\"}}</tool_call>"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 4);
+
+        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
+        let first_call = &first["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(first_call["index"], 0);
+        assert_eq!(first_call["function"]["arguments"], r#"{"query":"first"}"#);
+
+        let second: Value = serde_json::from_str(data[1]).expect("second chunk should be JSON");
+        let second_call = &second["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(second_call["index"], 1);
+        assert_eq!(
+            second_call["function"]["arguments"],
+            r#"{"query":"second"}"#
+        );
+
+        let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(data[3], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn chat_route_streams_only_first_tool_call_when_parallel_tool_calls_false() {
+        let response = streaming_chat_response(
+            "chat-route-tool-stream-single-call",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"parallel_tool_calls":false,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"first\"}}</tool_call>"),
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"second\"}}</tool_call>"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 3);
+
+        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
+        let first_call = &first["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(first_call["index"], 0);
+        assert_eq!(first_call["function"]["arguments"], r#"{"query":"first"}"#);
+
+        let final_chunk: Value = serde_json::from_str(data[1]).expect("final chunk should be JSON");
+        assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(data[2], "[DONE]");
+    }
+
+    #[tokio::test]
     async fn chat_route_finishes_cleanly_on_unrecoverable_incomplete_tool_marker() {
         let response = streaming_chat_response(
             "chat-route-tool-stream-unrecoverable-marker",
@@ -2684,6 +2858,38 @@ mod tests {
         assert_eq!(tool_call["type"], "function");
         assert_eq!(tool_call["function"]["name"], "search_web");
         assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
+    }
+
+    #[tokio::test]
+    async fn chat_route_returns_non_streaming_multiple_tool_calls() {
+        let response = chat_response(
+            "chat-route-tool-non-stream-multiple-calls",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":false,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"first\"}}</tool_call>\n<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"second\"}}</tool_call>"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert!(body["choices"][0]["message"]["content"].is_null());
+        let tool_calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .expect("tool_calls should be an array");
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0]["function"]["name"], "search_web");
+        assert_eq!(
+            tool_calls[0]["function"]["arguments"],
+            r#"{"query":"first"}"#
+        );
+        assert_eq!(
+            tool_calls[1]["function"]["arguments"],
+            r#"{"query":"second"}"#
+        );
+        assert_ne!(tool_calls[0]["id"], tool_calls[1]["id"]);
     }
 
     #[tokio::test]
