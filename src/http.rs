@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
+use vllm_tool_parser::{ToolCallDelta, ToolParseResult, ToolParser};
 
 use crate::{
     attestation::{AttestationError, AttestationVerifier},
@@ -34,7 +35,9 @@ use crate::{
         chat::{ChatCompletionRequest, ChatConstructionError, ChatRequestError},
     },
     sessions::{AttestedModelState, SessionContext, SessionError, SessionManager, SessionRequest},
-    tools::{ToolEmulationContext, ToolOutputClassification, ValidatedToolCall},
+    tools::{
+        ToolEmulationContext, ToolOutputClassification, ValidatedToolCall, generate_tool_call_id,
+    },
     venice::{VeniceClient, VeniceClientError},
 };
 
@@ -317,12 +320,13 @@ async fn openai_tool_emulated_chat_response(
 
         let include_usage_requested = request.stream_options.include_usage.unwrap_or(false);
         let transformer = OpenAiToolEmulatedChatStreamTransformer::new(
-            tool_context.clone(),
+            tool_context,
             codec,
             proxy_instance_key,
             request.model.clone(),
             include_usage_requested,
-        );
+        )
+        .map_err(ProxyError::ChatStream)?;
         return Ok(chat_sse_response(
             upstream,
             transformer,
@@ -362,7 +366,7 @@ async fn openai_tool_emulated_chat_response(
             Ok(completion) => completion?,
             Err(_) => {
                 let validation_error = format!(
-                    "tool call marker did not close within {}",
+                    "tool-emulated completion did not finish within {}",
                     humantime::format_duration(tool_context.config().tool_call_marker_timeout)
                 );
                 if retries >= tool_context.max_retries() {
@@ -1310,36 +1314,55 @@ impl ChatSseTransformer for OpenAiChatStreamTransformer {
     }
 }
 
+/// Per-call streaming state for one parser-reported tool call.
+struct ToolStreamState {
+    /// Parser-local tool index; the position in `tool_states` is the OpenAI
+    /// `tool_calls` index (order of first appearance).
+    parser_index: usize,
+    id: String,
+    argument_bytes: usize,
+}
+
+/// Streaming transformer that feeds decrypted assistant text through a
+/// model-family tool parser and emits standard OpenAI incremental
+/// `delta.tool_calls` chunks.
+///
+/// Unlike the non-streaming path, streamed tool calls are NOT validated
+/// against tool names or schemas: parser output is forwarded as-is, matching
+/// standard inference-engine behavior. Validation and the retry/correction
+/// loop remain non-streaming features. Parser errors fail the stream closed.
 struct OpenAiToolEmulatedChatStreamTransformer {
-    tool_context: ToolEmulationContext,
     ctx: ChunkContext,
     include_usage_requested: bool,
     sent_role: bool,
     sent_final_finish: bool,
-    text_buffer: String,
-    tool_buffer: Option<String>,
-    /// Number of tool calls emitted so far; doubles as the next tool-call index.
-    emitted_tool_calls: u64,
+    parser: Box<dyn ToolParser>,
+    parser_finished: bool,
+    tool_call_max_bytes: usize,
+    tool_states: Vec<ToolStreamState>,
 }
 
 impl OpenAiToolEmulatedChatStreamTransformer {
     fn new(
-        tool_context: ToolEmulationContext,
+        tool_context: &ToolEmulationContext,
         codec: E2eeCodec,
         proxy_instance_key: ProxyInstanceKey,
         fallback_model: String,
         include_usage_requested: bool,
-    ) -> Self {
-        Self {
-            tool_context,
+    ) -> Result<Self, ChatStreamError> {
+        let parser = tool_context
+            .create_parser()
+            .map_err(|error| ChatStreamError::malformed_event(error.to_string()))?;
+        Ok(Self {
             ctx: ChunkContext::new(codec, proxy_instance_key, fallback_model),
             include_usage_requested,
             sent_role: false,
             sent_final_finish: false,
-            text_buffer: String::new(),
-            tool_buffer: None,
-            emitted_tool_calls: 0,
-        }
+            parser,
+            parser_finished: false,
+            tool_call_max_bytes: tool_context.config().tool_call_max_bytes,
+            tool_states: Vec::new(),
+        })
     }
 
     fn handle_choice_chunk(
@@ -1356,19 +1379,21 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         let content = encrypted_delta_content(delta)?;
 
         let mut output = Vec::new();
-        if let Some(content) = content {
-            let decrypted = self.ctx.decrypt(Some(content))?;
-            if let Some(content) = decrypted {
-                output.extend(self.handle_decrypted_content(value, index, &content)?);
-            }
+        if let Some(content) = content
+            && let Some(content) = self.ctx.decrypt(Some(content))?
+            && !self.sent_final_finish
+        {
+            let result = self.push_parser(&content)?;
+            output.extend(self.emit_parse_result(value, index, result)?);
         }
 
         if !finish_reason.is_null() && !self.sent_final_finish {
-            output.extend(self.finish_pending_content(value, index)?);
-            let finish_reason = if self.emitted_tool_calls > 0 {
-                Value::String("tool_calls".to_owned())
-            } else {
+            let result = self.finish_parser()?;
+            output.extend(self.emit_parse_result(value, index, result)?);
+            let finish_reason = if self.tool_states.is_empty() {
                 finish_reason
+            } else {
+                Value::String("tool_calls".to_owned())
             };
             output.push(StreamOutput::Json(self.ctx.chunk_with_choice(
                 value,
@@ -1382,201 +1407,44 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         Ok(output)
     }
 
-    fn handle_decrypted_content(
-        &mut self,
-        upstream: &Value,
-        index: u64,
-        content: &str,
-    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        if self.sent_final_finish {
-            return Ok(Vec::new());
-        }
-
-        if self.tool_buffer.is_some() {
-            if let Some(buffer) = self.tool_buffer.as_mut() {
-                buffer.push_str(content);
-            }
-            return self.try_emit_tool_call(upstream, index);
-        }
-
-        self.text_buffer.push_str(content);
-        let marker_start = self.tool_context.config().marker_start.clone();
-        if let Some(marker_index) = self.text_buffer.find(&marker_start) {
-            let before_marker = self.text_buffer[..marker_index].to_owned();
-            let marker_and_after = self.text_buffer[marker_index..].to_owned();
-            self.text_buffer.clear();
-
-            let mut output = self.emit_text(upstream, index, before_marker)?;
-            self.tool_buffer = Some(marker_and_after);
-            output.extend(self.try_emit_tool_call(upstream, index)?);
-            return Ok(output);
-        }
-
-        self.flush_safe_text(upstream, index)
+    /// Feeds one decrypted content delta into the tool parser (fail closed on
+    /// parser errors).
+    fn push_parser(&mut self, content: &str) -> Result<ToolParseResult, ChatStreamError> {
+        self.parser.push(content).map_err(|error| {
+            ChatStreamError::malformed_event(format!("tool call parsing failed: {error}"))
+        })
     }
 
-    fn try_emit_tool_call(
+    /// Flushes the tool parser at end of output (fail closed on parser
+    /// errors, e.g. an unterminated tool call).
+    fn finish_parser(&mut self) -> Result<ToolParseResult, ChatStreamError> {
+        if self.parser_finished {
+            return Ok(ToolParseResult::default());
+        }
+        self.parser_finished = true;
+        self.parser.finish().map_err(|error| {
+            ChatStreamError::malformed_event(format!("tool call parsing failed: {error}"))
+        })
+    }
+
+    /// Emits parser output as OpenAI content and incremental tool-call deltas.
+    fn emit_parse_result(
         &mut self,
         upstream: &Value,
         index: u64,
+        result: ToolParseResult,
     ) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        let marker_start = self.tool_context.config().marker_start.clone();
-        let marker_end = self.tool_context.config().marker_end.clone();
         let mut output = Vec::new();
-
-        // The tool buffer always begins with `marker_start`. Drain complete
-        // blocks leniently: a block ends at the first closing marker, but a new
-        // opening marker implicitly closes a block whose closing marker the
-        // model omitted.
-        loop {
-            let Some(buffer) = self.tool_buffer.as_ref() else {
-                return Ok(output);
-            };
-            if buffer.len() > self.tool_context.config().tool_call_max_bytes {
-                return Err(ChatStreamError::malformed_event(format!(
-                    "tool call marker exceeded max size of {} bytes",
-                    self.tool_context.config().tool_call_max_bytes
-                )));
-            }
-
-            let body = &buffer[marker_start.len()..];
-            let next_end = body.find(&marker_end);
-            let next_start = body.find(&marker_start);
-            let (block, rest, rest_is_marker) = match (next_end, next_start) {
-                (Some(end), next_start) if next_start.is_none() || next_start > Some(end) => {
-                    let block_end = marker_start.len() + end + marker_end.len();
-                    (
-                        buffer[..block_end].to_owned(),
-                        buffer[block_end..].to_owned(),
-                        false,
-                    )
-                }
-                (_, Some(next)) => {
-                    let split = marker_start.len() + next;
-                    (
-                        format!("{}{marker_end}", &buffer[..split]),
-                        buffer[split..].to_owned(),
-                        true,
-                    )
-                }
-                (_, None) => return Ok(output),
-            };
-
-            if self.tool_context.single_tool_call() && self.emitted_tool_calls > 0 {
-                warn!(
-                    "discarding extra streamed tool call marker; the request set parallel_tool_calls to false"
-                );
-            } else {
-                let tool_call = self.tool_context.validate_marker(&block).map_err(|error| {
-                    ChatStreamError::malformed_event(format!(
-                        "tool call marker is invalid: {error}"
-                    ))
-                })?;
-                output.extend(self.emit_tool_call(upstream, index, tool_call)?);
-            }
-
-            if rest_is_marker {
-                // The remainder starts at the next opening marker; keep
-                // draining in tool-buffer mode.
-                self.tool_buffer = Some(rest);
-            } else {
-                // Re-process the remainder through normal content handling so
-                // trailing text and further markers are handled uniformly.
-                self.tool_buffer = None;
-                output.extend(self.handle_decrypted_content(upstream, index, &rest)?);
-                return Ok(output);
-            }
+        if !result.normal_text.is_empty() {
+            output.push(self.text_chunk(upstream, index, result.normal_text));
         }
+        for call in result.calls {
+            output.push(self.tool_call_chunk(upstream, index, call)?);
+        }
+        Ok(output)
     }
 
-    fn flush_safe_text(
-        &mut self,
-        upstream: &Value,
-        index: u64,
-    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        let marker_start = self.tool_context.config().marker_start.as_str();
-        let keep_len = marker_prefix_suffix_len(&self.text_buffer, marker_start);
-        let flush_len = self.text_buffer.len().saturating_sub(keep_len);
-        if flush_len == 0 {
-            return Ok(Vec::new());
-        }
-
-        let text = self.text_buffer[..flush_len].to_owned();
-        self.text_buffer.drain(..flush_len);
-        self.emit_text(upstream, index, text)
-    }
-
-    fn finish_pending_content(
-        &mut self,
-        upstream: &Value,
-        index: u64,
-    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        if self.tool_buffer.is_some() {
-            return self.finish_incomplete_tool_call(upstream, index);
-        }
-        self.flush_all_text(upstream, index)
-    }
-
-    fn finish_incomplete_tool_call(
-        &mut self,
-        upstream: &Value,
-        index: u64,
-    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        let Some(buffer) = self.tool_buffer.take() else {
-            return Ok(Vec::new());
-        };
-
-        if self.tool_context.single_tool_call() && self.emitted_tool_calls > 0 {
-            warn!(
-                "discarding extra streamed tool call marker; the request set parallel_tool_calls to false"
-            );
-            self.text_buffer.clear();
-            return Ok(Vec::new());
-        }
-
-        let recovered_marker = format!("{}{}", buffer, self.tool_context.config().marker_end);
-        match self.tool_context.validate_marker(&recovered_marker) {
-            Ok(tool_call) => {
-                warn!("recovered streamed tool call with missing closing marker");
-                self.text_buffer.clear();
-                self.emit_tool_call(upstream, index, tool_call)
-            }
-            Err(error) => {
-                warn!(
-                    validation_error = %error,
-                    "discarding incomplete streamed tool call marker"
-                );
-                self.text_buffer.clear();
-                Ok(Vec::new())
-            }
-        }
-    }
-
-    fn flush_all_text(
-        &mut self,
-        upstream: &Value,
-        index: u64,
-    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        let text = std::mem::take(&mut self.text_buffer);
-        self.emit_text(upstream, index, text)
-    }
-
-    fn emit_text(
-        &mut self,
-        upstream: &Value,
-        index: u64,
-        text: String,
-    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        if text.is_empty() {
-            return Ok(Vec::new());
-        }
-        if self.emitted_tool_calls > 0 {
-            if !text.trim().is_empty() {
-                warn!("discarding text after streamed tool call marker");
-            }
-            return Ok(Vec::new());
-        }
-
+    fn text_chunk(&mut self, upstream: &Value, index: u64, text: String) -> StreamOutput {
         let mut delta = serde_json::Map::new();
         if !self.sent_role {
             delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
@@ -1584,20 +1452,63 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         }
         delta.insert("content".to_owned(), Value::String(text));
 
-        Ok(vec![StreamOutput::Json(self.ctx.chunk_with_choice(
+        StreamOutput::Json(self.ctx.chunk_with_choice(
             upstream,
             index,
             Value::Object(delta),
             Value::Null,
-        ))])
+        ))
     }
 
-    fn emit_tool_call(
+    /// Emits one incremental OpenAI tool-call delta: id, type, and name on the
+    /// first fragment for a call, argument fragments after.
+    fn tool_call_chunk(
         &mut self,
         upstream: &Value,
         index: u64,
-        tool_call: ValidatedToolCall,
-    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        call: ToolCallDelta,
+    ) -> Result<StreamOutput, ChatStreamError> {
+        let (openai_index, is_first) = match self
+            .tool_states
+            .iter()
+            .position(|state| state.parser_index == call.tool_index)
+        {
+            Some(openai_index) => (openai_index, false),
+            None => {
+                self.tool_states.push(ToolStreamState {
+                    parser_index: call.tool_index,
+                    id: generate_tool_call_id(),
+                    argument_bytes: 0,
+                });
+                (self.tool_states.len() - 1, true)
+            }
+        };
+        // This caps emitted argument bytes per call; text the parser buffers
+        // internally before emitting (e.g. an unfinished tool-call header) is
+        // not counted and is bounded only by the upstream stream length.
+        let state = &mut self.tool_states[openai_index];
+        state.argument_bytes += call.arguments.len();
+        if state.argument_bytes > self.tool_call_max_bytes {
+            return Err(ChatStreamError::malformed_event(format!(
+                "tool call arguments exceeded max size of {} bytes",
+                self.tool_call_max_bytes
+            )));
+        }
+
+        let mut function = serde_json::Map::new();
+        if let Some(name) = call.name {
+            function.insert("name".to_owned(), Value::String(name));
+        }
+        function.insert("arguments".to_owned(), Value::String(call.arguments));
+
+        let mut tool_call = serde_json::Map::new();
+        tool_call.insert("index".to_owned(), json!(openai_index));
+        if is_first {
+            tool_call.insert("id".to_owned(), Value::String(state.id.clone()));
+            tool_call.insert("type".to_owned(), Value::String("function".to_owned()));
+        }
+        tool_call.insert("function".to_owned(), Value::Object(function));
+
         let mut delta = serde_json::Map::new();
         if !self.sent_role {
             delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
@@ -1605,18 +1516,15 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         }
         delta.insert(
             "tool_calls".to_owned(),
-            Value::Array(vec![
-                tool_call.to_openai_streaming_value(self.emitted_tool_calls),
-            ]),
+            Value::Array(vec![Value::Object(tool_call)]),
         );
-        self.emitted_tool_calls += 1;
 
-        Ok(vec![StreamOutput::Json(self.ctx.chunk_with_choice(
+        Ok(StreamOutput::Json(self.ctx.chunk_with_choice(
             upstream,
             index,
             Value::Object(delta),
             Value::Null,
-        ))])
+        )))
     }
 
     fn handle_usage_chunk(&self, value: &Value) -> Result<Vec<StreamOutput>, ChatStreamError> {
@@ -1627,7 +1535,9 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             ));
         };
 
-        if !self.include_usage_requested || self.sent_final_finish {
+        // Usage normally arrives after the finish chunk; forward it whenever
+        // the client requested it.
+        if !self.include_usage_requested {
             return Ok(Vec::new());
         }
 
@@ -1636,12 +1546,14 @@ impl OpenAiToolEmulatedChatStreamTransformer {
 
     fn finish_stream(&mut self) -> Result<Vec<StreamOutput>, ChatStreamError> {
         let upstream = &Value::Null;
-        let mut output = self.finish_pending_content(upstream, 0)?;
+        let mut output = Vec::new();
         if !self.sent_final_finish {
-            let finish_reason = if self.emitted_tool_calls > 0 {
-                "tool_calls"
-            } else {
+            let result = self.finish_parser()?;
+            output.extend(self.emit_parse_result(upstream, 0, result)?);
+            let finish_reason = if self.tool_states.is_empty() {
                 "stop"
+            } else {
+                "tool_calls"
             };
             output.push(StreamOutput::Json(self.ctx.chunk_with_choice(
                 upstream,
@@ -1666,21 +1578,6 @@ impl ChatSseTransformer for OpenAiToolEmulatedChatStreamTransformer {
             }
         }
     }
-}
-
-fn marker_prefix_suffix_len(buffer: &str, marker: &str) -> usize {
-    if buffer.is_empty() || marker.is_empty() {
-        return 0;
-    }
-
-    let mut best = 0;
-    for (index, _) in buffer.char_indices() {
-        let suffix = &buffer[index..];
-        if suffix.len() < marker.len() && marker.starts_with(suffix) {
-            best = best.max(suffix.len());
-        }
-    }
-    best
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2335,7 +2232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_route_streams_tool_call_chunks() {
+    async fn chat_route_streams_incremental_tool_call_chunks() {
         let response = streaming_chat_response(
             "chat-route-tool-stream",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
@@ -2349,25 +2246,37 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_body(response).await;
-        let data = sse_data(&body);
-        assert_eq!(data.len(), 3);
-        let tool_chunk: Value = serde_json::from_str(data[0]).expect("tool chunk should be JSON");
-        assert_eq!(tool_chunk["choices"][0]["delta"]["role"], "assistant");
-        let tool_call = &tool_chunk["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(tool_call["index"], 0);
-        assert!(tool_call["id"].as_str().unwrap().starts_with("call_"));
-        assert_eq!(tool_call["type"], "function");
-        assert_eq!(tool_call["function"]["name"], "search_web");
-        assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
-        assert!(tool_chunk["choices"][0]["finish_reason"].is_null());
-        let final_chunk: Value = serde_json::from_str(data[1]).expect("final chunk should be JSON");
+        let chunks = sse_json_chunks(&body);
+
+        // Role is sent once, on the first emitted chunk.
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+
+        // First fragment for a call carries id, type, and name; later
+        // fragments carry only argument text.
+        let tool_calls = streamed_tool_call_deltas(&chunks);
+        assert!(!tool_calls.is_empty());
+        let first = tool_calls[0];
+        assert_eq!(first["index"], 0);
+        assert!(first["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(first["type"], "function");
+        assert_eq!(first["function"]["name"], "search_web");
+        for later in &tool_calls[1..] {
+            assert!(later.get("id").is_none());
+            assert!(later.get("type").is_none());
+            assert!(later["function"].get("name").is_none());
+        }
+        assert_eq!(
+            streamed_tool_call_arguments(&chunks, 0),
+            r#"{"query":"example"}"#
+        );
+
+        let final_chunk = chunks.last().expect("stream should have chunks");
         assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
         assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(data[2], "[DONE]");
     }
 
     #[tokio::test]
-    async fn chat_route_streams_text_then_buffers_and_emits_tool_call() {
+    async fn chat_route_streams_text_then_incremental_tool_call() {
         let response = streaming_chat_response(
             "chat-route-tool-stream-mixed-text",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
@@ -2385,40 +2294,52 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_body(response).await;
-        let data = sse_data(&body);
-        assert_eq!(data.len(), 4);
-        let text_chunk: Value = serde_json::from_str(data[0]).expect("text chunk should be JSON");
-        assert_eq!(text_chunk["choices"][0]["delta"]["role"], "assistant");
+        let chunks = sse_json_chunks(&body);
+
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(streamed_content(&chunks), "I'll check that. ");
+
+        let tool_calls = streamed_tool_call_deltas(&chunks);
+        assert!(!tool_calls.is_empty());
+        assert_eq!(tool_calls[0]["function"]["name"], "search_web");
         assert_eq!(
-            text_chunk["choices"][0]["delta"]["content"],
-            "I'll check that. "
-        );
-        assert!(
-            text_chunk["choices"][0]["delta"]
-                .get("tool_calls")
-                .is_none()
+            streamed_tool_call_arguments(&chunks, 0),
+            r#"{"query":"example"}"#
         );
 
-        let tool_chunk: Value = serde_json::from_str(data[1]).expect("tool chunk should be JSON");
-        assert!(tool_chunk["choices"][0]["delta"].get("role").is_none());
-        assert!(tool_chunk["choices"][0]["delta"].get("content").is_none());
-        let tool_call = &tool_chunk["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(tool_call["function"]["name"], "search_web");
-        assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
-
-        let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
+        let final_chunk = chunks.last().expect("stream should have chunks");
         assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(data[3], "[DONE]");
     }
 
     #[tokio::test]
-    async fn chat_route_recovers_streamed_tool_call_missing_closing_marker() {
+    async fn chat_route_fails_closed_on_unterminated_streamed_tool_call() {
+        // A tool call truncated mid-JSON is beyond the lenient closing-marker
+        // recovery; the stream fails closed.
         let response = streaming_chat_response(
             "chat-route-tool-stream-missing-close",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
             vec![
                 MockStreamFrame::Text("I'll check that. "),
-                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}"),
+                MockStreamFrame::Text("<tool_call>{\"name\":"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_stream_body_fails(response).await;
+    }
+
+    #[tokio::test]
+    async fn chat_route_streams_hermes_format_tool_call_from_glm_model() {
+        // Observed live: e2ee-glm-5-1 emits the prompt-instructed Hermes
+        // format. All models parse as Hermes regardless of model ID.
+        let response = streaming_chat_response(
+            "chat-route-tool-stream-glm-hermes",
+            r#"{"model":"e2ee-glm-5-1","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_call>\n{\"name\":\"search_web\",\"arguments\":"),
+                MockStreamFrame::Text("{\"query\":\"example\"}}\n</tool_call>"),
                 MockStreamFrame::Finish("stop"),
                 MockStreamFrame::Done,
             ],
@@ -2427,20 +2348,49 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_body(response).await;
-        let data = sse_data(&body);
-        assert_eq!(data.len(), 4);
-        let text_chunk: Value = serde_json::from_str(data[0]).expect("text chunk should be JSON");
+        let chunks = sse_json_chunks(&body);
+
+        let tool_calls = streamed_tool_call_deltas(&chunks);
+        assert!(!tool_calls.is_empty());
+        assert_eq!(tool_calls[0]["function"]["name"], "search_web");
         assert_eq!(
-            text_chunk["choices"][0]["delta"]["content"],
-            "I'll check that. "
+            streamed_tool_call_arguments(&chunks, 0),
+            r#"{"query":"example"}"#
         );
-        let tool_chunk: Value = serde_json::from_str(data[1]).expect("tool chunk should be JSON");
-        let tool_call = &tool_chunk["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(tool_call["function"]["name"], "search_web");
-        assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
-        let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
+
+        let final_chunk = chunks.last().expect("stream should have chunks");
         assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(data[3], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn chat_route_recovers_streamed_tool_call_with_truncated_closing_marker() {
+        // Observed live: Venice cuts `</tool_call>` for some models. A
+        // complete call missing only the closing marker is recovered.
+        let response = streaming_chat_response(
+            "chat-route-tool-stream-truncated-close",
+            r#"{"model":"e2ee-glm-4-7-flash-p","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            vec![
+                MockStreamFrame::Text("<tool_call>\n{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}\n"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let chunks = sse_json_chunks(&body);
+
+        let tool_calls = streamed_tool_call_deltas(&chunks);
+        assert!(!tool_calls.is_empty());
+        assert_eq!(tool_calls[0]["function"]["name"], "search_web");
+        assert_eq!(
+            streamed_tool_call_arguments(&chunks, 0),
+            r#"{"query":"example"}"#
+        );
+
+        let final_chunk = chunks.last().expect("stream should have chunks");
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[tokio::test]
@@ -2460,40 +2410,44 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_body(response).await;
-        let data = sse_data(&body);
-        assert_eq!(data.len(), 4);
+        let chunks = sse_json_chunks(&body);
 
-        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
-        assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
-        let first_call = &first["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(first_call["index"], 0);
-        assert_eq!(first_call["function"]["name"], "search_web");
-        assert_eq!(first_call["function"]["arguments"], r#"{"query":"first"}"#);
-
-        let second: Value = serde_json::from_str(data[1]).expect("second chunk should be JSON");
-        assert!(second["choices"][0]["delta"].get("role").is_none());
-        let second_call = &second["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(second_call["index"], 1);
-        assert_eq!(second_call["function"]["name"], "search_web");
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        let tool_calls = streamed_tool_call_deltas(&chunks);
+        let first = tool_calls
+            .iter()
+            .find(|tool_call| tool_call["index"] == 0 && tool_call.get("id").is_some())
+            .expect("first call should have an id-bearing fragment");
+        let second = tool_calls
+            .iter()
+            .find(|tool_call| tool_call["index"] == 1 && tool_call.get("id").is_some())
+            .expect("second call should have an id-bearing fragment");
+        assert_eq!(first["function"]["name"], "search_web");
+        assert_eq!(second["function"]["name"], "search_web");
+        assert_ne!(first["id"], second["id"]);
         assert_eq!(
-            second_call["function"]["arguments"],
+            streamed_tool_call_arguments(&chunks, 0),
+            r#"{"query":"first"}"#
+        );
+        assert_eq!(
+            streamed_tool_call_arguments(&chunks, 1),
             r#"{"query":"second"}"#
         );
 
-        let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
+        let final_chunk = chunks.last().expect("stream should have chunks");
         assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
         assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(data[3], "[DONE]");
     }
 
     #[tokio::test]
-    async fn chat_route_streams_lenient_split_when_first_closing_marker_is_missing() {
+    async fn chat_route_tool_stream_passes_through_usage_chunk_when_requested() {
         let response = streaming_chat_response(
-            "chat-route-tool-stream-lenient-split",
-            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            "chat-route-tool-stream-usage",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"stream_options":{"include_usage":true},"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
             vec![
-                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"first\"}}\n<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"second\"}}</tool_call>"),
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"example\"}}</tool_call>"),
                 MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Usage,
                 MockStreamFrame::Done,
             ],
         )
@@ -2501,31 +2455,49 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_body(response).await;
-        let data = sse_data(&body);
-        assert_eq!(data.len(), 4);
+        let chunks = sse_json_chunks(&body);
 
-        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
-        let first_call = &first["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(first_call["index"], 0);
-        assert_eq!(first_call["function"]["arguments"], r#"{"query":"first"}"#);
-
-        let second: Value = serde_json::from_str(data[1]).expect("second chunk should be JSON");
-        let second_call = &second["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(second_call["index"], 1);
-        assert_eq!(
-            second_call["function"]["arguments"],
-            r#"{"query":"second"}"#
-        );
-
-        let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
-        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(data[3], "[DONE]");
+        // Usage arrives after the finish chunk and must still pass through.
+        let usage_chunk = chunks.last().expect("stream should have chunks");
+        assert_eq!(usage_chunk["choices"], json!([]));
+        assert_eq!(usage_chunk["usage"]["total_tokens"], 3);
+        let finish_chunk = &chunks[chunks.len() - 2];
+        assert_eq!(finish_chunk["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[tokio::test]
-    async fn chat_route_streams_only_first_tool_call_when_parallel_tool_calls_false() {
+    async fn chat_route_fails_closed_when_streamed_tool_call_exceeds_max_bytes() {
+        let model_public_key = ProxyInstanceKey::generate().public_key_hex().to_owned();
+        let base_url = spawn_streaming_venice_server(
+            model_public_key,
+            true,
+            vec![
+                MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"this argument body is much longer than the configured cap\"}}</tool_call>"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+        let mut config = chat_config_with_basic_test_attestation();
+        config.tools.tool_call_max_bytes = 16;
+
+        let response = request_chat_with_config(
+            config,
+            "chat-route-tool-stream-max-bytes",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
+            base_url,
+        )
+        .await;
+
+        assert_stream_body_fails(response).await;
+    }
+
+    #[tokio::test]
+    async fn chat_route_streams_all_tool_calls_when_parallel_tool_calls_false() {
+        // `parallel_tool_calls` is accepted for OpenAI compatibility but
+        // ignored; all parsed tool calls are streamed.
         let response = streaming_chat_response(
-            "chat-route-tool-stream-single-call",
+            "chat-route-tool-stream-parallel-false",
             r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"parallel_tool_calls":false,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
             vec![
                 MockStreamFrame::Text("<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"first\"}}</tool_call>"),
@@ -2538,46 +2510,19 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_body(response).await;
-        let data = sse_data(&body);
-        assert_eq!(data.len(), 3);
+        let chunks = sse_json_chunks(&body);
 
-        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
-        let first_call = &first["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(first_call["index"], 0);
-        assert_eq!(first_call["function"]["arguments"], r#"{"query":"first"}"#);
-
-        let final_chunk: Value = serde_json::from_str(data[1]).expect("final chunk should be JSON");
-        assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
-        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(data[2], "[DONE]");
-    }
-
-    #[tokio::test]
-    async fn chat_route_finishes_cleanly_on_unrecoverable_incomplete_tool_marker() {
-        let response = streaming_chat_response(
-            "chat-route-tool-stream-unrecoverable-marker",
-            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"search"}],"stream":true,"tools":[{"type":"function","function":{"name":"search_web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]}"#,
-            vec![
-                MockStreamFrame::Text("I'll check that. "),
-                MockStreamFrame::Text("<tool_call>{\"name\":"),
-                MockStreamFrame::Finish("stop"),
-                MockStreamFrame::Done,
-            ],
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let data = sse_data(&body);
-        assert_eq!(data.len(), 3);
-        let text_chunk: Value = serde_json::from_str(data[0]).expect("text chunk should be JSON");
         assert_eq!(
-            text_chunk["choices"][0]["delta"]["content"],
-            "I'll check that. "
+            streamed_tool_call_arguments(&chunks, 0),
+            r#"{"query":"first"}"#
         );
-        let final_chunk: Value = serde_json::from_str(data[1]).expect("final chunk should be JSON");
-        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
-        assert_eq!(data[2], "[DONE]");
+        assert_eq!(
+            streamed_tool_call_arguments(&chunks, 1),
+            r#"{"query":"second"}"#
+        );
+
+        let final_chunk = chunks.last().expect("stream should have chunks");
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[tokio::test]
@@ -3103,10 +3048,22 @@ mod tests {
         request_body: &'static str,
         base_url: String,
     ) -> Response {
-        let app = router_with_venice_client(
+        request_chat_with_config(
             chat_config_with_basic_test_attestation(),
-            test_venice_client_for_base_url(base_url),
-        );
+            session_id,
+            request_body,
+            base_url,
+        )
+        .await
+    }
+
+    async fn request_chat_with_config(
+        config: ProxyConfig,
+        session_id: &'static str,
+        request_body: &'static str,
+        base_url: String,
+    ) -> Response {
+        let app = router_with_venice_client(config, test_venice_client_for_base_url(base_url));
 
         app.oneshot(
             Request::builder()
@@ -3147,6 +3104,42 @@ mod tests {
     fn sse_data(body: &str) -> Vec<&str> {
         body.lines()
             .filter_map(|line| line.strip_prefix("data: "))
+            .collect()
+    }
+
+    /// Parses all SSE data chunks before the trailing `[DONE]` as JSON.
+    fn sse_json_chunks(body: &str) -> Vec<Value> {
+        let data = sse_data(body);
+        assert_eq!(data.last().copied(), Some("[DONE]"));
+        data[..data.len() - 1]
+            .iter()
+            .map(|chunk| serde_json::from_str(chunk).expect("SSE chunk should be JSON"))
+            .collect()
+    }
+
+    /// Concatenates all `delta.content` text across stream chunks.
+    fn streamed_content(chunks: &[Value]) -> String {
+        chunks
+            .iter()
+            .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+            .collect()
+    }
+
+    /// Flattens all `delta.tool_calls` entries across stream chunks.
+    fn streamed_tool_call_deltas(chunks: &[Value]) -> Vec<&Value> {
+        chunks
+            .iter()
+            .filter_map(|chunk| chunk["choices"][0]["delta"]["tool_calls"].as_array())
+            .flatten()
+            .collect()
+    }
+
+    /// Concatenates streamed argument fragments for one tool-call index.
+    fn streamed_tool_call_arguments(chunks: &[Value], index: u64) -> String {
+        streamed_tool_call_deltas(chunks)
+            .iter()
+            .filter(|tool_call| tool_call["index"] == json!(index))
+            .filter_map(|tool_call| tool_call["function"]["arguments"].as_str())
             .collect()
     }
 

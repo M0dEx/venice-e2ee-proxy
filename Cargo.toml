@@ -30,8 +30,8 @@ uuid = { version = "1.11", features = ["v4"] }
 zeroize = "1.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-json5 = "1.3.1"
 humantime = "2.3.0"
+vllm-tool-parser = { git = "https://github.com/vllm-project/vllm", tag = "v0.22.1" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

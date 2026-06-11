@@ -37,11 +37,7 @@ require_encrypted_response_content = true
 [tools]
 enabled = true
 mode = "emulated"
-marker_start = "<tool_call>"
-marker_end = "</tool_call>"
 max_retries = 2
-initial_marker_scan_bytes = 128
 tool_call_max_bytes = 65536
 tool_call_marker_timeout = "30s"
 validate_json_schema = true
-emit_tool_call_arguments_single_chunk = true

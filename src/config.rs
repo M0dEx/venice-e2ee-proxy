@@ -88,20 +88,6 @@ impl ProxyConfig {
 
         validate_non_empty("e2ee.hkdf_info", &self.e2ee.hkdf_info)?;
 
-        validate_non_empty("tools.marker_start", &self.tools.marker_start)?;
-        validate_non_empty("tools.marker_end", &self.tools.marker_end)?;
-        if self.tools.marker_start == self.tools.marker_end {
-            return Err(ConfigError::invalid(
-                "tools.marker_end",
-                "must differ from tools.marker_start",
-            ));
-        }
-        if self.tools.initial_marker_scan_bytes == 0 {
-            return Err(ConfigError::invalid(
-                "tools.initial_marker_scan_bytes",
-                "must be greater than zero",
-            ));
-        }
         if self.tools.tool_call_max_bytes == 0 {
             return Err(ConfigError::invalid(
                 "tools.tool_call_max_bytes",
@@ -112,12 +98,6 @@ impl ProxyConfig {
             "tools.tool_call_marker_timeout",
             self.tools.tool_call_marker_timeout,
         )?;
-        if !self.tools.emit_tool_call_arguments_single_chunk {
-            return Err(ConfigError::invalid(
-                "tools.emit_tool_call_arguments_single_chunk",
-                "must be true; v0.1 emits complete tool-call arguments in one chunk",
-            ));
-        }
 
         Ok(())
     }
@@ -313,15 +293,11 @@ impl Default for E2eeConfig {
 pub struct ToolsConfig {
     pub enabled: bool,
     pub mode: ToolMode,
-    pub marker_start: String,
-    pub marker_end: String,
     pub max_retries: u32,
-    pub initial_marker_scan_bytes: usize,
     pub tool_call_max_bytes: usize,
     #[serde(deserialize_with = "deserialize_duration")]
     pub tool_call_marker_timeout: Duration,
     pub validate_json_schema: bool,
-    pub emit_tool_call_arguments_single_chunk: bool,
 }
 
 impl Default for ToolsConfig {
@@ -329,14 +305,10 @@ impl Default for ToolsConfig {
         Self {
             enabled: true,
             mode: ToolMode::Emulated,
-            marker_start: "<tool_call>".to_owned(),
-            marker_end: "</tool_call>".to_owned(),
             max_retries: 2,
-            initial_marker_scan_bytes: 128,
             tool_call_max_bytes: 65_536,
             tool_call_marker_timeout: Duration::from_secs(30),
             validate_json_schema: true,
-            emit_tool_call_arguments_single_chunk: true,
         }
     }
 }
@@ -486,17 +458,13 @@ mod tests {
         assert!(config.e2ee.require_encrypted_response_content);
         assert!(config.tools.enabled);
         assert_eq!(config.tools.mode, ToolMode::Emulated);
-        assert_eq!(config.tools.marker_start, "<tool_call>");
-        assert_eq!(config.tools.marker_end, "</tool_call>");
         assert_eq!(config.tools.max_retries, 2);
-        assert_eq!(config.tools.initial_marker_scan_bytes, 128);
         assert_eq!(config.tools.tool_call_max_bytes, 65_536);
         assert_eq!(
             config.tools.tool_call_marker_timeout,
             Duration::from_secs(30)
         );
         assert!(config.tools.validate_json_schema);
-        assert!(config.tools.emit_tool_call_arguments_single_chunk);
 
         config.validate().expect("default config is valid");
     }
@@ -538,7 +506,7 @@ mod tests {
         assert_eq!(config.venice.request_timeout, Duration::from_secs(30));
         assert!(!config.tools.enabled);
         assert_eq!(config.tools.mode, ToolMode::None);
-        assert_eq!(config.tools.marker_start, "<tool_call>");
+        assert_eq!(config.tools.tool_call_max_bytes, 65_536);
     }
 
     #[test]
@@ -633,17 +601,10 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_unsupported_v0_1_tool_modes() {
-        let err =
-            ProxyConfig::from_toml_str("[tools]\nemit_tool_call_arguments_single_chunk = false\n")
-                .expect_err("unsupported v0.1 tool mode should be rejected");
-        assert!(matches!(
-            err,
-            ConfigError::InvalidValue {
-                field: "tools.emit_tool_call_arguments_single_chunk",
-                ..
-            }
-        ));
+    fn removed_tool_marker_options_are_rejected_as_unknown_fields() {
+        let err = ProxyConfig::from_toml_str("[tools]\nmarker_start = \"<tool_call>\"\n")
+            .expect_err("removed tools.marker_start option should be rejected");
+        assert!(matches!(err, ConfigError::Figment(_)));
     }
 
     #[test]

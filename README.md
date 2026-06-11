@@ -2,7 +2,7 @@
 
 Local OpenAI-compatible proxy for Venice.AI E2EE models.
 
-The repository implements a local HTTP proxy shell, typed configuration loading, route registration, shared OpenAI-style errors, safe response-header helpers, the Venice HTTP client, Venice model mapping, `GET /v1/models`, proxy key/session lifecycle, the Venice E2EE codec, attestation fetch/policy checks, request-side chat normalization/E2EE request construction, streaming and buffered non-streaming encrypted chat, marker-based tool-call emulation, and mocked proxy integration tests.
+The repository implements a local HTTP proxy shell, typed configuration loading, route registration, shared OpenAI-style errors, safe response-header helpers, the Venice HTTP client, Venice model mapping, `GET /v1/models`, proxy key/session lifecycle, the Venice E2EE codec, attestation fetch/policy checks, request-side chat normalization/E2EE request construction, streaming and buffered non-streaming encrypted chat, tool-call emulation backed by vLLM's vllm-tool-parser Hermes parser with lenient recovery, and mocked proxy integration tests.
 
 ## Stack
 

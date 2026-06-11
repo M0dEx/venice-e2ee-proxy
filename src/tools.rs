@@ -1,15 +1,23 @@
 //! OpenAI-style tool-call emulation.
 //!
 //! Venice E2EE responses do not expose native function calls, so this module
-//! recognizes the v0.1 marker protocol in decrypted assistant text, validates it
-//! against the request's OpenAI `tools`, and builds prompt text for the encrypted
-//! controller/correction requests.
+//! parses tool calls client-side from decrypted assistant text using vLLM's
+//! `vllm-tool-parser` Hermes parser (the prompt-instructed format) wrapped
+//! with lenient recovery for deviations observed live, validates the calls
+//! against the request's OpenAI `tools`, and builds prompt text for the
+//! encrypted controller/correction requests.
+//!
+//! All models use the Hermes format: Venice E2EE cannot render tools into
+//! the server-side chat template (tools arrive encrypted), so trained native
+//! tool formats are not reliably triggered and the prompt instruction is
+//! what drives the output shape.
 
 use std::{collections::HashSet, time::Duration};
 
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tracing::warn;
+use vllm_tool_parser::{HermesToolParser, Tool, ToolCallDelta, ToolParseResult, ToolParser};
 
 use crate::{
     config::{ToolMode, ToolsConfig},
@@ -19,13 +27,27 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone)]
+/// Tool-call markers used in the controller/correction prompt instructions
+/// (the Hermes format).
+const TOOL_CALL_START: &str = "<tool_call>";
+const TOOL_CALL_END: &str = "</tool_call>";
+
+/// Generates an OpenAI-style tool-call ID.
+pub fn generate_tool_call_id() -> String {
+    format!("call_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Maximum bytes of invalid assistant output echoed back in a correction
+/// prompt; oversized output would otherwise grow each encrypted retry request
+/// by the full output size.
+const CORRECTION_INVALID_OUTPUT_MAX_BYTES: usize = 4_096;
+
+#[derive(Debug)]
 pub struct ToolEmulationContext {
     config: ToolsConfig,
     tools: Vec<ChatToolDefinition>,
     tool_schemas_json: String,
     require_tool_call: bool,
-    single_tool_call: bool,
 }
 
 impl ToolEmulationContext {
@@ -51,9 +73,6 @@ impl ToolEmulationContext {
             }
             return Ok(None);
         }
-        // OpenAI semantics: `parallel_tool_calls: false` asks for at most one
-        // tool call per assistant turn. There is no upper limit otherwise.
-        let single_tool_call = request.parallel_tool_calls == Some(false);
 
         let mut seen_names = HashSet::new();
         for tool in &request.tools {
@@ -110,7 +129,6 @@ impl ToolEmulationContext {
             tools,
             tool_schemas_json,
             require_tool_call,
-            single_tool_call,
         }))
     }
 
@@ -126,40 +144,25 @@ impl ToolEmulationContext {
         self.config.tool_call_marker_timeout
     }
 
-    /// Returns true when the request restricts the assistant to at most one
-    /// tool call per turn (`parallel_tool_calls: false`).
-    pub fn single_tool_call(&self) -> bool {
-        self.single_tool_call
+    /// Creates a tool parser for one assistant turn.
+    ///
+    /// The Hermes parser ignores tool schemas, so none are passed.
+    pub fn create_parser(&self) -> Result<Box<dyn ToolParser>, ToolCallValidationError> {
+        LenientToolParser::create(&[]).map_err(|error| {
+            ToolCallValidationError::new(format!("tool parser could not be created: {error}"))
+        })
     }
 
     pub fn controller_message(&self) -> NormalizedChatMessage {
-        let multiple = !self.single_tool_call;
-        let requirement = match (self.require_tool_call, multiple) {
-            (true, false) => {
-                "You must call exactly one tool. Do not answer the user directly. Output exactly one tool call using this format and nothing else:"
-            }
-            (true, true) => {
-                "You must call at least one tool. Do not answer the user directly. Output each tool call using this format and nothing else:"
-            }
-            (false, false) => {
-                "If a tool is required, do not answer the user directly. Output exactly one tool call using this format and nothing else:"
-            }
-            (false, true) => {
-                "If tools are required, do not answer the user directly. Output each tool call using this format and nothing else:"
-            }
-        };
-        let call_count_rule = if multiple {
-            "Emit one marker block per tool call."
+        let requirement = if self.require_tool_call {
+            "You must call at least one tool. Do not answer the user directly. Output each tool call using this format and nothing else:"
         } else {
-            "Call at most one tool."
+            "If tools are required, do not answer the user directly. Output each tool call using this format and nothing else:"
         };
         let optional_rule = if self.require_tool_call {
             String::new()
         } else {
-            format!(
-                "\n- If no tool is needed, answer normally and do not use {}.",
-                self.config.marker_start
-            )
+            format!("\n- If no tool is needed, answer normally and do not use {TOOL_CALL_START}.")
         };
 
         // Venice E2EE rejects repeated tool-controller `system` prompts when a
@@ -169,11 +172,8 @@ impl ToolEmulationContext {
         NormalizedChatMessage::new(
             "user",
             format!(
-                "You have access to tools.\n\n{requirement}\n\n{}\n{}\n{}\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- arguments must be valid JSON and must satisfy the tool schema.\n- {call_count_rule}\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
-                self.config.marker_start,
-                r#"{"name":"TOOL_NAME","arguments":{...}}"#,
-                self.config.marker_end,
-                self.tool_schemas_json,
+                "You have access to tools.\n\n{requirement}\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- arguments must be valid JSON and must satisfy the tool schema.\n- Emit one marker block per tool call.\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
+                r#"{"name":"TOOL_NAME","arguments":{...}}"#, self.tool_schemas_json,
             ),
         )
     }
@@ -183,130 +183,75 @@ impl ToolEmulationContext {
         validation_error: &str,
         invalid_output: &str,
     ) -> NormalizedChatMessage {
-        let requirement = if self.single_tool_call {
-            "You must now return exactly one valid tool call and nothing else."
-        } else {
-            "You must now return only valid tool calls and nothing else."
-        };
+        let invalid_output =
+            truncate_at_char_boundary(invalid_output, CORRECTION_INVALID_OUTPUT_MAX_BYTES);
         NormalizedChatMessage::new(
             "system",
             format!(
-                "Your previous response attempted a tool call, but it was invalid.\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}\n\n{requirement}\n\nUse this exact format:\n\n{}\n{}\n{}\n\nRules:\n- TOOL_NAME must exactly match one of the available tools.\n- arguments must be a JSON object.\n- arguments must satisfy the tool schema.\n- Do not include markdown fences.\n- Do not include explanations.\n- Do not answer the user directly.\n\nAvailable tools:\n{}",
-                self.config.marker_start,
-                r#"{"name":"TOOL_NAME","arguments":{...}}"#,
-                self.config.marker_end,
-                self.tool_schemas_json,
+                "Your previous response attempted a tool call, but it was invalid.\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}\n\nYou must now return only valid tool calls and nothing else.\n\nUse this exact format:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nRules:\n- TOOL_NAME must exactly match one of the available tools.\n- arguments must be a JSON object.\n- arguments must satisfy the tool schema.\n- Do not include markdown fences.\n- Do not include explanations.\n- Do not answer the user directly.\n\nAvailable tools:\n{}",
+                r#"{"name":"TOOL_NAME","arguments":{...}}"#, self.tool_schemas_json,
             ),
         )
     }
 
+    /// Classifies buffered assistant output into normal text, validated tool
+    /// calls, or an invalid tool call that feeds the retry/correction loop.
+    ///
+    /// Mixed text + tool calls classifies as tool calls; the surrounding text
+    /// is dropped from the OpenAI message, matching previous behavior.
     pub fn classify_assistant_output(&self, output: &str) -> ToolOutputClassification {
-        let blocks = self.marker_blocks(output);
-        if blocks.is_empty() {
-            return if self.require_tool_call {
-                ToolOutputClassification::InvalidToolCall {
-                    error: ToolCallValidationError::new(
-                        "expected the assistant response to include a tool_call marker",
-                    ),
-                    invalid_output: output.to_owned(),
-                }
-            } else {
-                ToolOutputClassification::NormalText
+        if output.len() > self.config.tool_call_max_bytes {
+            return ToolOutputClassification::InvalidToolCall {
+                error: ToolCallValidationError::new(format!(
+                    "assistant output exceeded the tool call max size of {} bytes",
+                    self.config.tool_call_max_bytes
+                )),
+                invalid_output: output.to_owned(),
             };
         }
 
-        let keep = if self.single_tool_call {
-            1
-        } else {
-            blocks.len()
-        };
-        if blocks.len() > keep {
-            warn!(
-                found = blocks.len(),
-                "discarding extra tool call markers; the request set parallel_tool_calls to false"
-            );
-        }
+        let result = self
+            .create_parser()
+            .and_then(|mut parser| {
+                parser.parse_complete(output).map_err(|error| {
+                    ToolCallValidationError::new(format!("tool call parsing failed: {error}"))
+                })
+            })
+            .and_then(|result| {
+                result
+                    .calls
+                    .iter()
+                    .map(|call| self.validate_tool_call(call))
+                    .collect::<Result<Vec<_>, _>>()
+            });
 
-        let mut tool_calls = Vec::new();
-        for block in blocks.iter().take(keep) {
-            match self.validate_marker(block) {
-                Ok(tool_call) => tool_calls.push(tool_call),
-                Err(error) => {
-                    return ToolOutputClassification::InvalidToolCall {
-                        error,
+        match result {
+            Ok(tool_calls) if tool_calls.is_empty() => {
+                if self.require_tool_call {
+                    ToolOutputClassification::InvalidToolCall {
+                        error: ToolCallValidationError::new(
+                            "expected the assistant response to include a tool call",
+                        ),
                         invalid_output: output.to_owned(),
-                    };
+                    }
+                } else {
+                    ToolOutputClassification::NormalText
                 }
             }
+            Ok(tool_calls) => ToolOutputClassification::ToolCalls(tool_calls),
+            Err(error) => ToolOutputClassification::InvalidToolCall {
+                error,
+                invalid_output: output.to_owned(),
+            },
         }
-        ToolOutputClassification::ToolCalls(tool_calls)
     }
 
-    /// Splits assistant output into tool-call marker blocks using lenient
-    /// boundaries: a block ends at the first closing marker, but a new opening
-    /// marker (or the end of output) implicitly closes the current block when
-    /// the model omitted the closing marker.
-    pub fn marker_blocks(&self, output: &str) -> Vec<String> {
-        let start_tag = self.config.marker_start.as_str();
-        let end_tag = self.config.marker_end.as_str();
-        let mut blocks = Vec::new();
-        let mut rest = output;
-        while let Some(start) = rest.find(start_tag) {
-            let body_start = start + start_tag.len();
-            let body = &rest[body_start..];
-            let next_start = body.find(start_tag);
-            let next_end = body.find(end_tag);
-            match (next_end, next_start) {
-                (Some(end), next_start) if next_start.is_none() || next_start > Some(end) => {
-                    let block_end = body_start + end + end_tag.len();
-                    blocks.push(rest[start..block_end].to_owned());
-                    rest = &rest[block_end..];
-                }
-                (_, Some(next)) => {
-                    blocks.push(format!("{}{end_tag}", &rest[start..body_start + next]));
-                    rest = &rest[body_start + next..];
-                }
-                (_, None) => {
-                    blocks.push(format!("{}{end_tag}", &rest[start..]));
-                    rest = "";
-                }
-            }
-        }
-        blocks
-    }
-
-    pub fn validate_marker(
+    /// Validates one coalesced parser tool call against the request's tools.
+    fn validate_tool_call(
         &self,
-        output: &str,
+        call: &ToolCallDelta,
     ) -> Result<ValidatedToolCall, ToolCallValidationError> {
-        if output.len() > self.config.tool_call_max_bytes {
-            return Err(ToolCallValidationError::new(format!(
-                "tool call marker exceeded max size of {} bytes",
-                self.config.tool_call_max_bytes
-            )));
-        }
-
-        let trimmed = output.trim();
-        if !trimmed.starts_with(&self.config.marker_start) {
-            return Err(ToolCallValidationError::new(format!(
-                "tool call must start with {}",
-                self.config.marker_start
-            )));
-        }
-        if !trimmed.ends_with(&self.config.marker_end) {
-            return Err(ToolCallValidationError::new(format!(
-                "tool call must end with {} and contain no trailing text",
-                self.config.marker_end
-            )));
-        }
-        let inner_start = self.config.marker_start.len();
-        let inner_end = trimmed.len() - self.config.marker_end.len();
-        let inner = trimmed[inner_start..inner_end].trim();
-        let value = parse_tool_call_json(inner)?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| ToolCallValidationError::new("tool call JSON must be an object"))?;
-        let (name, arguments) = extract_tool_call_name_and_arguments(object)?;
+        let name = call.name.as_deref().unwrap_or_default();
         if name.trim().is_empty() {
             return Err(ToolCallValidationError::new(
                 "tool call name must not be empty",
@@ -317,7 +262,15 @@ impl ToolEmulationContext {
             .iter()
             .find(|tool| tool.name() == name)
             .ok_or_else(|| ToolCallValidationError::new(format!("unknown tool name {name:?}")))?;
-        let arguments = normalize_tool_call_arguments(arguments)?;
+
+        let arguments: Value = serde_json::from_str(&call.arguments).map_err(|source| {
+            ToolCallValidationError::new(format!("tool call arguments JSON is invalid: {source}"))
+        })?;
+        if !arguments.is_object() {
+            return Err(ToolCallValidationError::new(
+                "tool call arguments must be a JSON object",
+            ));
+        }
 
         if self.config.validate_json_schema
             && let Some(schema) = tool.parameters_schema()
@@ -336,94 +289,172 @@ impl ToolEmulationContext {
         })?;
 
         Ok(ValidatedToolCall {
-            id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+            id: generate_tool_call_id(),
             name: name.to_owned(),
             arguments_json,
         })
     }
 }
 
-fn parse_tool_call_json(input: &str) -> Result<Value, ToolCallValidationError> {
-    serde_json::from_str(input).or_else(|strict_error| {
-        json5::from_str(input).map_err(|json5_error| {
-            ToolCallValidationError::new(format!(
-                "tool call JSON is invalid: {strict_error}; JSON5 fallback failed: {json5_error}"
-            ))
-        })
-    })
+/// Truncates text to at most `max_bytes` (on a char boundary), marking the cut.
+fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
+    if text.len() <= max_bytes {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{} [output truncated]", &text[..end]))
 }
 
-fn extract_tool_call_name_and_arguments(
-    object: &Map<String, Value>,
-) -> Result<(&str, &Value), ToolCallValidationError> {
-    if let Some(function) = object.get("function") {
-        let function = function.as_object().ok_or_else(|| {
-            ToolCallValidationError::new("tool call function field must be an object")
-        })?;
-        let name = string_member(function, &["name"])?;
-        let arguments = value_member(function, &["arguments", "parameters"])?;
-        return Ok((name, arguments));
+/// Lenient wrapper around the strict Hermes parser, tolerating model
+/// deviations observed live against Venice:
+/// - A parse that fails to finish (the model or an upstream stop sequence
+///   dropped `</tool_call>`; seen with `e2ee-glm-4-7-flash-p`) is retried
+///   once with the closing marker appended.
+/// - Trailing garbage after a tool call with complete JSON arguments (e.g.
+///   `e2ee-glm-5-1` closing a call with a stray `</arg_value>`) drains the
+///   rest of the output instead of failing. Input is split before each `<`
+///   so such garbage reaches the parser in its own push and cannot take
+///   already-parsed deltas down with it.
+struct LenientToolParser {
+    inner: Box<dyn ToolParser>,
+    /// Tracks whether the most recent call's argument JSON is complete, to
+    /// distinguish trailing garbage from a truncated call.
+    args_scanner: ArgsCompletenessScanner,
+    /// Set once trailing garbage was detected; all further input is ignored.
+    drained: bool,
+}
+
+impl ToolParser for LenientToolParser {
+    fn create(tools: &[Tool]) -> vllm_tool_parser::Result<Box<dyn ToolParser>> {
+        Ok(Box::new(Self {
+            inner: HermesToolParser::create(tools)?,
+            args_scanner: ArgsCompletenessScanner::default(),
+            drained: false,
+        }))
     }
 
-    let name = string_member(object, &["name", "tool_name", "tool"])?;
-    let arguments = value_member(object, &["arguments", "parameters"])?;
-    Ok((name, arguments))
-}
-
-fn string_member<'a>(
-    object: &'a Map<String, Value>,
-    names: &[&'static str],
-) -> Result<&'a str, ToolCallValidationError> {
-    for name in names {
-        if let Some(value) = object.get(*name) {
-            return value.as_str().ok_or_else(|| {
-                ToolCallValidationError::new(format!("tool call {name} field must be a string"))
-            });
+    fn push(&mut self, chunk: &str) -> vllm_tool_parser::Result<ToolParseResult> {
+        let mut merged = ToolParseResult::default();
+        if self.drained {
+            return Ok(merged);
         }
-    }
-
-    Err(ToolCallValidationError::new(format!(
-        "tool call is missing {} field",
-        names.join(" or ")
-    )))
-}
-
-fn value_member<'a>(
-    object: &'a Map<String, Value>,
-    names: &[&'static str],
-) -> Result<&'a Value, ToolCallValidationError> {
-    for name in names {
-        if let Some(value) = object.get(*name) {
-            return Ok(value);
-        }
-    }
-
-    Err(ToolCallValidationError::new(format!(
-        "tool call is missing {} field",
-        names.join(" or ")
-    )))
-}
-
-fn normalize_tool_call_arguments(arguments: &Value) -> Result<Value, ToolCallValidationError> {
-    match arguments {
-        Value::Object(_) => Ok(arguments.clone()),
-        Value::String(arguments) => {
-            let value: Value = serde_json::from_str(arguments).map_err(|source| {
-                ToolCallValidationError::new(format!(
-                    "tool call arguments JSON is invalid: {source}"
-                ))
-            })?;
-            if value.is_object() {
-                Ok(value)
-            } else {
-                Err(ToolCallValidationError::new(
-                    "tool call arguments JSON string must decode to an object",
-                ))
+        for piece in split_before_tag_starts(chunk) {
+            match self.inner.push(piece) {
+                Ok(result) => {
+                    self.args_scanner.track(&result);
+                    merged.normal_text.push_str(&result.normal_text);
+                    merged.calls.extend(result.calls);
+                }
+                Err(error) => {
+                    if !self.args_scanner.complete() {
+                        return Err(error);
+                    }
+                    // The last call's arguments are complete; treat the rest
+                    // of the output as discardable garbage.
+                    warn!(%error, "ignoring trailing output after a complete tool call");
+                    self.drained = true;
+                    break;
+                }
             }
         }
-        _ => Err(ToolCallValidationError::new(
-            "tool call arguments must be a JSON object or JSON object string",
-        )),
+        Ok(merged)
+    }
+
+    fn finish(&mut self) -> vllm_tool_parser::Result<ToolParseResult> {
+        if self.drained {
+            return Ok(ToolParseResult::default());
+        }
+        let error = match self.inner.finish() {
+            Ok(result) => return Ok(result),
+            Err(error) => error,
+        };
+        // Assume the closing marker was cut off; complete it and retry. Keep
+        // the original error when the output is truncated beyond recovery.
+        let Ok(mut recovered) = self.inner.push(TOOL_CALL_END) else {
+            return Err(error);
+        };
+        let Ok(finished) = self.inner.finish() else {
+            return Err(error);
+        };
+        recovered.normal_text.push_str(&finished.normal_text);
+        recovered.calls.extend(finished.calls);
+        Ok(recovered)
+    }
+}
+
+/// Splits text so every `<` starts a new piece, isolating each potential tag
+/// (marker, native-format tag, or garbage) in its own parser push.
+fn split_before_tag_starts(text: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for (index, _) in text.match_indices('<') {
+        if index > start {
+            pieces.push(&text[start..index]);
+        }
+        start = index;
+    }
+    if start < text.len() {
+        pieces.push(&text[start..]);
+    }
+    pieces
+}
+
+/// Minimal JSON scanner tracking whether the most recent tool call's
+/// argument text forms a complete JSON value (balanced braces/brackets
+/// outside strings).
+#[derive(Debug, Default)]
+struct ArgsCompletenessScanner {
+    started: bool,
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl ArgsCompletenessScanner {
+    fn track(&mut self, result: &ToolParseResult) {
+        for call in &result.calls {
+            if call.name.is_some() {
+                *self = Self::default();
+            }
+            self.feed(&call.arguments);
+        }
+    }
+
+    fn feed(&mut self, fragment: &str) {
+        for ch in fragment.chars() {
+            if self.escaped {
+                self.escaped = false;
+                continue;
+            }
+            if self.in_string {
+                match ch {
+                    '\\' => self.escaped = true,
+                    '"' => self.in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match ch {
+                '"' => {
+                    self.in_string = true;
+                    self.started = true;
+                }
+                '{' | '[' => {
+                    self.depth += 1;
+                    self.started = true;
+                }
+                '}' | ']' => self.depth = self.depth.saturating_sub(1),
+                ch if !ch.is_whitespace() => self.started = true,
+                _ => {}
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.started && self.depth == 0 && !self.in_string
     }
 }
 
@@ -447,18 +478,6 @@ pub struct ValidatedToolCall {
 impl ValidatedToolCall {
     pub fn to_openai_value(&self) -> Value {
         serde_json::json!({
-            "id": self.id,
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "arguments": self.arguments_json,
-            },
-        })
-    }
-
-    pub fn to_openai_streaming_value(&self, index: u64) -> Value {
-        serde_json::json!({
-            "index": index,
             "id": self.id,
             "type": "function",
             "function": {
@@ -743,8 +762,12 @@ mod tests {
     use crate::config::ToolsConfig;
 
     fn request_with_tool(arguments_schema: Value) -> ChatCompletionRequest {
+        request_with_tool_for_model("e2ee-test", arguments_schema)
+    }
+
+    fn request_with_tool_for_model(model: &str, arguments_schema: Value) -> ChatCompletionRequest {
         ChatCompletionRequest::parse(&json!({
-            "model": "e2ee-test",
+            "model": model,
             "messages": [{"role":"user", "content":"hi"}],
             "tools": [{
                 "type": "function",
@@ -765,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_valid_tool_call_marker() {
+    fn classifies_valid_hermes_tool_call() {
         let request = request_with_tool(json!({
             "type": "object",
             "properties": {"query": {"type": "string"}},
@@ -782,35 +805,9 @@ mod tests {
             panic!("expected valid tool call");
         };
         assert_eq!(tool_calls.len(), 1);
+        assert!(tool_calls[0].id.starts_with("call_"));
         assert_eq!(tool_calls[0].name, "search_web");
         assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"Venice\"}");
-    }
-
-    #[test]
-    fn validates_common_tool_call_marker_variants() {
-        let request = request_with_tool(json!({
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-            "additionalProperties": false
-        }));
-        let context = context_for_request(&request);
-
-        for marker in [
-            r#"<tool_call>{"name":"search_web","parameters":{"query":"Venice"}}</tool_call>"#,
-            r#"<tool_call>{"tool_name":"search_web","arguments":{"query":"Venice"}}</tool_call>"#,
-            r#"<tool_call>{"function":{"name":"search_web","arguments":{"query":"Venice"}}}</tool_call>"#,
-            r#"<tool_call>{"function":{"name":"search_web","parameters":{"query":"Venice"}}}</tool_call>"#,
-            r#"<tool_call>{"type":"function","name":"search_web","arguments":"{\"query\":\"Venice\"}"}</tool_call>"#,
-            r#"<tool_call>{'name':'search_web','arguments':{'query':'Venice'}}</tool_call>"#,
-            r#"<tool_call>{name: 'search_web', arguments: {query: 'Venice'}}</tool_call>"#,
-        ] {
-            let tool_call = context
-                .validate_marker(marker)
-                .expect("common marker variant should validate");
-            assert_eq!(tool_call.name, "search_web");
-            assert_eq!(tool_call.arguments_json, "{\"query\":\"Venice\"}");
-        }
     }
 
     #[test]
@@ -823,24 +820,176 @@ mod tests {
         }));
         let context = context_for_request(&request);
 
-        let invalid_json = context
-            .validate_marker("<tool_call>{</tool_call>")
-            .unwrap_err();
-        assert!(invalid_json.message().contains("JSON is invalid"));
+        // Hermes passes argument text through raw; invalid JSON is caught by
+        // our validation layer.
+        let ToolOutputClassification::InvalidToolCall { error, .. } = context
+            .classify_assistant_output(
+                "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"x\",}}</tool_call>",
+            )
+        else {
+            panic!("expected invalid JSON to be rejected");
+        };
+        assert!(error.message().contains("JSON is invalid"));
 
-        let unknown = context
-            .validate_marker(
+        let ToolOutputClassification::InvalidToolCall { error, .. } = context
+            .classify_assistant_output(
                 "<tool_call>{\"name\":\"unknown\",\"arguments\":{\"query\":\"x\"}}</tool_call>",
             )
-            .unwrap_err();
-        assert!(unknown.message().contains("unknown tool name"));
+        else {
+            panic!("expected unknown tool to be rejected");
+        };
+        assert!(error.message().contains("unknown tool name"));
 
-        let schema = context
-            .validate_marker(
+        let ToolOutputClassification::InvalidToolCall { error, .. } = context
+            .classify_assistant_output(
                 "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"q\":\"x\"}}</tool_call>",
             )
-            .unwrap_err();
-        assert!(schema.message().contains("arguments.query is required"));
+        else {
+            panic!("expected schema mismatch to be rejected");
+        };
+        assert!(error.message().contains("arguments.query is required"));
+    }
+
+    #[test]
+    fn recovers_tool_call_with_truncated_closing_marker() {
+        // Observed live: Venice cuts `</tool_call>` for some models (likely a
+        // stop sequence). A complete call missing only the closing marker is
+        // recovered leniently.
+        let request = request_with_tool(json!({"type": "object"}));
+        let context = context_for_request(&request);
+
+        let classification = context.classify_assistant_output(
+            "<tool_call>\n{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}\n",
+        );
+
+        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
+            panic!("expected truncated closing marker to be recovered, got {classification:?}");
+        };
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "search_web");
+        assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"a\"}");
+    }
+
+    #[test]
+    fn ignores_trailing_garbage_after_complete_tool_call() {
+        // Exact outputs observed live from `e2ee-glm-5-1`: a Hermes-shaped
+        // call "closed" with a stray GLM-native tag.
+        let request = request_with_tool_for_model("e2ee-glm-5-1", json!({"type": "object"}));
+        let context = context_for_request(&request);
+
+        for output in [
+            "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}</arg_value>",
+            "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}</arg_value></tool_call>",
+        ] {
+            let classification = context.classify_assistant_output(output);
+            let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
+                panic!(
+                    "expected trailing garbage to be ignored for {output:?}, got {classification:?}"
+                );
+            };
+            assert_eq!(tool_calls.len(), 1);
+            assert_eq!(tool_calls[0].name, "search_web");
+            assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"a\"}");
+        }
+    }
+
+    #[test]
+    fn classifies_output_truncated_mid_json_as_invalid_tool_call() {
+        let request = request_with_tool(json!({"type": "object"}));
+        let context = context_for_request(&request);
+
+        let classification =
+            context.classify_assistant_output("<tool_call>{\"name\":\"search_web\",\"argu");
+
+        let ToolOutputClassification::InvalidToolCall { error, .. } = classification else {
+            panic!("expected mid-JSON truncation to be invalid, got {classification:?}");
+        };
+        assert!(error.message().contains("tool call parsing failed"));
+    }
+
+    #[test]
+    fn classifies_plain_text_and_enforces_required_tool_call() {
+        let request = request_with_tool(json!({"type": "object"}));
+        let context = context_for_request(&request);
+        assert_eq!(
+            context.classify_assistant_output("Hello, world!"),
+            ToolOutputClassification::NormalText
+        );
+
+        let request = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tool_choice": "required",
+            "tools": [{"type":"function", "function":{"name":"search_web", "parameters":{"type":"object"}}}]
+        }))
+        .expect("request should parse");
+        let context = context_for_request(&request);
+
+        let ToolOutputClassification::InvalidToolCall { error, .. } =
+            context.classify_assistant_output("Hello, world!")
+        else {
+            panic!("expected missing required tool call to be invalid");
+        };
+        assert!(error.message().contains("expected the assistant response"));
+    }
+
+    #[test]
+    fn classifies_mixed_text_and_tool_call_as_tool_calls() {
+        let request = request_with_tool(json!({"type": "object"}));
+        let context = context_for_request(&request);
+
+        let classification = context.classify_assistant_output(
+            "Let me check.\n<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}</tool_call>",
+        );
+
+        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
+            panic!("expected mixed output to classify as tool calls");
+        };
+        assert_eq!(tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn classifies_multiple_tool_calls_regardless_of_parallel_tool_calls() {
+        let request = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "parallel_tool_calls": false,
+            "tools": [{"type":"function", "function":{"name":"search_web", "parameters":{"type":"object"}}}]
+        }))
+        .expect("request should parse");
+        let context = context_for_request(&request);
+
+        // `parallel_tool_calls` is accepted for OpenAI compatibility but
+        // ignored; all parsed tool calls are returned.
+        let classification = context.classify_assistant_output(
+            "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}</tool_call>\n<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"b\"}}</tool_call>",
+        );
+        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
+            panic!("expected two valid tool calls");
+        };
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"a\"}");
+        assert_eq!(tool_calls[1].arguments_json, "{\"query\":\"b\"}");
+        assert_ne!(tool_calls[0].id, tool_calls[1].id);
+    }
+
+    #[test]
+    fn rejects_oversized_assistant_output() {
+        let request = request_with_tool(json!({"type": "object"}));
+        let config = ToolsConfig {
+            tool_call_max_bytes: 32,
+            ..ToolsConfig::default()
+        };
+        let context = ToolEmulationContext::from_request(&config, &request)
+            .expect("tool context should build")
+            .expect("tools should activate");
+
+        let ToolOutputClassification::InvalidToolCall { error, .. } =
+            context.classify_assistant_output(&"x".repeat(33))
+        else {
+            panic!("expected oversized output to be invalid");
+        };
+        assert!(error.message().contains("max size of 32 bytes"));
     }
 
     #[test]
@@ -857,10 +1006,13 @@ mod tests {
             .expect("tool context should build")
             .expect("tools should activate");
 
-        let tool_call = context
-            .validate_marker("<tool_call>{\"name\":\"search_web\",\"arguments\":{}}</tool_call>")
-            .expect("schema mismatch should be allowed when validation is disabled");
-        assert_eq!(tool_call.arguments_json, "{}");
+        let classification = context.classify_assistant_output(
+            "<tool_call>{\"name\":\"search_web\",\"arguments\":{}}</tool_call>",
+        );
+        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
+            panic!("schema mismatch should be allowed when validation is disabled");
+        };
+        assert_eq!(tool_calls[0].arguments_json, "{}");
     }
 
     #[test]
@@ -868,75 +1020,28 @@ mod tests {
         let request = request_with_tool(json!({"type": "object"}));
         let context = context_for_request(&request);
 
-        let arguments = context
-            .validate_marker("<tool_call>{\"name\":\"search_web\",\"arguments\":[]}</tool_call>")
+        // The Hermes parser itself rejects non-object argument payloads, so
+        // this surfaces as a parser failure rather than reaching our
+        // arguments-must-be-an-object validation.
+        let ToolOutputClassification::InvalidToolCall { error, .. } = context
+            .classify_assistant_output(
+                "<tool_call>{\"name\":\"search_web\",\"arguments\":[]}</tool_call>",
+            )
+        else {
+            panic!("expected non-object arguments to be rejected");
+        };
+        assert!(error.message().contains("tool call parsing failed"));
+
+        // Our validation layer still rejects non-object arguments that a
+        // parser passes through (defense in depth for other families).
+        let error = context
+            .validate_tool_call(&ToolCallDelta {
+                tool_index: 0,
+                name: Some("search_web".to_owned()),
+                arguments: "[]".to_owned(),
+            })
             .unwrap_err();
-        assert!(
-            arguments
-                .message()
-                .contains("arguments must be a JSON object")
-        );
-    }
-
-    #[test]
-    fn splits_multiple_markers_leniently() {
-        let request = request_with_tool(json!({"type": "object"}));
-        let context = context_for_request(&request);
-
-        // Two well-formed marker blocks.
-        let classification = context.classify_assistant_output(
-            "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}</tool_call>\n<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"b\"}}</tool_call>",
-        );
-        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
-            panic!("expected two valid tool calls");
-        };
-        assert_eq!(tool_calls.len(), 2);
-        assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"a\"}");
-        assert_eq!(tool_calls[1].arguments_json, "{\"query\":\"b\"}");
-
-        // A new opening marker implicitly closes the previous block, and a
-        // trailing unclosed block is implicitly closed at end of output.
-        let classification = context.classify_assistant_output(
-            "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}\n<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"b\"}}",
-        );
-        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
-            panic!("expected two leniently split tool calls");
-        };
-        assert_eq!(tool_calls.len(), 2);
-        assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"a\"}");
-        assert_eq!(tool_calls[1].arguments_json, "{\"query\":\"b\"}");
-    }
-
-    #[test]
-    fn request_parallel_tool_calls_false_keeps_only_first_call() {
-        let request = ChatCompletionRequest::parse(&json!({
-            "model": "e2ee-test",
-            "messages": [{"role":"user", "content":"hi"}],
-            "parallel_tool_calls": false,
-            "tools": [{"type":"function", "function":{"name":"search_web", "parameters":{"type":"object"}}}]
-        }))
-        .expect("request should parse");
-        let context = context_for_request(&request);
-        assert!(context.single_tool_call());
-
-        let classification = context.classify_assistant_output(
-            "<tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"a\"}}</tool_call><tool_call>{\"name\":\"search_web\",\"arguments\":{\"query\":\"b\"}}</tool_call>",
-        );
-        let ToolOutputClassification::ToolCalls(tool_calls) = classification else {
-            panic!("expected the first tool call to be kept");
-        };
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].arguments_json, "{\"query\":\"a\"}");
-
-        let request = ChatCompletionRequest::parse(&json!({
-            "model": "e2ee-test",
-            "messages": [{"role":"user", "content":"hi"}],
-            "parallel_tool_calls": true,
-            "tools": [{"type":"function", "function":{"name":"search_web", "parameters":{"type":"object"}}}]
-        }))
-        .expect("request should parse");
-        let context = context_for_request(&request);
-        assert!(!context.single_tool_call());
+        assert!(error.message().contains("arguments must be a JSON object"));
     }
 
     #[test]
@@ -962,6 +1067,7 @@ mod tests {
                 .content
                 .contains("Emit one marker block per tool call")
         );
+        assert!(controller.content.contains("<tool_call>"));
         assert!(controller.content.contains("search_web"));
 
         let correction = context.correction_message("bad name", "<tool_call>{}</tool_call>");
@@ -978,27 +1084,33 @@ mod tests {
                 .contains("You must now return only valid tool calls")
         );
 
-        let single_call_request = ChatCompletionRequest::parse(&json!({
+        let optional_request = ChatCompletionRequest::parse(&json!({
             "model": "e2ee-test",
             "messages": [{"role":"user", "content":"hi"}],
-            "tool_choice": "required",
-            "parallel_tool_calls": false,
             "tools": [{"type":"function", "function":{"name":"search_web", "parameters":{"type":"object"}}}]
         }))
         .expect("request should parse");
-        let single = context_for_request(&single_call_request);
+        let optional = context_for_request(&optional_request);
         assert!(
-            single
+            optional
                 .controller_message()
                 .content
-                .contains("You must call exactly one tool")
+                .contains("If no tool is needed, answer normally")
         );
-        assert!(
-            single
-                .correction_message("bad name", "<tool_call>{}</tool_call>")
-                .content
-                .contains("You must now return exactly one valid tool call")
-        );
+    }
+
+    #[test]
+    fn correction_prompt_truncates_oversized_invalid_output() {
+        let request = request_with_tool(json!({"type": "object"}));
+        let context = context_for_request(&request);
+
+        let oversized = "x".repeat(CORRECTION_INVALID_OUTPUT_MAX_BYTES + 1);
+        let correction = context.correction_message("error", &oversized);
+        assert!(correction.content.contains("[output truncated]"));
+        assert!(!correction.content.contains(&oversized));
+
+        let short = context.correction_message("error", "<tool_call>{}</tool_call>");
+        assert!(!short.content.contains("[output truncated]"));
     }
 
     #[test]
