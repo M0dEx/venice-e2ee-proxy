@@ -3,6 +3,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::e2ee::{E2eeCodec, E2eeCodecError};
+use crate::util::json_kind;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatCompletionRequest {
@@ -73,15 +74,15 @@ impl ChatCompletionRequest {
         })
     }
 
-    pub fn into_venice_e2ee_request(
+    pub fn to_venice_e2ee_request(
         &self,
         codec: &E2eeCodec,
         model_public_key_hex: &str,
     ) -> Result<PreparedVeniceChatRequest, ChatConstructionError> {
-        self.into_venice_e2ee_request_with_messages(codec, model_public_key_hex, &[], &[])
+        self.to_venice_e2ee_request_with_messages(codec, model_public_key_hex, &[], &[])
     }
 
-    pub fn into_venice_e2ee_request_with_messages(
+    pub fn to_venice_e2ee_request_with_messages(
         &self,
         codec: &E2eeCodec,
         model_public_key_hex: &str,
@@ -254,19 +255,7 @@ impl OpenAiStreamOptions {
         let Some(value) = value else {
             return Ok(Self::default());
         };
-        let object = value.as_object().ok_or_else(|| {
-            ChatRequestError::invalid_field("stream_options", "stream_options must be an object")
-        })?;
-        reject_unknown_fields(object, &["include_usage"], "stream_options")?;
-        if let Some(include_usage) = object.get("include_usage")
-            && !include_usage.is_boolean()
-        {
-            return Err(ChatRequestError::invalid_field(
-                "include_usage",
-                format!("expected boolean, got {}", json_kind(include_usage)),
-            ));
-        }
-        deserialize_typed_field("stream_options", value)
+        deserialize_typed_value("stream_options", value)
     }
 }
 
@@ -292,24 +281,7 @@ impl VeniceParameters {
         let Some(value) = value else {
             return Ok(Self::default());
         };
-        let object = value.as_object().ok_or_else(|| {
-            ChatRequestError::invalid_field(
-                "venice_parameters",
-                "venice_parameters must be an object",
-            )
-        })?;
-        reject_unknown_fields(
-            object,
-            &[
-                "enable_e2ee",
-                "include_venice_system_prompt",
-                "enable_web_search",
-            ],
-            "venice_parameters",
-        )?;
-        validate_raw_venice_parameter_types(object)?;
-
-        let raw: RawVeniceParameters = deserialize_typed_field("venice_parameters", value)?;
+        let raw: RawVeniceParameters = deserialize_typed_value("venice_parameters", value)?;
         let enable_e2ee = raw.enable_e2ee.unwrap_or(true);
         if !enable_e2ee {
             return Err(ChatRequestError::UnsupportedVeniceParameter {
@@ -452,8 +424,9 @@ struct RawAssistantToolFunction {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTextContentPart {
+    // Deserialized only to enforce `"type": "text"`; never read afterwards.
     #[serde(rename = "type")]
-    kind: TextContentPartType,
+    _kind: TextContentPartType,
     text: String,
 }
 
@@ -751,67 +724,15 @@ fn normalize_text_parts(parts: &[Value], path: &str) -> Result<String, ChatReque
 
     let mut text = String::new();
     for (index, part) in parts.iter().enumerate() {
-        let object = part.as_object().ok_or_else(|| {
-            ChatRequestError::unsupported_content(
-                format!("{path}[{index}]"),
-                "content parts must be objects",
-            )
-        })?;
-        let kind = required_non_empty_string(object, "type")?;
-        if kind != "text" {
-            return Err(ChatRequestError::unsupported_content(
-                format!("{path}[{index}]"),
-                format!("only text content parts are supported, got {kind:?}"),
-            ));
-        }
-        reject_unknown_fields(object, &["type", "text"], "content part")?;
         let part: RawTextContentPart = serde_json::from_value(part.clone()).map_err(|source| {
             ChatRequestError::unsupported_content(
                 format!("{path}[{index}]"),
                 format!("text content part must match {{type:\"text\", text:string}}: {source}"),
             )
         })?;
-        match part.kind {
-            TextContentPartType::Text => text.push_str(&part.text),
-        }
+        text.push_str(&part.text);
     }
     Ok(text)
-}
-
-fn validate_raw_venice_parameter_types(
-    object: &Map<String, Value>,
-) -> Result<(), ChatRequestError> {
-    if let Some(enable_e2ee) = object.get("enable_e2ee")
-        && !enable_e2ee.is_boolean()
-    {
-        return Err(ChatRequestError::invalid_field(
-            "venice_parameters.enable_e2ee",
-            format!("expected boolean, got {}", json_kind(enable_e2ee)),
-        ));
-    }
-    if let Some(include_venice_system_prompt) = object.get("include_venice_system_prompt")
-        && !include_venice_system_prompt.is_boolean()
-    {
-        return Err(ChatRequestError::invalid_field(
-            "venice_parameters.include_venice_system_prompt",
-            format!(
-                "expected boolean, got {}",
-                json_kind(include_venice_system_prompt)
-            ),
-        ));
-    }
-    if let Some(enable_web_search) = object.get("enable_web_search")
-        && !(enable_web_search.is_string() || enable_web_search.is_boolean())
-    {
-        return Err(ChatRequestError::invalid_field(
-            "venice_parameters.enable_web_search",
-            format!(
-                "enable_web_search must be \"off\" or false, got {}",
-                json_kind(enable_web_search)
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn parse_tools(value: Option<&Value>) -> Result<Vec<ChatToolDefinition>, ChatRequestError> {
@@ -940,13 +861,6 @@ fn optional_stop(object: &Map<String, Value>) -> Result<Option<StopSequence>, Ch
     }
 }
 
-fn deserialize_typed_field<T>(field: &'static str, value: &Value) -> Result<T, ChatRequestError>
-where
-    T: DeserializeOwned,
-{
-    deserialize_typed_value(field, value)
-}
-
 fn deserialize_typed_value<T>(field: &'static str, value: &Value) -> Result<T, ChatRequestError>
 where
     T: DeserializeOwned,
@@ -1023,17 +937,6 @@ fn xml_escape_attr(value: &str) -> String {
     escaped
 }
 
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,17 +949,7 @@ mod tests {
 
     fn model_public_key_hex(secret_key: &SecretKey) -> String {
         let public_key = secret_key.public_key();
-        encode_lower_hex(public_key.to_encoded_point(false).as_bytes())
-    }
-
-    fn encode_lower_hex(bytes: &[u8]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        out
+        hex::encode(public_key.to_encoded_point(false).as_bytes())
     }
 
     #[test]
@@ -1391,6 +1284,113 @@ mod tests {
     }
 
     #[test]
+    fn serde_layer_rejects_unknown_nested_fields_and_wrong_types() {
+        let stream_options_unknown = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "stream_options": {"include_usage": true, "extra": 1}
+        }))
+        .expect_err("unknown stream_options field should be rejected");
+        assert_eq!(stream_options_unknown.api_error_code(), "invalid_request");
+        assert!(
+            stream_options_unknown
+                .to_string()
+                .contains("unknown field `extra`"),
+            "unexpected message: {stream_options_unknown}"
+        );
+
+        let include_usage_string = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "stream_options": {"include_usage": "yes"}
+        }))
+        .expect_err("non-boolean include_usage should be rejected");
+        assert_eq!(include_usage_string.api_error_code(), "invalid_request");
+        assert!(
+            include_usage_string
+                .to_string()
+                .contains("expected boolean, got string"),
+            "unexpected message: {include_usage_string}"
+        );
+
+        let venice_unknown = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "venice_parameters": {"unknown_param": true}
+        }))
+        .expect_err("unknown venice_parameters field should be rejected");
+        assert_eq!(venice_unknown.api_error_code(), "invalid_request");
+        assert!(
+            venice_unknown
+                .to_string()
+                .contains("unknown field `unknown_param`"),
+            "unexpected message: {venice_unknown}"
+        );
+
+        let enable_e2ee_string = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "venice_parameters": {"enable_e2ee": "yes"}
+        }))
+        .expect_err("non-boolean enable_e2ee should be rejected");
+        assert_eq!(enable_e2ee_string.api_error_code(), "invalid_request");
+        assert!(
+            enable_e2ee_string
+                .to_string()
+                .contains("expected boolean, got string"),
+            "unexpected message: {enable_e2ee_string}"
+        );
+
+        let web_search_number = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "venice_parameters": {"enable_web_search": 42}
+        }))
+        .expect_err("non-string/boolean enable_web_search should be rejected");
+        assert_eq!(web_search_number.api_error_code(), "invalid_request");
+        assert!(
+            web_search_number
+                .to_string()
+                .contains("expected string or boolean, got number"),
+            "unexpected message: {web_search_number}"
+        );
+
+        let null_enable_e2ee = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "venice_parameters": {"enable_e2ee": null}
+        }))
+        .expect_err("null enable_e2ee should be rejected");
+        assert_eq!(null_enable_e2ee.api_error_code(), "invalid_request");
+
+        let content_part_unknown = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":[{"type":"text", "text":"hi", "extra":1}]}]
+        }))
+        .expect_err("unknown content part field should be rejected");
+        assert_eq!(
+            content_part_unknown.api_error_code(),
+            "unsupported_message_content"
+        );
+        assert!(
+            content_part_unknown
+                .to_string()
+                .contains("unknown field `extra`"),
+            "unexpected message: {content_part_unknown}"
+        );
+
+        let content_part_non_object = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":["plain string part"]}]
+        }))
+        .expect_err("non-object content part should be rejected");
+        assert_eq!(
+            content_part_non_object.api_error_code(),
+            "unsupported_message_content"
+        );
+    }
+
+    #[test]
     fn constructs_encrypted_request_for_non_streaming_mode() {
         let model_key = SecretKey::random(&mut rand_core::OsRng);
         let model_public_key = model_public_key_hex(&model_key);
@@ -1409,7 +1409,7 @@ mod tests {
         }));
 
         let prepared = request
-            .into_venice_e2ee_request(&codec, &model_public_key)
+            .to_venice_e2ee_request(&codec, &model_public_key)
             .expect("request should encrypt");
 
         assert!(!prepared.client_stream);
@@ -1454,7 +1454,7 @@ mod tests {
         }));
 
         let prepared = request
-            .into_venice_e2ee_request(&codec, &model_public_key)
+            .to_venice_e2ee_request(&codec, &model_public_key)
             .expect("request should encrypt");
 
         assert!(prepared.client_stream);
@@ -1477,7 +1477,7 @@ mod tests {
         let correction = NormalizedChatMessage::new("system", "retry prompt");
 
         let prepared = request
-            .into_venice_e2ee_request_with_messages(
+            .to_venice_e2ee_request_with_messages(
                 &codec,
                 &model_public_key,
                 std::slice::from_ref(&controller),

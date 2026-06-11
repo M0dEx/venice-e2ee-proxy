@@ -27,6 +27,7 @@ use thiserror::Error;
 
 use crate::{
     config::{AttestationConfig, NvidiaRequirement, ProxyConfig},
+    util::json_kind,
     venice::{VeniceClient, VeniceClientError},
 };
 
@@ -111,13 +112,7 @@ impl AttestationNonce {
     pub fn generate() -> Self {
         let mut bytes = [0_u8; ATTESTATION_NONCE_BYTES];
         OsRng.fill_bytes(&mut bytes);
-        Self(encode_lower_hex(&bytes))
-    }
-
-    pub fn from_hex(value: impl Into<String>) -> Result<Self, AttestationError> {
-        let value = value.into();
-        validate_nonce_hex(&value)?;
-        Ok(Self(value.to_ascii_lowercase()))
+        Self(hex::encode(bytes))
     }
 
     pub fn as_str(&self) -> &str {
@@ -139,7 +134,6 @@ pub struct VerifiedAttestation {
     pub tee_provider: Option<String>,
     pub tdx: TdxVerificationSummary,
     pub nvidia: NvidiaVerificationSummary,
-    pub key_binding: bool,
     pub verified_at: SystemTime,
     pub attestation_report: Value,
 }
@@ -354,7 +348,6 @@ fn verify_attestation_evidence(
         tee_provider: optional_non_empty_string(evidence, "tee_provider").map(ToOwned::to_owned),
         tdx,
         nvidia,
-        key_binding: true,
         verified_at: SystemTime::now(),
         attestation_report: upstream_response,
     })
@@ -487,14 +480,11 @@ fn parse_tdx_quote(value: &str) -> Result<ParsedTdxQuote, AttestationError> {
 fn decode_tdx_quote(value: &str) -> Result<Vec<u8>, AttestationError> {
     let value = value.trim();
     let hex = value.strip_prefix("0x").unwrap_or(value);
+    // `hex::decode("")` succeeds with empty bytes, so keep empty input on the base64 path.
     if !hex.is_empty()
-        && hex.len().is_multiple_of(2)
-        && hex.as_bytes().iter().all(|byte| hex_value(*byte).is_some())
+        && let Ok(bytes) = hex::decode(hex)
     {
-        return decode_hex(hex).map_err(|message| AttestationError::PolicyViolation {
-            code: AttestationFailureCode::InvalidTdxEvidence,
-            message: format!("intel_quote is not valid hex: {message}"),
-        });
+        return Ok(bytes);
     }
 
     general_purpose::STANDARD
@@ -511,9 +501,9 @@ fn verify_reportdata_binding(
     signing_address: Option<&str>,
 ) -> Result<(), AttestationError> {
     let reportdata =
-        decode_hex(reportdata_hex).map_err(|message| AttestationError::PolicyViolation {
+        hex::decode(reportdata_hex).map_err(|error| AttestationError::PolicyViolation {
             code: AttestationFailureCode::InvalidTdxEvidence,
-            message: format!("tdx_reportdata is not valid hex: {message}"),
+            message: format!("tdx_reportdata is not valid hex: {error}"),
         })?;
     if reportdata.len() != TDX_REPORT_DATA_LEN {
         return policy_error(
@@ -526,9 +516,9 @@ fn verify_reportdata_binding(
     }
 
     let signing_key_bytes =
-        decode_hex(signing_key).map_err(|message| AttestationError::PolicyViolation {
+        hex::decode(signing_key).map_err(|error| AttestationError::PolicyViolation {
             code: AttestationFailureCode::InvalidSigningKey,
-            message: format!("normalized signing key is not valid hex: {message}"),
+            message: format!("normalized signing key is not valid hex: {error}"),
         })?;
     let signing_key_hash = Sha256::digest(&signing_key_bytes);
     if reportdata.starts_with(&signing_key_hash[..]) {
@@ -612,9 +602,9 @@ fn top_level_debug(object: &serde_json::Map<String, Value>) -> Option<bool> {
 
 fn normalize_public_key_hex(value: &str) -> Result<String, AttestationError> {
     let value = value.trim().strip_prefix("0x").unwrap_or(value.trim());
-    let mut bytes = decode_hex(value).map_err(|message| AttestationError::PolicyViolation {
+    let mut bytes = hex::decode(value).map_err(|error| AttestationError::PolicyViolation {
         code: AttestationFailureCode::InvalidSigningKey,
-        message,
+        message: error.to_string(),
     })?;
 
     if bytes.len() == 64 {
@@ -639,15 +629,13 @@ fn normalize_public_key_hex(value: &str) -> Result<String, AttestationError> {
             code: AttestationFailureCode::InvalidSigningKey,
             message: "signing key is not a valid secp256k1 public key".to_owned(),
         })?;
-    Ok(encode_lower_hex(
-        public_key.to_encoded_point(false).as_bytes(),
-    ))
+    Ok(hex::encode(public_key.to_encoded_point(false).as_bytes()))
 }
 
 fn ethereum_address_from_uncompressed_key_hex(value: &str) -> Result<String, AttestationError> {
-    let bytes = decode_hex(value).map_err(|message| AttestationError::PolicyViolation {
+    let bytes = hex::decode(value).map_err(|error| AttestationError::PolicyViolation {
         code: AttestationFailureCode::InvalidSigningKey,
-        message,
+        message: error.to_string(),
     })?;
     if bytes.len() != 65 || bytes.first() != Some(&0x04) {
         return policy_error(
@@ -657,7 +645,7 @@ fn ethereum_address_from_uncompressed_key_hex(value: &str) -> Result<String, Att
     }
 
     let hash = Keccak256::digest(&bytes[1..]);
-    Ok(format!("0x{}", encode_lower_hex(&hash[12..])))
+    Ok(format!("0x{}", hex::encode(&hash[12..])))
 }
 
 fn normalize_ethereum_address(value: &str) -> Result<String, AttestationError> {
@@ -696,64 +684,6 @@ fn policy_error<T>(
         code,
         message: message.into(),
     })
-}
-
-fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
-    if !value.len().is_multiple_of(2) {
-        return Err("hex string has odd length".to_owned());
-    }
-
-    let mut out = Vec::with_capacity(value.len() / 2);
-    let bytes = value.as_bytes();
-    for (pair_index, pair) in bytes.chunks_exact(2).enumerate() {
-        let high = hex_value(pair[0]).ok_or_else(|| {
-            format!(
-                "hex string contains non-hex character {:?} at index {}",
-                pair[0] as char,
-                pair_index * 2
-            )
-        })?;
-        let low = hex_value(pair[1]).ok_or_else(|| {
-            format!(
-                "hex string contains non-hex character {:?} at index {}",
-                pair[1] as char,
-                pair_index * 2 + 1
-            )
-        })?;
-        out.push((high << 4) | low);
-    }
-    Ok(out)
-}
-
-fn hex_value(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn encode_lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 #[cfg(test)]
@@ -796,7 +726,7 @@ mod tests {
     fn key_material() -> (String, String) {
         let secret_key = SecretKey::from_slice(&[7_u8; 32]).expect("fixed secret key is valid");
         let public_key = secret_key.public_key();
-        let public_key_hex = encode_lower_hex(public_key.to_encoded_point(false).as_bytes());
+        let public_key_hex = hex::encode(public_key.to_encoded_point(false).as_bytes());
         let address = ethereum_address_from_uncompressed_key_hex(&public_key_hex)
             .expect("test public key should derive address");
         (public_key_hex, address)
@@ -839,7 +769,6 @@ mod tests {
         assert_eq!(result.tee_provider.as_deref(), Some("tdx"));
         assert!(!result.tdx.present);
         assert_eq!(result.nvidia.verified, NvidiaVerificationStatus::NotPresent);
-        assert!(result.key_binding);
     }
 
     #[test]
@@ -1182,7 +1111,7 @@ mod tests {
     }
 
     fn tdx_quote_hex(debug: bool, tee_type: u32) -> String {
-        encode_lower_hex(&tdx_quote_bytes(debug, tee_type))
+        hex::encode(tdx_quote_bytes(debug, tee_type))
     }
 
     fn tdx_quote_base64(debug: bool, tee_type: u32) -> String {

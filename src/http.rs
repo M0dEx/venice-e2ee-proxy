@@ -195,7 +195,7 @@ async fn create_chat_completion(
         .await;
     }
 
-    let prepared = request.into_venice_e2ee_request(&codec, model_public_key)?;
+    let prepared = request.to_venice_e2ee_request(&codec, model_public_key)?;
     info!(
         model = %request.model,
         client_stream = prepared.client_stream,
@@ -213,12 +213,19 @@ async fn create_chat_completion(
 
     if prepared.client_stream {
         info!(model = %request.model, "streaming chat completion response to client");
-        Ok(openai_chat_sse_response(
-            upstream,
+        let include_usage_requested = request.stream_options.include_usage.unwrap_or(false);
+        let transformer = OpenAiChatStreamTransformer::new(
             codec,
             proxy_instance_key.clone(),
+            request.model.clone(),
+            include_usage_requested,
+        );
+        Ok(chat_sse_response(
+            upstream,
+            transformer,
             request.model,
-            request.stream_options.include_usage.unwrap_or(false),
+            include_usage_requested,
+            &CHAT_SSE_LOG,
             metadata,
         ))
     } else {
@@ -254,7 +261,6 @@ async fn ensure_attested_session(
         tee_provider = attestation.tee_provider.as_deref().unwrap_or("unknown"),
         tdx_verified = attestation.tdx.verified,
         nvidia_verified = attestation.nvidia.verified.as_header_value(),
-        key_binding = attestation.key_binding,
         "model attestation verified"
     );
 
@@ -298,29 +304,31 @@ async fn openai_tool_emulated_chat_response(
         "starting tool-emulated chat completion"
     );
     if request.stream {
-        let controller_messages = [tool_context.controller_message()];
-        let prepared = request.into_venice_e2ee_request_with_messages(
+        let upstream = tool_emulated_upstream_stream(
+            state,
+            request,
+            tool_context,
             &codec,
+            &proxy_instance_key,
             model_public_key,
-            &controller_messages,
-            &[],
-        )?;
-        let upstream = state
-            .venice_client()
-            .create_chat_completion_stream(
-                &prepared.upstream,
-                proxy_instance_key.public_key_hex(),
-                model_public_key,
-            )
-            .await?;
+            None,
+        )
+        .await?;
 
-        return Ok(openai_tool_emulated_chat_sse_response(
-            upstream,
+        let include_usage_requested = request.stream_options.include_usage.unwrap_or(false);
+        let transformer = OpenAiToolEmulatedChatStreamTransformer::new(
             tool_context.clone(),
             codec,
             proxy_instance_key,
             request.model.clone(),
-            request.stream_options.include_usage.unwrap_or(false),
+            include_usage_requested,
+        );
+        return Ok(chat_sse_response(
+            upstream,
+            transformer,
+            request.model.clone(),
+            include_usage_requested,
+            &TOOL_EMULATED_CHAT_SSE_LOG,
             metadata,
         ));
     }
@@ -329,28 +337,16 @@ async fn openai_tool_emulated_chat_response(
     let mut correction: Option<(String, String)> = None;
 
     loop {
-        let controller_messages = [tool_context.controller_message()];
-        let correction_messages: Vec<_> = correction
-            .as_ref()
-            .map(|(validation_error, invalid_output)| {
-                tool_context.correction_message(validation_error, invalid_output)
-            })
-            .into_iter()
-            .collect();
-        let prepared = request.into_venice_e2ee_request_with_messages(
+        let upstream = tool_emulated_upstream_stream(
+            state,
+            request,
+            tool_context,
             &codec,
+            &proxy_instance_key,
             model_public_key,
-            &controller_messages,
-            &correction_messages,
-        )?;
-        let upstream = state
-            .venice_client()
-            .create_chat_completion_stream(
-                &prepared.upstream,
-                proxy_instance_key.public_key_hex(),
-                model_public_key,
-            )
-            .await?;
+            correction.as_ref(),
+        )
+        .await?;
 
         let completion = match tokio::time::timeout(
             tool_context.marker_timeout(),
@@ -395,24 +391,17 @@ async fn openai_tool_emulated_chat_response(
             .and_then(Value::as_str)
             .unwrap_or_default();
 
+        let mut metadata = metadata.clone();
+        if retries > 0 {
+            metadata.tool_retries = Some(retries);
+        }
+
         match tool_context.classify_assistant_output(assistant_content) {
             ToolOutputClassification::NormalText => {
                 info!(model = %request.model, retries, "tool emulation produced normal text");
-                let mut metadata = metadata.clone();
-                if retries > 0 {
-                    metadata.tool_retries = Some(retries);
-                }
-                return Ok(if request.stream {
-                    openai_chat_sse_response_from_completion(
-                        completion,
-                        request.stream_options.include_usage.unwrap_or(false),
-                        metadata,
-                    )
-                } else {
-                    let mut response = Json(completion).into_response();
-                    metadata.apply(response.headers_mut());
-                    response
-                });
+                let mut response = Json(completion).into_response();
+                metadata.apply(response.headers_mut());
+                return Ok(response);
             }
             ToolOutputClassification::ToolCalls(tool_calls) => {
                 info!(
@@ -421,18 +410,10 @@ async fn openai_tool_emulated_chat_response(
                     retries,
                     "tool emulation produced tool calls"
                 );
-                let mut metadata = metadata.clone();
-                if retries > 0 {
-                    metadata.tool_retries = Some(retries);
-                }
-                return Ok(if request.stream {
-                    openai_tool_call_sse_response(completion, tool_calls, metadata)
-                } else {
-                    let body = openai_tool_call_completion(completion, tool_calls);
-                    let mut response = Json(body).into_response();
-                    metadata.apply(response.headers_mut());
-                    response
-                });
+                let body = openai_tool_call_completion(completion, tool_calls);
+                let mut response = Json(body).into_response();
+                metadata.apply(response.headers_mut());
+                return Ok(response);
             }
             ToolOutputClassification::InvalidToolCall {
                 error,
@@ -464,107 +445,38 @@ async fn openai_tool_emulated_chat_response(
     }
 }
 
-fn openai_chat_sse_response_from_completion(
-    completion: Value,
-    include_usage_requested: bool,
-    metadata: ProxyMetadataHeaders,
-) -> Response {
-    let mut events = Vec::new();
-    let choice = completion
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .cloned()
-        .unwrap_or(Value::Null);
-    let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
-    let content = choice
-        .get("message")
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !content.is_empty() {
-        events.push(openai_chunk_from_completion(
-            &completion,
-            index,
-            json!({"role": "assistant", "content": content}),
-            Value::Null,
-        ));
-    }
-    let finish_reason = choice
-        .get("finish_reason")
-        .cloned()
-        .unwrap_or_else(|| Value::String("stop".to_owned()));
-    events.push(openai_chunk_from_completion(
-        &completion,
-        index,
-        json!({}),
-        finish_reason,
-    ));
-    if include_usage_requested
-        && let Some(usage) = completion.get("usage")
-        && !usage.is_null()
-    {
-        events.push(json!({
-            "id": string_field(&completion, "id").unwrap_or("chatcmpl-local"),
-            "object": "chat.completion.chunk",
-            "created": integer_field(&completion, "created").unwrap_or_else(unix_timestamp_now),
-            "model": string_field(&completion, "model").unwrap_or("unknown"),
-            "choices": [],
-            "usage": usage,
-        }));
-    }
-
-    sse_response_from_json_events(events, metadata)
-}
-
-fn openai_tool_call_sse_response(
-    completion: Value,
-    tool_calls: Vec<ValidatedToolCall>,
-    metadata: ProxyMetadataHeaders,
-) -> Response {
-    let choice = completion
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .cloned()
-        .unwrap_or(Value::Null);
-    let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
-    let streamed_tool_calls: Vec<Value> = tool_calls
-        .iter()
-        .enumerate()
-        .map(|(tool_index, tool_call)| tool_call.to_openai_streaming_value(tool_index as u64))
+/// Builds and sends the encrypted tool-emulated upstream request, optionally
+/// appending a correction message from `(validation_error, invalid_output)`.
+async fn tool_emulated_upstream_stream(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    tool_context: &ToolEmulationContext,
+    codec: &E2eeCodec,
+    proxy_instance_key: &ProxyInstanceKey,
+    model_public_key: &str,
+    correction: Option<&(String, String)>,
+) -> Result<reqwest::Response, ProxyError> {
+    let controller_messages = [tool_context.controller_message()];
+    let correction_messages: Vec<_> = correction
+        .map(|(validation_error, invalid_output)| {
+            tool_context.correction_message(validation_error, invalid_output)
+        })
+        .into_iter()
         .collect();
-    let events = vec![
-        openai_chunk_from_completion(
-            &completion,
-            index,
-            json!({
-                "role": "assistant",
-                "tool_calls": streamed_tool_calls,
-            }),
-            Value::Null,
-        ),
-        openai_chunk_from_completion(
-            &completion,
-            index,
-            json!({}),
-            Value::String("tool_calls".to_owned()),
-        ),
-    ];
-
-    sse_response_from_json_events(events, metadata)
-}
-
-fn sse_response_from_json_events(events: Vec<Value>, metadata: ProxyMetadataHeaders) -> Response {
-    let stream = async_stream::stream! {
-        for event in events {
-            yield Ok::<Event, io::Error>(Event::default().data(event.to_string()));
-        }
-        yield Ok::<Event, io::Error>(Event::default().data("[DONE]"));
-    };
-    let mut response = Sse::new(stream).into_response();
-    metadata.apply(response.headers_mut());
-    response
+    let prepared = request.to_venice_e2ee_request_with_messages(
+        codec,
+        model_public_key,
+        &controller_messages,
+        &correction_messages,
+    )?;
+    Ok(state
+        .venice_client()
+        .create_chat_completion_stream(
+            &prepared.upstream,
+            proxy_instance_key.public_key_hex(),
+            model_public_key,
+        )
+        .await?)
 }
 
 fn openai_tool_call_completion(completion: Value, tool_calls: Vec<ValidatedToolCall>) -> Value {
@@ -595,25 +507,6 @@ fn openai_tool_call_completion(completion: Value, tool_calls: Vec<ValidatedToolC
             "finish_reason": "tool_calls",
         }],
         "usage": completion.get("usage").cloned().unwrap_or(Value::Null),
-    })
-}
-
-fn openai_chunk_from_completion(
-    completion: &Value,
-    index: u64,
-    delta: Value,
-    finish_reason: Value,
-) -> Value {
-    json!({
-        "id": string_field(completion, "id").unwrap_or("chatcmpl-local"),
-        "object": "chat.completion.chunk",
-        "created": integer_field(completion, "created").unwrap_or_else(unix_timestamp_now),
-        "model": string_field(completion, "model").unwrap_or("unknown"),
-        "choices": [{
-            "index": index,
-            "delta": delta,
-            "finish_reason": finish_reason,
-        }],
     })
 }
 
@@ -673,7 +566,7 @@ async fn buffer_openai_chat_completion(
         ));
     }
 
-    let completion = transformer.into_response()?;
+    let completion = transformer.into_response();
     info!(
         model = %fallback_model,
         chunk_count,
@@ -683,46 +576,77 @@ async fn buffer_openai_chat_completion(
     Ok(completion)
 }
 
-fn openai_chat_sse_response(
+/// Per-path log messages for the shared chat SSE pump, preserving the
+/// historical "streaming" vs "tool-emulated" wording.
+struct ChatSseLogMessages {
+    start: &'static str,
+    parsed_chunk: &'static str,
+    transformed_event: &'static str,
+    completed: &'static str,
+    ended_early: &'static str,
+}
+
+const CHAT_SSE_LOG: ChatSseLogMessages = ChatSseLogMessages {
+    start: "starting upstream chat SSE transformation",
+    parsed_chunk: "parsed streaming upstream SSE chunk",
+    transformed_event: "transformed streaming upstream SSE event",
+    completed: "completed upstream chat SSE transformation",
+    ended_early: "streaming upstream stream ended before DONE",
+};
+
+const TOOL_EMULATED_CHAT_SSE_LOG: ChatSseLogMessages = ChatSseLogMessages {
+    start: "starting tool-emulated upstream chat SSE transformation",
+    parsed_chunk: "parsed tool-emulated upstream SSE chunk",
+    transformed_event: "transformed tool-emulated upstream SSE event",
+    completed: "completed tool-emulated upstream chat SSE transformation",
+    ended_early: "tool-emulated upstream stream ended before DONE",
+};
+
+/// Transforms parsed upstream SSE events into client-facing stream outputs.
+trait ChatSseTransformer {
+    fn handle_event(&mut self, event: RawSseEvent) -> Result<Vec<StreamOutput>, ChatStreamError>;
+}
+
+fn chat_sse_response<T>(
     upstream: reqwest::Response,
-    codec: E2eeCodec,
-    proxy_instance_key: ProxyInstanceKey,
+    transformer: T,
     fallback_model: String,
     include_usage_requested: bool,
+    log: &'static ChatSseLogMessages,
     metadata: ProxyMetadataHeaders,
-) -> Response {
-    let stream = openai_chat_event_stream(
+) -> Response
+where
+    T: ChatSseTransformer + Send + 'static,
+{
+    let stream = chat_sse_event_stream(
         upstream,
-        codec,
-        proxy_instance_key,
+        transformer,
         fallback_model,
         include_usage_requested,
+        log,
     );
     let mut response = Sse::new(stream).into_response();
     metadata.apply(response.headers_mut());
     response
 }
 
-fn openai_chat_event_stream(
+fn chat_sse_event_stream<T>(
     mut upstream: reqwest::Response,
-    codec: E2eeCodec,
-    proxy_instance_key: ProxyInstanceKey,
+    mut transformer: T,
     fallback_model: String,
     include_usage_requested: bool,
-) -> impl futures_core::Stream<Item = Result<Event, axum::BoxError>> {
+    log: &'static ChatSseLogMessages,
+) -> impl futures_core::Stream<Item = Result<Event, axum::BoxError>>
+where
+    T: ChatSseTransformer + Send + 'static,
+{
     async_stream::try_stream! {
         info!(
             model = %fallback_model,
             include_usage_requested,
-            "starting upstream chat SSE transformation"
+            "{}", log.start
         );
         let mut parser = SseEventParser::default();
-        let mut transformer = OpenAiChatStreamTransformer::new(
-            codec,
-            proxy_instance_key,
-            fallback_model.clone(),
-            include_usage_requested,
-        );
         let mut upstream_done = false;
         let mut chunk_count = 0_u64;
         let mut event_count = 0_u64;
@@ -745,7 +669,7 @@ fn openai_chat_event_stream(
                 chunk_count,
                 parsed_events = events.len(),
                 total_events = event_count,
-                "parsed streaming upstream SSE chunk"
+                "{}", log.parsed_chunk
             );
 
             for event in events {
@@ -755,7 +679,7 @@ fn openai_chat_event_stream(
                     model = %fallback_model,
                     emitted_outputs = outputs.len(),
                     total_outputs = output_count,
-                    "transformed streaming upstream SSE event"
+                    "{}", log.transformed_event
                 );
 
                 for output in outputs {
@@ -768,7 +692,7 @@ fn openai_chat_event_stream(
                                 chunk_count,
                                 event_count,
                                 output_count,
-                                "completed upstream chat SSE transformation"
+                                "{}", log.completed
                             );
                             yield Event::default().data("[DONE]");
                             break;
@@ -792,130 +716,7 @@ fn openai_chat_event_stream(
                 chunk_count,
                 event_count,
                 output_count,
-                "streaming upstream stream ended before DONE"
-            );
-            parser.finish().map_err(box_chat_stream_error)?;
-            Err::<(), axum::BoxError>(box_chat_stream_error(ChatStreamError::malformed_event(
-                "upstream stream ended before data: [DONE]",
-            )))?;
-        }
-    }
-}
-
-fn openai_tool_emulated_chat_sse_response(
-    upstream: reqwest::Response,
-    tool_context: ToolEmulationContext,
-    codec: E2eeCodec,
-    proxy_instance_key: ProxyInstanceKey,
-    fallback_model: String,
-    include_usage_requested: bool,
-    metadata: ProxyMetadataHeaders,
-) -> Response {
-    let stream = openai_tool_emulated_chat_event_stream(
-        upstream,
-        tool_context,
-        codec,
-        proxy_instance_key,
-        fallback_model,
-        include_usage_requested,
-    );
-    let mut response = Sse::new(stream).into_response();
-    metadata.apply(response.headers_mut());
-    response
-}
-
-fn openai_tool_emulated_chat_event_stream(
-    mut upstream: reqwest::Response,
-    tool_context: ToolEmulationContext,
-    codec: E2eeCodec,
-    proxy_instance_key: ProxyInstanceKey,
-    fallback_model: String,
-    include_usage_requested: bool,
-) -> impl futures_core::Stream<Item = Result<Event, axum::BoxError>> {
-    async_stream::try_stream! {
-        info!(
-            model = %fallback_model,
-            include_usage_requested,
-            "starting tool-emulated upstream chat SSE transformation"
-        );
-        let mut parser = SseEventParser::default();
-        let mut transformer = OpenAiToolEmulatedChatStreamTransformer::new(
-            tool_context,
-            codec,
-            proxy_instance_key,
-            fallback_model.clone(),
-            include_usage_requested,
-        );
-        let mut upstream_done = false;
-        let mut chunk_count = 0_u64;
-        let mut event_count = 0_u64;
-        let mut output_count = 0_u64;
-
-        while let Some(chunk) = upstream
-            .chunk()
-            .await
-            .map_err(ChatStreamError::upstream_stream)
-            .map_err(box_chat_stream_error)?
-        {
-            chunk_count += 1;
-            let chunk = std::str::from_utf8(&chunk)
-                .map_err(ChatStreamError::invalid_utf8)
-                .map_err(box_chat_stream_error)?;
-            let events = parser.push(chunk).map_err(box_chat_stream_error)?;
-            event_count += events.len() as u64;
-            debug!(
-                model = %fallback_model,
-                chunk_count,
-                parsed_events = events.len(),
-                total_events = event_count,
-                "parsed tool-emulated upstream SSE chunk"
-            );
-
-            for event in events {
-                let outputs = transformer.handle_event(event).map_err(box_chat_stream_error)?;
-                output_count += outputs.len() as u64;
-                debug!(
-                    model = %fallback_model,
-                    emitted_outputs = outputs.len(),
-                    total_outputs = output_count,
-                    "transformed tool-emulated upstream SSE event"
-                );
-
-                for output in outputs {
-                    match output {
-                        StreamOutput::Json(value) => yield Event::default().data(value.to_string()),
-                        StreamOutput::Done => {
-                            upstream_done = true;
-                            info!(
-                                model = %fallback_model,
-                                chunk_count,
-                                event_count,
-                                output_count,
-                                "completed tool-emulated upstream chat SSE transformation"
-                            );
-                            yield Event::default().data("[DONE]");
-                            break;
-                        }
-                    }
-                }
-
-                if upstream_done {
-                    break;
-                }
-            }
-
-            if upstream_done {
-                break;
-            }
-        }
-
-        if !upstream_done {
-            warn!(
-                model = %fallback_model,
-                chunk_count,
-                event_count,
-                output_count,
-                "tool-emulated upstream stream ended before DONE"
+                "{}", log.ended_early
             );
             parser.finish().map_err(box_chat_stream_error)?;
             Err::<(), axum::BoxError>(box_chat_stream_error(ChatStreamError::malformed_event(
@@ -978,12 +779,182 @@ struct RawSseEvent {
     data: String,
 }
 
-struct OpenAiChatCompletionBuffer {
+/// Per-path log messages for [`classify_upstream_event`], preserving the
+/// historical "buffered" / "streaming" / "tool-emulated" wording. Optional
+/// entries are skipped for paths that historically did not emit them.
+struct UpstreamEventLogMessages {
+    event: &'static str,
+    sse_error: &'static str,
+    done: &'static str,
+    parsing: Option<&'static str>,
+    json_error: &'static str,
+    missing_choices: &'static str,
+    parsed: Option<&'static str>,
+    unexpected_choice_count: &'static str,
+}
+
+const BUFFERED_UPSTREAM_EVENT_LOG: UpstreamEventLogMessages = UpstreamEventLogMessages {
+    event: "buffering upstream SSE event",
+    sse_error: "upstream SSE error event while buffering response",
+    done: "received upstream DONE while buffering response",
+    parsing: Some("parsing buffered upstream chat JSON chunk"),
+    json_error: "upstream JSON error chunk while buffering response",
+    missing_choices: "buffered upstream chat chunk is missing choices array",
+    parsed: Some("parsed buffered upstream chat chunk"),
+    unexpected_choice_count: "unexpected buffered upstream choice count",
+};
+
+const STREAMING_UPSTREAM_EVENT_LOG: UpstreamEventLogMessages = UpstreamEventLogMessages {
+    event: "transforming streaming upstream SSE event",
+    sse_error: "upstream SSE error event while streaming response",
+    done: "received upstream DONE while streaming response",
+    parsing: Some("parsing streaming upstream chat JSON chunk"),
+    json_error: "upstream JSON error chunk while streaming response",
+    missing_choices: "streaming upstream chat chunk is missing choices array",
+    parsed: Some("parsed streaming upstream chat chunk"),
+    unexpected_choice_count: "unexpected streaming upstream choice count",
+};
+
+const TOOL_EMULATED_UPSTREAM_EVENT_LOG: UpstreamEventLogMessages = UpstreamEventLogMessages {
+    event: "transforming tool-emulated streaming upstream SSE event",
+    sse_error: "upstream SSE error event while streaming tool-emulated response",
+    done: "received upstream DONE while streaming tool-emulated response",
+    parsing: None,
+    json_error: "upstream JSON error chunk while streaming tool-emulated response",
+    missing_choices: "tool-emulated upstream chat chunk is missing choices array",
+    parsed: None,
+    unexpected_choice_count: "unexpected tool-emulated upstream choice count",
+};
+
+/// A validated upstream SSE event, classified for downstream handling.
+enum UpstreamEventKind {
+    /// The upstream `data: [DONE]` sentinel.
+    Done,
+    /// A chunk with an empty `choices` array (usage-only chunk).
+    Usage(Value),
+    /// A chunk with exactly one choice.
+    Choice { value: Value, choice: Value },
+}
+
+/// Shared prologue for upstream SSE event handling: rejects error events and
+/// error payloads, detects `[DONE]`, parses the JSON chunk, and validates the
+/// `choices` array.
+fn classify_upstream_event(
+    event: RawSseEvent,
+    log: &UpstreamEventLogMessages,
+) -> Result<UpstreamEventKind, ChatStreamError> {
+    let event_type = event.event.as_deref().unwrap_or("message");
+    let is_done = event.data.trim() == "[DONE]";
+    debug!(event_type, is_done, "{}", log.event);
+
+    if event.event.as_deref() == Some("error") {
+        warn!("{}", log.sse_error);
+        return Err(ChatStreamError::upstream_event(event.data));
+    }
+
+    if is_done {
+        info!("{}", log.done);
+        return Ok(UpstreamEventKind::Done);
+    }
+
+    if let Some(parsing) = log.parsing {
+        debug!("{}", parsing);
+    }
+    let value: Value = serde_json::from_str(&event.data).map_err(ChatStreamError::json_event)?;
+    if let Some(error) = value.get("error") {
+        warn!("{}", log.json_error);
+        return Err(ChatStreamError::upstream_event(error.to_string()));
+    }
+
+    let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+        warn!("{}", log.missing_choices);
+        return Err(ChatStreamError::malformed_event(
+            "upstream chat chunk is missing choices array",
+        ));
+    };
+    if let Some(parsed) = log.parsed {
+        debug!(choice_count = choices.len(), "{}", parsed);
+    }
+
+    if choices.is_empty() {
+        return Ok(UpstreamEventKind::Usage(value));
+    }
+    if choices.len() != 1 {
+        warn!(
+            choice_count = choices.len(),
+            "{}", log.unexpected_choice_count
+        );
+        return Err(ChatStreamError::malformed_event(format!(
+            "expected exactly one upstream choice, got {}",
+            choices.len(),
+        )));
+    }
+
+    let choice = choices[0].clone();
+    Ok(UpstreamEventKind::Choice { value, choice })
+}
+
+/// Shared chunk-transformation state: the E2EE codec/key used to decrypt
+/// upstream content plus the fallback identity fields for emitted chunks.
+struct ChunkContext {
     codec: E2eeCodec,
     proxy_instance_key: ProxyInstanceKey,
     fallback_id: String,
     fallback_created: i64,
     fallback_model: String,
+}
+
+impl ChunkContext {
+    fn new(codec: E2eeCodec, proxy_instance_key: ProxyInstanceKey, fallback_model: String) -> Self {
+        Self {
+            codec,
+            proxy_instance_key,
+            fallback_id: format!("chatcmpl-local-{}", uuid::Uuid::new_v4()),
+            fallback_created: unix_timestamp_now(),
+            fallback_model,
+        }
+    }
+
+    fn decrypt(&self, content: Option<&str>) -> Result<Option<String>, ChatStreamError> {
+        self.codec
+            .decrypt_response_content(content, self.proxy_instance_key.private_key())
+            .map_err(ChatStreamError::decryption)
+    }
+
+    fn chunk_with_choice(
+        &self,
+        upstream: &Value,
+        index: u64,
+        delta: Value,
+        finish_reason: Value,
+    ) -> Value {
+        json!({
+            "id": string_field(upstream, "id").unwrap_or(&self.fallback_id),
+            "object": string_field(upstream, "object").unwrap_or("chat.completion.chunk"),
+            "created": integer_field(upstream, "created").unwrap_or(self.fallback_created),
+            "model": string_field(upstream, "model").unwrap_or(&self.fallback_model),
+            "choices": [{
+                "index": index,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }],
+        })
+    }
+
+    fn usage_chunk(&self, upstream: &Value, usage: &Value) -> Value {
+        json!({
+            "id": string_field(upstream, "id").unwrap_or(&self.fallback_id),
+            "object": string_field(upstream, "object").unwrap_or("chat.completion.chunk"),
+            "created": integer_field(upstream, "created").unwrap_or(self.fallback_created),
+            "model": string_field(upstream, "model").unwrap_or(&self.fallback_model),
+            "choices": [],
+            "usage": usage,
+        })
+    }
+}
+
+struct OpenAiChatCompletionBuffer {
+    ctx: ChunkContext,
     id: Option<String>,
     created: Option<i64>,
     model: Option<String>,
@@ -997,11 +968,7 @@ struct OpenAiChatCompletionBuffer {
 impl OpenAiChatCompletionBuffer {
     fn new(codec: E2eeCodec, proxy_instance_key: ProxyInstanceKey, fallback_model: String) -> Self {
         Self {
-            codec,
-            proxy_instance_key,
-            fallback_id: format!("chatcmpl-local-{}", uuid::Uuid::new_v4()),
-            fallback_created: unix_timestamp_now(),
-            fallback_model,
+            ctx: ChunkContext::new(codec, proxy_instance_key, fallback_model),
             id: None,
             created: None,
             model: None,
@@ -1014,65 +981,26 @@ impl OpenAiChatCompletionBuffer {
     }
 
     fn handle_event(&mut self, event: RawSseEvent) -> Result<bool, ChatStreamError> {
-        let event_type = event.event.as_deref().unwrap_or("message");
-        let is_done = event.data.trim() == "[DONE]";
-        debug!(event_type, is_done, "buffering upstream SSE event");
-
-        if event.event.as_deref() == Some("error") {
-            warn!("upstream SSE error event while buffering response");
-            return Err(ChatStreamError::upstream_event(event.data));
-        }
-
-        if is_done {
-            info!("received upstream DONE while buffering response");
-            if !self.saw_encrypted_content {
-                self.codec
-                    .decrypt_response_content(None, self.proxy_instance_key.private_key())
-                    .map_err(ChatStreamError::decryption)?;
+        match classify_upstream_event(event, &BUFFERED_UPSTREAM_EVENT_LOG)? {
+            UpstreamEventKind::Done => {
+                if !self.saw_encrypted_content {
+                    self.ctx.decrypt(None)?;
+                }
+                if self.finish_reason.is_none() {
+                    self.finish_reason = Some(Value::String("stop".to_owned()));
+                }
+                Ok(true)
             }
-            if self.finish_reason.is_none() {
-                self.finish_reason = Some(Value::String("stop".to_owned()));
+            UpstreamEventKind::Usage(value) => {
+                self.record_metadata(&value);
+                self.handle_usage_chunk(&value).map(|()| false)
             }
-            return Ok(true);
+            UpstreamEventKind::Choice { value, choice } => {
+                self.record_metadata(&value);
+                self.handle_choice_chunk(&choice)?;
+                Ok(false)
+            }
         }
-
-        debug!("parsing buffered upstream chat JSON chunk");
-        let value: Value =
-            serde_json::from_str(&event.data).map_err(ChatStreamError::json_event)?;
-        if let Some(error) = value.get("error") {
-            warn!("upstream JSON error chunk while buffering response");
-            return Err(ChatStreamError::upstream_event(error.to_string()));
-        }
-
-        self.record_metadata(&value);
-
-        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
-            warn!("buffered upstream chat chunk is missing choices array");
-            return Err(ChatStreamError::malformed_event(
-                "upstream chat chunk is missing choices array",
-            ));
-        };
-        debug!(
-            choice_count = choices.len(),
-            "parsed buffered upstream chat chunk"
-        );
-
-        if choices.is_empty() {
-            return self.handle_usage_chunk(&value).map(|()| false);
-        }
-        if choices.len() != 1 {
-            warn!(
-                choice_count = choices.len(),
-                "unexpected buffered upstream choice count"
-            );
-            return Err(ChatStreamError::malformed_event(format!(
-                "expected exactly one upstream choice, got {}",
-                choices.len(),
-            )));
-        }
-
-        self.handle_choice_chunk(&choices[0])?;
-        Ok(false)
     }
 
     fn handle_usage_chunk(&mut self, value: &Value) -> Result<(), ChatStreamError> {
@@ -1114,10 +1042,7 @@ impl OpenAiChatCompletionBuffer {
         );
 
         if let Some(content) = content {
-            let decrypted = self
-                .codec
-                .decrypt_response_content(Some(content), self.proxy_instance_key.private_key())
-                .map_err(ChatStreamError::decryption)?;
+            let decrypted = self.ctx.decrypt(Some(content))?;
             self.saw_encrypted_content = true;
             debug!(
                 choice_index = index,
@@ -1154,12 +1079,12 @@ impl OpenAiChatCompletionBuffer {
         }
     }
 
-    fn into_response(self) -> Result<Value, ChatStreamError> {
-        Ok(json!({
-            "id": self.id.unwrap_or(self.fallback_id),
+    fn into_response(self) -> Value {
+        json!({
+            "id": self.id.unwrap_or(self.ctx.fallback_id),
             "object": "chat.completion",
-            "created": self.created.unwrap_or(self.fallback_created),
-            "model": self.model.unwrap_or(self.fallback_model),
+            "created": self.created.unwrap_or(self.ctx.fallback_created),
+            "model": self.model.unwrap_or(self.ctx.fallback_model),
             "choices": [{
                 "index": self.choice_index.unwrap_or(0),
                 "message": {
@@ -1169,7 +1094,7 @@ impl OpenAiChatCompletionBuffer {
                 "finish_reason": self.finish_reason.unwrap_or_else(|| Value::String("stop".to_owned())),
             }],
             "usage": self.usage.unwrap_or(Value::Null),
-        }))
+        })
     }
 }
 
@@ -1232,11 +1157,7 @@ fn parse_sse_event(raw: &str) -> Result<Option<RawSseEvent>, ChatStreamError> {
 }
 
 struct OpenAiChatStreamTransformer {
-    codec: E2eeCodec,
-    proxy_instance_key: ProxyInstanceKey,
-    fallback_id: String,
-    fallback_created: i64,
-    fallback_model: String,
+    ctx: ChunkContext,
     include_usage_requested: bool,
     sent_role: bool,
     sent_final_finish: bool,
@@ -1250,76 +1171,11 @@ impl OpenAiChatStreamTransformer {
         include_usage_requested: bool,
     ) -> Self {
         Self {
-            codec,
-            proxy_instance_key,
-            fallback_id: format!("chatcmpl-local-{}", uuid::Uuid::new_v4()),
-            fallback_created: unix_timestamp_now(),
-            fallback_model,
+            ctx: ChunkContext::new(codec, proxy_instance_key, fallback_model),
             include_usage_requested,
             sent_role: false,
             sent_final_finish: false,
         }
-    }
-
-    fn handle_event(&mut self, event: RawSseEvent) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        let event_type = event.event.as_deref().unwrap_or("message");
-        let is_done = event.data.trim() == "[DONE]";
-        debug!(
-            event_type,
-            is_done, "transforming streaming upstream SSE event"
-        );
-
-        if event.event.as_deref() == Some("error") {
-            warn!("upstream SSE error event while streaming response");
-            return Err(ChatStreamError::upstream_event(event.data));
-        }
-
-        if is_done {
-            info!("received upstream DONE while streaming response");
-            let mut output = Vec::new();
-            if !self.sent_final_finish {
-                debug!("synthesizing final streaming finish chunk before DONE");
-                output.push(StreamOutput::Json(self.finish_chunk(None)?));
-                self.sent_final_finish = true;
-            }
-            output.push(StreamOutput::Done);
-            return Ok(output);
-        }
-
-        debug!("parsing streaming upstream chat JSON chunk");
-        let value: Value =
-            serde_json::from_str(&event.data).map_err(ChatStreamError::json_event)?;
-        if let Some(error) = value.get("error") {
-            warn!("upstream JSON error chunk while streaming response");
-            return Err(ChatStreamError::upstream_event(error.to_string()));
-        }
-
-        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
-            warn!("streaming upstream chat chunk is missing choices array");
-            return Err(ChatStreamError::malformed_event(
-                "upstream chat chunk is missing choices array",
-            ));
-        };
-        debug!(
-            choice_count = choices.len(),
-            "parsed streaming upstream chat chunk"
-        );
-
-        if choices.is_empty() {
-            return self.handle_usage_chunk(&value);
-        }
-        if choices.len() != 1 {
-            warn!(
-                choice_count = choices.len(),
-                "unexpected streaming upstream choice count"
-            );
-            return Err(ChatStreamError::malformed_event(format!(
-                "expected exactly one upstream choice, got {}",
-                choices.len(),
-            )));
-        }
-
-        self.handle_choice_chunk(&value, &choices[0])
     }
 
     fn handle_choice_chunk(
@@ -1353,10 +1209,7 @@ impl OpenAiChatStreamTransformer {
             return Ok(output);
         }
 
-        let decrypted = self
-            .codec
-            .decrypt_response_content(content, self.proxy_instance_key.private_key())
-            .map_err(ChatStreamError::decryption)?;
+        let decrypted = self.ctx.decrypt(content)?;
         debug!(
             has_decrypted_content = decrypted.is_some(),
             "decrypted streaming upstream content chunk"
@@ -1414,23 +1267,12 @@ impl OpenAiChatStreamTransformer {
         }
 
         info!("streaming upstream usage chunk forwarded");
-        Ok(vec![StreamOutput::Json(json!({
-            "id": string_field(value, "id").unwrap_or(&self.fallback_id),
-            "object": string_field(value, "object").unwrap_or("chat.completion.chunk"),
-            "created": integer_field(value, "created").unwrap_or(self.fallback_created),
-            "model": string_field(value, "model").unwrap_or(&self.fallback_model),
-            "choices": [],
-            "usage": usage,
-        }))])
+        Ok(vec![StreamOutput::Json(self.ctx.usage_chunk(value, usage))])
     }
 
-    fn finish_chunk(&self, upstream: Option<&Value>) -> Result<Value, ChatStreamError> {
-        self.chunk_with_choice(
-            upstream.unwrap_or(&Value::Null),
-            None,
-            json!({}),
-            Value::String("stop".to_owned()),
-        )
+    fn finish_chunk(&self) -> Value {
+        self.ctx
+            .chunk_with_choice(&Value::Null, 0, json!({}), Value::String("stop".to_owned()))
     }
 
     fn chunk_with_choice(
@@ -1441,28 +1283,36 @@ impl OpenAiChatStreamTransformer {
         finish_reason: Value,
     ) -> Result<Value, ChatStreamError> {
         let index = normalized_choice_index(index)?;
+        Ok(self
+            .ctx
+            .chunk_with_choice(upstream, index, delta, finish_reason))
+    }
+}
 
-        Ok(json!({
-            "id": string_field(upstream, "id").unwrap_or(&self.fallback_id),
-            "object": string_field(upstream, "object").unwrap_or("chat.completion.chunk"),
-            "created": integer_field(upstream, "created").unwrap_or(self.fallback_created),
-            "model": string_field(upstream, "model").unwrap_or(&self.fallback_model),
-            "choices": [{
-                "index": index,
-                "delta": delta,
-                "finish_reason": finish_reason,
-            }],
-        }))
+impl ChatSseTransformer for OpenAiChatStreamTransformer {
+    fn handle_event(&mut self, event: RawSseEvent) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        match classify_upstream_event(event, &STREAMING_UPSTREAM_EVENT_LOG)? {
+            UpstreamEventKind::Done => {
+                let mut output = Vec::new();
+                if !self.sent_final_finish {
+                    debug!("synthesizing final streaming finish chunk before DONE");
+                    output.push(StreamOutput::Json(self.finish_chunk()));
+                    self.sent_final_finish = true;
+                }
+                output.push(StreamOutput::Done);
+                Ok(output)
+            }
+            UpstreamEventKind::Usage(value) => self.handle_usage_chunk(&value),
+            UpstreamEventKind::Choice { value, choice } => {
+                self.handle_choice_chunk(&value, &choice)
+            }
+        }
     }
 }
 
 struct OpenAiToolEmulatedChatStreamTransformer {
     tool_context: ToolEmulationContext,
-    codec: E2eeCodec,
-    proxy_instance_key: ProxyInstanceKey,
-    fallback_id: String,
-    fallback_created: i64,
-    fallback_model: String,
+    ctx: ChunkContext,
     include_usage_requested: bool,
     sent_role: bool,
     sent_final_finish: bool,
@@ -1482,11 +1332,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
     ) -> Self {
         Self {
             tool_context,
-            codec,
-            proxy_instance_key,
-            fallback_id: format!("chatcmpl-local-{}", uuid::Uuid::new_v4()),
-            fallback_created: unix_timestamp_now(),
-            fallback_model,
+            ctx: ChunkContext::new(codec, proxy_instance_key, fallback_model),
             include_usage_requested,
             sent_role: false,
             sent_final_finish: false,
@@ -1494,55 +1340,6 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             tool_buffer: None,
             emitted_tool_calls: 0,
         }
-    }
-
-    fn handle_event(&mut self, event: RawSseEvent) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        let event_type = event.event.as_deref().unwrap_or("message");
-        let is_done = event.data.trim() == "[DONE]";
-        debug!(
-            event_type,
-            is_done, "transforming tool-emulated streaming upstream SSE event"
-        );
-
-        if event.event.as_deref() == Some("error") {
-            warn!("upstream SSE error event while streaming tool-emulated response");
-            return Err(ChatStreamError::upstream_event(event.data));
-        }
-
-        if is_done {
-            info!("received upstream DONE while streaming tool-emulated response");
-            return self.finish_stream(None);
-        }
-
-        let value: Value =
-            serde_json::from_str(&event.data).map_err(ChatStreamError::json_event)?;
-        if let Some(error) = value.get("error") {
-            warn!("upstream JSON error chunk while streaming tool-emulated response");
-            return Err(ChatStreamError::upstream_event(error.to_string()));
-        }
-
-        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
-            warn!("tool-emulated upstream chat chunk is missing choices array");
-            return Err(ChatStreamError::malformed_event(
-                "upstream chat chunk is missing choices array",
-            ));
-        };
-
-        if choices.is_empty() {
-            return self.handle_usage_chunk(&value);
-        }
-        if choices.len() != 1 {
-            warn!(
-                choice_count = choices.len(),
-                "unexpected tool-emulated upstream choice count"
-            );
-            return Err(ChatStreamError::malformed_event(format!(
-                "expected exactly one upstream choice, got {}",
-                choices.len(),
-            )));
-        }
-
-        self.handle_choice_chunk(&value, &choices[0])
     }
 
     fn handle_choice_chunk(
@@ -1560,10 +1357,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
 
         let mut output = Vec::new();
         if let Some(content) = content {
-            let decrypted = self
-                .codec
-                .decrypt_response_content(Some(content), self.proxy_instance_key.private_key())
-                .map_err(ChatStreamError::decryption)?;
+            let decrypted = self.ctx.decrypt(Some(content))?;
             if let Some(content) = decrypted {
                 output.extend(self.handle_decrypted_content(value, index, &content)?);
             }
@@ -1576,12 +1370,12 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             } else {
                 finish_reason
             };
-            output.push(StreamOutput::Json(self.chunk_with_choice(
+            output.push(StreamOutput::Json(self.ctx.chunk_with_choice(
                 value,
                 index,
                 json!({}),
                 finish_reason,
-            )?));
+            )));
             self.sent_final_finish = true;
         }
 
@@ -1790,12 +1584,12 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         }
         delta.insert("content".to_owned(), Value::String(text));
 
-        Ok(vec![StreamOutput::Json(self.chunk_with_choice(
+        Ok(vec![StreamOutput::Json(self.ctx.chunk_with_choice(
             upstream,
             index,
             Value::Object(delta),
             Value::Null,
-        )?)])
+        ))])
     }
 
     fn emit_tool_call(
@@ -1817,12 +1611,12 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         );
         self.emitted_tool_calls += 1;
 
-        Ok(vec![StreamOutput::Json(self.chunk_with_choice(
+        Ok(vec![StreamOutput::Json(self.ctx.chunk_with_choice(
             upstream,
             index,
             Value::Object(delta),
             Value::Null,
-        )?)])
+        ))])
     }
 
     fn handle_usage_chunk(&self, value: &Value) -> Result<Vec<StreamOutput>, ChatStreamError> {
@@ -1837,21 +1631,11 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             return Ok(Vec::new());
         }
 
-        Ok(vec![StreamOutput::Json(json!({
-            "id": string_field(value, "id").unwrap_or(&self.fallback_id),
-            "object": string_field(value, "object").unwrap_or("chat.completion.chunk"),
-            "created": integer_field(value, "created").unwrap_or(self.fallback_created),
-            "model": string_field(value, "model").unwrap_or(&self.fallback_model),
-            "choices": [],
-            "usage": usage,
-        }))])
+        Ok(vec![StreamOutput::Json(self.ctx.usage_chunk(value, usage))])
     }
 
-    fn finish_stream(
-        &mut self,
-        upstream: Option<&Value>,
-    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
-        let upstream = upstream.unwrap_or(&Value::Null);
+    fn finish_stream(&mut self) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        let upstream = &Value::Null;
         let mut output = self.finish_pending_content(upstream, 0)?;
         if !self.sent_final_finish {
             let finish_reason = if self.emitted_tool_calls > 0 {
@@ -1859,36 +1643,28 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             } else {
                 "stop"
             };
-            output.push(StreamOutput::Json(self.chunk_with_choice(
+            output.push(StreamOutput::Json(self.ctx.chunk_with_choice(
                 upstream,
                 0,
                 json!({}),
                 Value::String(finish_reason.to_owned()),
-            )?));
+            )));
             self.sent_final_finish = true;
         }
         output.push(StreamOutput::Done);
         Ok(output)
     }
+}
 
-    fn chunk_with_choice(
-        &self,
-        upstream: &Value,
-        index: u64,
-        delta: Value,
-        finish_reason: Value,
-    ) -> Result<Value, ChatStreamError> {
-        Ok(json!({
-            "id": string_field(upstream, "id").unwrap_or(&self.fallback_id),
-            "object": string_field(upstream, "object").unwrap_or("chat.completion.chunk"),
-            "created": integer_field(upstream, "created").unwrap_or(self.fallback_created),
-            "model": string_field(upstream, "model").unwrap_or(&self.fallback_model),
-            "choices": [{
-                "index": index,
-                "delta": delta,
-                "finish_reason": finish_reason,
-            }],
-        }))
+impl ChatSseTransformer for OpenAiToolEmulatedChatStreamTransformer {
+    fn handle_event(&mut self, event: RawSseEvent) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        match classify_upstream_event(event, &TOOL_EMULATED_UPSTREAM_EVENT_LOG)? {
+            UpstreamEventKind::Done => self.finish_stream(),
+            UpstreamEventKind::Usage(value) => self.handle_usage_chunk(&value),
+            UpstreamEventKind::Choice { value, choice } => {
+                self.handle_choice_chunk(&value, &choice)
+            }
+        }
     }
 }
 
@@ -2020,14 +1796,7 @@ impl ChatStreamError {
     }
 
     fn decryption(source: E2eeCodecError) -> Self {
-        match source {
-            E2eeCodecError::MissingEncryptedContent
-            | E2eeCodecError::MalformedEncryptedPayload { .. }
-            | E2eeCodecError::AuthenticationFailed
-            | E2eeCodecError::UnsupportedCodecShape { .. }
-            | E2eeCodecError::InvalidPlaintextUtf8 => Self::Decryption { source },
-            other => Self::Decryption { source: other },
-        }
+        Self::Decryption { source }
     }
 
     fn api_error_type(&self) -> &'static str {
@@ -2074,8 +1843,6 @@ pub enum ProxyError {
     ProxyInstanceKeyUnavailable,
     #[error("session does not contain an attested model public key after attestation verification")]
     MissingAttestedModelKey,
-    #[error("{message}")]
-    NotImplemented { message: String },
     #[error("method {method} is not supported for {uri}")]
     MethodNotAllowed { method: Method, uri: Uri },
     #[error("route {uri} was not found")]
@@ -2101,7 +1868,6 @@ impl ProxyError {
             Self::ProxyInstanceKeyUnavailable | Self::MissingAttestedModelKey => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
-            Self::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
         }
@@ -2121,7 +1887,6 @@ impl ProxyError {
             Self::ToolCallRetryExhausted { .. } => "proxy_tool_call_error",
             Self::ProxyInstanceKeyUnavailable => "proxy_configuration_error",
             Self::MissingAttestedModelKey => "proxy_attestation_error",
-            Self::NotImplemented { .. } => "proxy_not_implemented",
             Self::MethodNotAllowed { .. } | Self::NotFound { .. } => "invalid_request_error",
         }
     }
@@ -2139,7 +1904,6 @@ impl ProxyError {
             Self::ToolCallRetryExhausted { .. } => "invalid_tool_call",
             Self::ProxyInstanceKeyUnavailable => "proxy_instance_key_unavailable",
             Self::MissingAttestedModelKey => "attestation_failed",
-            Self::NotImplemented { .. } => "not_implemented",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
             Self::NotFound { .. } => "not_found",
         }
@@ -2385,7 +2149,7 @@ mod tests {
             .proxy_instance_key()
             .expect("default config should generate startup key");
         assert_eq!(key.public_key_hex().len(), 130);
-        assert!(state.session_manager().is_empty().unwrap());
+        assert!(state.session_manager().is_empty());
         assert_eq!(
             state.attestation_verifier().policy(),
             &ProxyConfig::default().attestation

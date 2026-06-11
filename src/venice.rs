@@ -26,8 +26,6 @@ pub const HEADER_VENICE_TEE_CLIENT_PUB_KEY: &str = "X-Venice-TEE-Client-Pub-Key"
 pub const HEADER_VENICE_TEE_MODEL_PUB_KEY: &str = "X-Venice-TEE-Model-Pub-Key";
 pub const HEADER_VENICE_TEE_SIGNING_ALGO: &str = "X-Venice-TEE-Signing-Algo";
 
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Clone)]
 pub struct VeniceClient {
     http: reqwest::Client,
@@ -77,18 +75,7 @@ impl VeniceClient {
             .send()
             .await
             .map_err(VeniceClientError::request_failure)?;
-
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(VeniceClientError::Authentication {
-                status: status.as_u16(),
-            });
-        }
-        if !status.is_success() {
-            return Err(VeniceClientError::UpstreamStatus {
-                status: status.as_u16(),
-            });
-        }
+        let response = Self::check_status(response)?;
 
         let body = response
             .bytes()
@@ -118,19 +105,7 @@ impl VeniceClient {
             .await
             .map_err(VeniceClientError::request_failure)?;
 
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(VeniceClientError::Authentication {
-                status: status.as_u16(),
-            });
-        }
-        if !status.is_success() {
-            return Err(VeniceClientError::UpstreamStatus {
-                status: status.as_u16(),
-            });
-        }
-
-        Ok(response)
+        Self::check_status(response)
     }
 
     pub async fn fetch_attestation_evidence(
@@ -148,7 +123,16 @@ impl VeniceClient {
             .send()
             .await
             .map_err(VeniceClientError::request_failure)?;
+        let response = Self::check_status(response)?;
 
+        response
+            .json::<Value>()
+            .await
+            .map_err(VeniceClientError::malformed_attestation_payload)
+    }
+
+    /// Maps unauthorized/forbidden and other non-success statuses to errors.
+    fn check_status(response: reqwest::Response) -> Result<reqwest::Response, VeniceClientError> {
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(VeniceClientError::Authentication {
@@ -160,39 +144,31 @@ impl VeniceClient {
                 status: status.as_u16(),
             });
         }
-
-        response
-            .json::<Value>()
-            .await
-            .map_err(VeniceClientError::malformed_attestation_payload)
+        Ok(response)
     }
 
     fn models_url(&self) -> Result<Url, VeniceClientError> {
-        self.base_url
-            .join("models")
-            .map_err(|source| VeniceClientError::EndpointUrl {
-                message: source.to_string(),
-            })
+        self.endpoint_url("models")
     }
 
     fn chat_completions_url(&self) -> Result<Url, VeniceClientError> {
-        self.base_url
-            .join("chat/completions")
-            .map_err(|source| VeniceClientError::EndpointUrl {
-                message: source.to_string(),
-            })
+        self.endpoint_url("chat/completions")
     }
 
     fn attestation_url(&self, model_id: &str, nonce: &str) -> Result<Url, VeniceClientError> {
-        let mut url = self.base_url.join("tee/attestation").map_err(|source| {
-            VeniceClientError::EndpointUrl {
-                message: source.to_string(),
-            }
-        })?;
+        let mut url = self.endpoint_url("tee/attestation")?;
         url.query_pairs_mut()
             .append_pair("model", model_id)
             .append_pair("nonce", nonce);
         Ok(url)
+    }
+
+    fn endpoint_url(&self, path: &str) -> Result<Url, VeniceClientError> {
+        self.base_url
+            .join(path)
+            .map_err(|source| VeniceClientError::EndpointUrl {
+                message: source.to_string(),
+            })
     }
 }
 
@@ -414,6 +390,8 @@ mod tests {
 
     use axum::{Router, body::Body, response::IntoResponse, routing::post};
     use tokio::net::TcpListener;
+
+    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[test]
     fn maps_supported_venice_text_models_to_openai_shape() {

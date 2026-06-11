@@ -33,7 +33,7 @@ impl ProxyInstancePrivateKey {
 
     fn public_key_hex(&self) -> String {
         let public_key = self.0.public_key();
-        encode_lower_hex(public_key.to_encoded_point(false).as_bytes())
+        hex::encode(public_key.to_encoded_point(false).as_bytes())
     }
 
     fn secret_key(&self) -> &SecretKey {
@@ -95,17 +95,6 @@ impl fmt::Debug for ProxyInstanceKey {
             .field("public_key_hex", &self.public_key_hex())
             .finish()
     }
-}
-
-fn encode_lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]

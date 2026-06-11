@@ -13,7 +13,7 @@
 use std::fmt;
 
 use aes_gcm::{
-    Aes256Gcm, Nonce as AesNonce,
+    Aes256Gcm,
     aead::{Aead, KeyInit},
 };
 use hkdf::Hkdf;
@@ -95,21 +95,6 @@ impl E2eeCodec {
         self.encrypt_content_with_parts(plaintext, &peer_public_key, ephemeral_private_key, nonce)
     }
 
-    /// Encrypts a serializable normalized payload as canonical JSON bytes before
-    /// applying the Venice field codec.
-    pub fn encrypt_json_payload<T: Serialize>(
-        &self,
-        payload: &T,
-        peer_public_key_hex: &str,
-    ) -> Result<EncryptedPayload, E2eeCodecError> {
-        let plaintext = serde_json::to_string(payload).map_err(|source| {
-            E2eeCodecError::MalformedEncryptedPayload {
-                message: format!("failed to serialize normalized payload: {source}"),
-            }
-        })?;
-        self.encrypt_content(&plaintext, peer_public_key_hex)
-    }
-
     /// Decrypts a packed Venice E2EE hex payload into UTF-8 text.
     pub fn decrypt_content(
         &self,
@@ -117,22 +102,14 @@ impl E2eeCodec {
         recipient_private_key: &SecretKey,
     ) -> Result<String, E2eeCodecError> {
         let packed = PackedEncryptedPayload::unpack(payload)?;
-        let peer_public_key =
-            PublicKey::from_sec1_bytes(&packed.ephemeral_public_key).map_err(|_| {
-                E2eeCodecError::MalformedEncryptedPayload {
-                    message: "ephemeral public key is not a valid uncompressed secp256k1 key"
-                        .to_owned(),
-                }
-            })?;
-        let key = self.derive_content_key_from_public_key(recipient_private_key, &peer_public_key);
-        let cipher = aes256_gcm_from_key(&key)?;
-        #[allow(deprecated)]
+        let key = self.derive_content_key_from_public_key(
+            recipient_private_key,
+            &packed.ephemeral_public_key,
+        );
+        let cipher = aes256_gcm_from_key(&key);
         let plaintext = Zeroizing::new(
             cipher
-                .decrypt(
-                    AesNonce::from_slice(&packed.nonce),
-                    packed.ciphertext_and_tag.as_slice(),
-                )
+                .decrypt((&packed.nonce).into(), packed.ciphertext_and_tag.as_slice())
                 .map_err(|_| E2eeCodecError::AuthenticationFailed)?,
         );
 
@@ -160,36 +137,6 @@ impl E2eeCodec {
             .map(Some)
     }
 
-    /// Converts a JSON string field containing a Venice E2EE payload into the
-    /// typed payload helper. Non-string shapes are rejected as unsupported codec
-    /// shapes so route code can fail closed before attempting decryption.
-    pub fn encrypted_payload_from_json_value(
-        &self,
-        value: &serde_json::Value,
-    ) -> Result<EncryptedPayload, E2eeCodecError> {
-        match value {
-            serde_json::Value::String(value) => EncryptedPayload::from_hex(value),
-            serde_json::Value::Object(object) if object.contains_key("version") => {
-                Err(E2eeCodecError::UnsupportedCodecShape {
-                    message: "versioned encrypted payload objects are not supported by this codec"
-                        .to_owned(),
-                })
-            }
-            other => Err(E2eeCodecError::UnsupportedCodecShape {
-                message: format!(
-                    "expected encrypted payload string, got {}",
-                    json_kind(other)
-                ),
-            }),
-        }
-    }
-
-    /// Serializes an encrypted payload into the JSON string shape used by Venice
-    /// request/response content fields.
-    pub fn encrypted_payload_to_json_value(&self, payload: &EncryptedPayload) -> serde_json::Value {
-        serde_json::Value::String(payload.as_hex().to_owned())
-    }
-
     fn encrypt_content_with_parts(
         &self,
         plaintext: &str,
@@ -203,10 +150,9 @@ impl E2eeCodec {
         debug_assert_eq!(ephemeral_public_key_bytes.len(), EPHEMERAL_PUBLIC_KEY_LEN);
 
         let key = self.derive_content_key_from_public_key(&ephemeral_private_key, peer_public_key);
-        let cipher = aes256_gcm_from_key(&key)?;
-        #[allow(deprecated)]
+        let cipher = aes256_gcm_from_key(&key);
         let ciphertext_and_tag = cipher
-            .encrypt(AesNonce::from_slice(nonce.as_bytes()), plaintext.as_bytes())
+            .encrypt(nonce.as_bytes().into(), plaintext.as_bytes())
             .map_err(|_| E2eeCodecError::EncryptionFailed)?;
 
         let mut packed = Vec::with_capacity(PACKED_PREFIX_LEN + ciphertext_and_tag.len());
@@ -267,7 +213,7 @@ impl PartialEq for ContentEncryptionKey {
 
 impl Eq for ContentEncryptionKey {}
 
-fn aes256_gcm_from_key(key: &ContentEncryptionKey) -> Result<Aes256Gcm, E2eeCodecError> {
+fn aes256_gcm_from_key(key: &ContentEncryptionKey) -> Aes256Gcm {
     // Zeroization note for the resolved RustCrypto stack used here:
     // - `aes-gcm` with `zeroize` wipes its temporary GHASH key during init.
     // - the direct `aes` dependency enables `aes/zeroize`, so AES-256 retained
@@ -284,11 +230,7 @@ fn aes256_gcm_from_key(key: &ContentEncryptionKey) -> Result<Aes256Gcm, E2eeCode
     // avoid brittle unsafe whole-object wiping and instead keep the cipher scoped
     // to one encrypt/decrypt operation while zeroizing the derived key material
     // and relying on verified safe drop behavior where the crates expose it.
-    Aes256Gcm::new_from_slice(key.as_slice()).map_err(|_| {
-        E2eeCodecError::MalformedEncryptedPayload {
-            message: "derived AES-256-GCM key has invalid length".to_owned(),
-        }
-    })
+    Aes256Gcm::new((&*key.0).into())
 }
 
 /// AES-GCM nonce used by the Venice field codec.
@@ -314,7 +256,7 @@ impl Nonce {
 impl fmt::Debug for Nonce {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Nonce")
-            .field(&encode_lower_hex(self.as_bytes()))
+            .field(&hex::encode(self.as_bytes()))
             .finish()
     }
 }
@@ -340,7 +282,7 @@ impl EncryptedPayload {
     }
 
     fn from_packed_bytes_unchecked(bytes: &[u8]) -> Self {
-        Self(encode_lower_hex(bytes))
+        Self(hex::encode(bytes))
     }
 }
 
@@ -353,14 +295,18 @@ impl fmt::Debug for EncryptedPayload {
 }
 
 struct PackedEncryptedPayload {
-    ephemeral_public_key: [u8; EPHEMERAL_PUBLIC_KEY_LEN],
+    ephemeral_public_key: PublicKey,
     nonce: [u8; NONCE_LEN],
     ciphertext_and_tag: Vec<u8>,
 }
 
 impl PackedEncryptedPayload {
     fn unpack(payload: &EncryptedPayload) -> Result<Self, E2eeCodecError> {
-        let bytes = decode_hex(payload.as_hex())?;
+        let bytes = hex::decode(payload.as_hex()).map_err(|error| {
+            E2eeCodecError::MalformedEncryptedPayload {
+                message: error.to_string(),
+            }
+        })?;
         if bytes.len() < MIN_PACKED_PAYLOAD_LEN {
             return Err(E2eeCodecError::MalformedEncryptedPayload {
                 message: format!(
@@ -370,17 +316,14 @@ impl PackedEncryptedPayload {
             });
         }
 
-        let mut ephemeral_public_key = [0_u8; EPHEMERAL_PUBLIC_KEY_LEN];
-        ephemeral_public_key.copy_from_slice(&bytes[..EPHEMERAL_PUBLIC_KEY_LEN]);
-        if ephemeral_public_key[0] != 0x04 {
+        if bytes[0] != 0x04 {
             return Err(E2eeCodecError::MalformedEncryptedPayload {
                 message: "ephemeral public key must be uncompressed SEC1 format".to_owned(),
             });
         }
-        PublicKey::from_sec1_bytes(&ephemeral_public_key).map_err(|_| {
-            E2eeCodecError::MalformedEncryptedPayload {
-                message: "ephemeral public key is not a valid secp256k1 key".to_owned(),
-            }
+        let ephemeral_public_key = PublicKey::from_sec1_bytes(&bytes[..EPHEMERAL_PUBLIC_KEY_LEN])
+            .map_err(|_| E2eeCodecError::MalformedEncryptedPayload {
+            message: "ephemeral public key is not a valid secp256k1 key".to_owned(),
         })?;
 
         let mut nonce = [0_u8; NONCE_LEN];
@@ -404,8 +347,6 @@ pub enum E2eeCodecError {
     MalformedEncryptedPayload { message: String },
     #[error("encrypted payload authentication failed")]
     AuthenticationFailed,
-    #[error("unsupported E2EE encrypted payload shape: {message}")]
-    UnsupportedCodecShape { message: String },
     #[error("invalid E2EE public key: {message}")]
     InvalidPublicKey { message: String },
     #[error("decrypted E2EE payload is not valid UTF-8")]
@@ -423,11 +364,8 @@ fn derive_aes_key(shared_secret: &SharedSecret, hkdf_info: &[u8]) -> ContentEncr
 }
 
 fn decode_uncompressed_public_key_hex(value: &str) -> Result<PublicKey, E2eeCodecError> {
-    let bytes = decode_hex(value).map_err(|error| match error {
-        E2eeCodecError::MalformedEncryptedPayload { message } => {
-            E2eeCodecError::InvalidPublicKey { message }
-        }
-        other => other,
+    let bytes = hex::decode(value).map_err(|error| E2eeCodecError::InvalidPublicKey {
+        message: error.to_string(),
     })?;
 
     if bytes.len() != EPHEMERAL_PUBLIC_KEY_LEN {
@@ -479,70 +417,9 @@ fn validate_packed_payload_hex(value: &str) -> Result<(), E2eeCodecError> {
     Ok(())
 }
 
-fn decode_hex(value: &str) -> Result<Vec<u8>, E2eeCodecError> {
-    if !value.len().is_multiple_of(2) {
-        return Err(E2eeCodecError::MalformedEncryptedPayload {
-            message: "hex string has odd length".to_owned(),
-        });
-    }
-
-    let mut out = Vec::with_capacity(value.len() / 2);
-    let bytes = value.as_bytes();
-    for (pair_index, pair) in bytes.chunks_exact(2).enumerate() {
-        let high = hex_value(pair[0]).ok_or_else(|| E2eeCodecError::MalformedEncryptedPayload {
-            message: format!(
-                "hex string contains non-hex character {:?} at index {}",
-                pair[0] as char,
-                pair_index * 2
-            ),
-        })?;
-        let low = hex_value(pair[1]).ok_or_else(|| E2eeCodecError::MalformedEncryptedPayload {
-            message: format!(
-                "hex string contains non-hex character {:?} at index {}",
-                pair[1] as char,
-                pair_index * 2 + 1
-            ),
-        })?;
-        out.push((high << 4) | low);
-    }
-    Ok(out)
-}
-
-fn hex_value(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn encode_lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn json_kind(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     const FIXED_NONCE: [u8; NONCE_LEN] = [
         0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab,
@@ -555,12 +432,12 @@ mod tests {
     const DETERMINISTIC_CIPHERTEXT_HEX: &str = "04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278aa0a1a2a3a4a5a6a7a8a9aaab3b364a6560dc6246955e1379bac6c7a0f453c5b2d9be6eabb00cad9955278b4c401f6793813d7f98ba8f163a5c51b87686";
 
     fn secret_key_from_hex(value: &str) -> SecretKey {
-        let bytes = decode_hex(value).expect("test key hex should decode");
+        let bytes = hex::decode(value).expect("test key hex should decode");
         SecretKey::from_slice(&bytes).expect("test key should be valid")
     }
 
     fn public_key_hex(secret_key: &SecretKey) -> String {
-        encode_lower_hex(secret_key.public_key().to_encoded_point(false).as_bytes())
+        hex::encode(secret_key.public_key().to_encoded_point(false).as_bytes())
     }
 
     #[test]
@@ -610,7 +487,7 @@ mod tests {
         let encrypted = codec
             .encrypt_content("secret", &recipient_public_key_hex)
             .expect("encryption should succeed");
-        let mut packed = decode_hex(encrypted.as_hex()).expect("ciphertext should decode");
+        let mut packed = hex::decode(encrypted.as_hex()).expect("ciphertext should decode");
         let last = packed.last_mut().expect("ciphertext has tag byte");
         *last ^= 0x01;
         let tampered = EncryptedPayload::from_packed_bytes_unchecked(&packed);
@@ -708,40 +585,5 @@ mod tests {
 
         assert_eq!(local_key, peer_key);
         assert_eq!(format!("{local_key:?}"), "ContentEncryptionKey([redacted])");
-    }
-
-    #[test]
-    fn json_payload_helpers_match_string_shape_and_reject_unsupported_shapes() {
-        let codec = E2eeCodec::default();
-        let recipient_private_key = SecretKey::random(&mut OsRng);
-        let recipient_public_key_hex = public_key_hex(&recipient_private_key);
-        let normalized = json!([
-            {"role":"system","content":"You are private."},
-            {"role":"user","content":"Hello"}
-        ]);
-
-        let encrypted = codec
-            .encrypt_json_payload(&normalized, &recipient_public_key_hex)
-            .expect("JSON payload should encrypt");
-        let value = codec.encrypted_payload_to_json_value(&encrypted);
-        assert!(value.is_string());
-        let parsed = codec
-            .encrypted_payload_from_json_value(&value)
-            .expect("string payload shape should parse");
-        assert_eq!(parsed, encrypted);
-        let decrypted = codec
-            .decrypt_content(&parsed, &recipient_private_key)
-            .expect("payload should decrypt");
-        assert_eq!(decrypted, serde_json::to_string(&normalized).unwrap());
-
-        let unsupported = codec
-            .encrypted_payload_from_json_value(
-                &json!({"version": 1, "ciphertext": encrypted.as_hex()}),
-            )
-            .expect_err("versioned object shape should be rejected");
-        assert!(matches!(
-            unsupported,
-            E2eeCodecError::UnsupportedCodecShape { .. }
-        ));
     }
 }

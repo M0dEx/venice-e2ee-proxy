@@ -8,6 +8,7 @@
 use std::{collections::HashSet, time::Duration};
 
 use serde_json::{Map, Value};
+use thiserror::Error;
 use tracing::warn;
 
 use crate::{
@@ -352,9 +353,9 @@ fn parse_tool_call_json(input: &str) -> Result<Value, ToolCallValidationError> {
     })
 }
 
-fn extract_tool_call_name_and_arguments<'a>(
-    object: &'a Map<String, Value>,
-) -> Result<(&'a str, &'a Value), ToolCallValidationError> {
+fn extract_tool_call_name_and_arguments(
+    object: &Map<String, Value>,
+) -> Result<(&str, &Value), ToolCallValidationError> {
     if let Some(function) = object.get("function") {
         let function = function.as_object().ok_or_else(|| {
             ToolCallValidationError::new("tool call function field must be an object")
@@ -468,7 +469,8 @@ impl ValidatedToolCall {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
 pub struct ToolCallValidationError {
     message: String,
 }
@@ -483,93 +485,6 @@ impl ToolCallValidationError {
     pub fn message(&self) -> &str {
         &self.message
     }
-}
-
-impl std::fmt::Display for ToolCallValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for ToolCallValidationError {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InitialMarkerScan {
-    Pending,
-    NormalText,
-    ToolCall,
-}
-
-pub fn scan_initial_marker_prefix(output: &str, config: &ToolsConfig) -> InitialMarkerScan {
-    if output.is_empty() {
-        return InitialMarkerScan::Pending;
-    }
-
-    let Some((first_non_ws, _)) = output.char_indices().find(|(_, ch)| !ch.is_whitespace()) else {
-        return if output.len() >= config.initial_marker_scan_bytes {
-            InitialMarkerScan::NormalText
-        } else {
-            InitialMarkerScan::Pending
-        };
-    };
-
-    let prefix = &output[first_non_ws..];
-    if prefix.starts_with(&config.marker_start) {
-        return InitialMarkerScan::ToolCall;
-    }
-    if config.marker_start.starts_with(prefix) && output.len() < config.initial_marker_scan_bytes {
-        return InitialMarkerScan::Pending;
-    }
-
-    InitialMarkerScan::NormalText
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolCallMarkerBuffer {
-    config: ToolsConfig,
-    output: String,
-    elapsed: Duration,
-}
-
-impl ToolCallMarkerBuffer {
-    pub fn new(config: &ToolsConfig) -> Self {
-        Self {
-            config: config.clone(),
-            output: String::new(),
-            elapsed: Duration::ZERO,
-        }
-    }
-
-    pub fn push(
-        &mut self,
-        chunk: &str,
-        elapsed: Duration,
-    ) -> Result<ToolCallBufferStatus, ToolCallValidationError> {
-        self.elapsed = elapsed;
-        if self.elapsed > self.config.tool_call_marker_timeout {
-            return Err(ToolCallValidationError::new(format!(
-                "tool call marker did not close within {}",
-                humantime::format_duration(self.config.tool_call_marker_timeout)
-            )));
-        }
-        self.output.push_str(chunk);
-        if self.output.len() > self.config.tool_call_max_bytes {
-            return Err(ToolCallValidationError::new(format!(
-                "tool call marker exceeded max size of {} bytes",
-                self.config.tool_call_max_bytes
-            )));
-        }
-        if self.output.contains(&self.config.marker_end) {
-            return Ok(ToolCallBufferStatus::Complete(self.output.clone()));
-        }
-        Ok(ToolCallBufferStatus::Pending)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolCallBufferStatus {
-    Pending,
-    Complete(String),
 }
 
 fn validate_schema_shape(schema: &Map<String, Value>) -> Result<(), String> {
@@ -822,8 +737,6 @@ fn value_kind(value: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use serde_json::json;
 
     use super::*;
@@ -849,75 +762,6 @@ mod tests {
         ToolEmulationContext::from_request(&ToolsConfig::default(), request)
             .expect("tool context should build")
             .expect("tools should activate")
-    }
-
-    #[test]
-    fn scans_initial_marker_prefix_until_threshold() {
-        let mut config = ToolsConfig {
-            initial_marker_scan_bytes: 6,
-            ..ToolsConfig::default()
-        };
-
-        assert_eq!(
-            scan_initial_marker_prefix("   ", &config),
-            InitialMarkerScan::Pending
-        );
-        assert_eq!(
-            scan_initial_marker_prefix("<tool", &config),
-            InitialMarkerScan::Pending
-        );
-        assert_eq!(
-            scan_initial_marker_prefix("<tool_", &config),
-            InitialMarkerScan::NormalText
-        );
-        assert_eq!(
-            scan_initial_marker_prefix(" hello", &config),
-            InitialMarkerScan::NormalText
-        );
-
-        config.initial_marker_scan_bytes = 16;
-        assert_eq!(
-            scan_initial_marker_prefix("\n<tool_call>", &config),
-            InitialMarkerScan::ToolCall
-        );
-    }
-
-    #[test]
-    fn buffers_complete_marker_and_reports_limits() {
-        let config = ToolsConfig {
-            tool_call_max_bytes: 64,
-            tool_call_marker_timeout: Duration::from_millis(50),
-            ..ToolsConfig::default()
-        };
-        let mut buffer = ToolCallMarkerBuffer::new(&config);
-
-        assert_eq!(
-            buffer
-                .push("<tool_call>{", Duration::from_millis(10))
-                .expect("partial marker should buffer"),
-            ToolCallBufferStatus::Pending
-        );
-        assert!(matches!(
-            buffer
-                .push("\"name\":\"x\"}</tool_call>", Duration::from_millis(20))
-                .expect("closing marker should complete"),
-            ToolCallBufferStatus::Complete(_)
-        ));
-
-        let mut too_large = ToolCallMarkerBuffer::new(&config);
-        let err = too_large
-            .push(
-                "<tool_call>012345678901234567890123456789012345678901234567890123456789",
-                Duration::ZERO,
-            )
-            .expect_err("oversized marker should fail");
-        assert!(err.message().contains("exceeded max size"));
-
-        let mut timed_out = ToolCallMarkerBuffer::new(&config);
-        let err = timed_out
-            .push("<tool_call>", Duration::from_millis(51))
-            .expect_err("marker timeout should fail");
-        assert!(err.message().contains("did not close"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! This module provides a typed representation of the proxy configuration,
 //! default values, validation, and redacted handling for the Venice API key.
 
-use std::{fmt, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use axum::http::HeaderName;
 use figment::{
@@ -85,7 +85,6 @@ impl ProxyConfig {
         )?;
 
         validate_http_url("attestation.pccs_url", &self.attestation.pccs_url, true)?;
-        validate_http_url("attestation.nras_url", &self.attestation.nras_url, false)?;
 
         validate_non_empty("e2ee.hkdf_info", &self.e2ee.hkdf_info)?;
 
@@ -247,22 +246,6 @@ pub enum SessionFallbackScope {
     Disabled,
 }
 
-impl SessionFallbackScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Agent => "agent",
-            Self::Request => "request",
-            Self::Disabled => "disabled",
-        }
-    }
-}
-
-impl fmt::Display for SessionFallbackScope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttestationConfig {
@@ -271,7 +254,6 @@ pub struct AttestationConfig {
     pub require_nvidia: NvidiaRequirement,
     pub allow_debug: bool,
     pub pccs_url: String,
-    pub nras_url: String,
 }
 
 impl Default for AttestationConfig {
@@ -282,7 +264,6 @@ impl Default for AttestationConfig {
             require_nvidia: NvidiaRequirement::WhenPresent,
             allow_debug: false,
             pccs_url: String::new(),
-            nras_url: "https://nras.attestation.nvidia.com/v3/attest/gpu".to_owned(),
         }
     }
 }
@@ -302,12 +283,6 @@ impl AttestationMode {
     }
 }
 
-impl fmt::Display for AttestationMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NvidiaRequirement {
@@ -315,22 +290,6 @@ pub enum NvidiaRequirement {
     #[default]
     WhenPresent,
     Never,
-}
-
-impl NvidiaRequirement {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Required => "required",
-            Self::WhenPresent => "when_present",
-            Self::Never => "never",
-        }
-    }
-}
-
-impl fmt::Display for NvidiaRequirement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -396,12 +355,6 @@ impl ToolMode {
             Self::Emulated => "emulated",
             Self::None => "none",
         }
-    }
-}
-
-impl fmt::Display for ToolMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -516,7 +469,6 @@ mod tests {
         assert_eq!(config.session.max_ttl, Duration::from_secs(1_800));
         assert_eq!(config.session.max_requests, 100);
         assert_eq!(config.session.fallback_scope, SessionFallbackScope::Request);
-        assert_eq!(SessionFallbackScope::Disabled.as_str(), "disabled");
         assert_eq!(
             config.session.headers.preferred,
             "X-Venice-Proxy-Session-Id"
@@ -528,14 +480,8 @@ mod tests {
             config.attestation.require_nvidia,
             NvidiaRequirement::WhenPresent
         );
-        assert_eq!(NvidiaRequirement::Required.as_str(), "required");
-        assert_eq!(NvidiaRequirement::Never.as_str(), "never");
         assert!(!config.attestation.allow_debug);
         assert_eq!(config.attestation.pccs_url, "");
-        assert_eq!(
-            config.attestation.nras_url,
-            "https://nras.attestation.nvidia.com/v3/attest/gpu"
-        );
         assert_eq!(config.e2ee.hkdf_info, "ecdsa_encryption");
         assert!(config.e2ee.require_encrypted_response_content);
         assert!(config.tools.enabled);
@@ -688,17 +634,16 @@ mod tests {
 
     #[test]
     fn validation_rejects_unsupported_v0_1_tool_modes() {
-        for (field, toml) in [(
-            "tools.emit_tool_call_arguments_single_chunk",
-            "emit_tool_call_arguments_single_chunk = false",
-        )] {
-            let err = ProxyConfig::from_toml_str(&format!("[tools]\n{toml}\n"))
+        let err =
+            ProxyConfig::from_toml_str("[tools]\nemit_tool_call_arguments_single_chunk = false\n")
                 .expect_err("unsupported v0.1 tool mode should be rejected");
-            assert!(matches!(
-                err,
-                ConfigError::InvalidValue { field: actual, .. } if actual == field
-            ));
-        }
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue {
+                field: "tools.emit_tool_call_arguments_single_chunk",
+                ..
+            }
+        ));
     }
 
     #[test]

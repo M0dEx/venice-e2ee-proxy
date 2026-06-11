@@ -17,7 +17,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::config::{ProxyConfig, SessionConfig, SessionFallbackScope};
+use crate::config::{SessionConfig, SessionFallbackScope};
 
 /// Scope of the resolved session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,25 +109,17 @@ impl<'a> SessionRequest<'a> {
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     config: SessionConfig,
-    sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
+    sessions: Arc<Mutex<HashMap<String, SessionContext>>>,
     agent_fallback_session_id: Arc<str>,
 }
 
 impl SessionManager {
-    pub fn from_config(config: &ProxyConfig) -> Self {
-        Self::new(config.session.clone())
-    }
-
     pub fn new(config: SessionConfig) -> Self {
         Self {
             config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             agent_fallback_session_id: Arc::from(Uuid::new_v4().to_string()),
         }
-    }
-
-    pub fn config(&self) -> &SessionConfig {
-        &self.config
     }
 
     /// Resolves, creates, or refreshes the session for a request using the
@@ -151,7 +143,7 @@ impl SessionManager {
 
         let resolved = self.resolve_identifier(request)?;
         let session_key = session_key(request.model_id, &resolved.agent_session_id);
-        let mut sessions = self.lock_sessions()?;
+        let mut sessions = self.lock_sessions();
         let replaced_expired = match sessions.get(&session_key) {
             Some(existing) => self.expiration_reason(existing, now),
             None => None,
@@ -165,21 +157,20 @@ impl SessionManager {
             existing.request_count += 1;
             existing.last_used_at = now;
             return Ok(SessionResolution {
-                session: existing.to_context(),
+                session: existing.clone(),
                 created: false,
                 replaced_expired: None,
             });
         }
 
-        let record = SessionRecord::new(
+        let context = SessionContext::new(
             request.model_id,
             resolved.agent_session_id,
             resolved.scope,
             now,
             &self.config,
         );
-        let context = record.to_context();
-        sessions.insert(session_key, record);
+        sessions.insert(session_key, context.clone());
 
         Ok(SessionResolution {
             session: context,
@@ -204,7 +195,7 @@ impl SessionManager {
         state: AttestedModelState,
         now: SystemTime,
     ) -> Result<SessionContext, SessionError> {
-        let mut sessions = self.lock_sessions()?;
+        let mut sessions = self.lock_sessions();
         let expired = sessions
             .get(session_key)
             .and_then(|session| self.expiration_reason(session, now));
@@ -223,28 +214,28 @@ impl SessionManager {
         session.attestation_report = Some(state.attestation_report);
         session.verified_at = Some(state.verified_at);
 
-        Ok(session.to_context())
+        Ok(session.clone())
     }
 
     /// Removes expired sessions and returns the number removed.
-    pub fn cleanup_expired(&self) -> Result<usize, SessionError> {
+    pub fn cleanup_expired(&self) -> usize {
         self.cleanup_expired_at(SystemTime::now())
     }
 
     /// Testable cleanup variant with an injected clock.
-    pub fn cleanup_expired_at(&self, now: SystemTime) -> Result<usize, SessionError> {
-        let mut sessions = self.lock_sessions()?;
+    pub fn cleanup_expired_at(&self, now: SystemTime) -> usize {
+        let mut sessions = self.lock_sessions();
         let before = sessions.len();
         sessions.retain(|_, session| self.expiration_reason(session, now).is_none());
-        Ok(before - sessions.len())
+        before - sessions.len()
     }
 
-    pub fn len(&self) -> Result<usize, SessionError> {
-        Ok(self.lock_sessions()?.len())
+    pub fn len(&self) -> usize {
+        self.lock_sessions().len()
     }
 
-    pub fn is_empty(&self) -> Result<bool, SessionError> {
-        Ok(self.len()? == 0)
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn resolve_identifier(
@@ -278,7 +269,7 @@ impl SessionManager {
 
     fn expiration_reason(
         &self,
-        session: &SessionRecord,
+        session: &SessionContext,
         now: SystemTime,
     ) -> Option<SessionExpirationReason> {
         if session.request_count >= self.config.max_requests {
@@ -293,10 +284,10 @@ impl SessionManager {
         None
     }
 
-    fn lock_sessions(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, SessionRecord>>, SessionError> {
-        self.sessions.lock().map_err(|_| SessionError::LockPoisoned)
+    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionContext>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -315,22 +306,7 @@ impl ResolvedSessionIdentifier {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SessionRecord {
-    session_key: String,
-    model_id: String,
-    agent_session_id: String,
-    scope: SessionScope,
-    created_at: SystemTime,
-    last_used_at: SystemTime,
-    expires_at: SystemTime,
-    request_count: u64,
-    attested_model_public_key: Option<String>,
-    attestation_report: Option<Value>,
-    verified_at: Option<SystemTime>,
-}
-
-impl SessionRecord {
+impl SessionContext {
     fn new(
         model_id: &str,
         agent_session_id: String,
@@ -353,22 +329,6 @@ impl SessionRecord {
             verified_at: None,
         }
     }
-
-    fn to_context(&self) -> SessionContext {
-        SessionContext {
-            session_key: self.session_key.clone(),
-            model_id: self.model_id.clone(),
-            agent_session_id: self.agent_session_id.clone(),
-            scope: self.scope,
-            created_at: self.created_at,
-            last_used_at: self.last_used_at,
-            expires_at: self.expires_at,
-            request_count: self.request_count,
-            attested_model_public_key: self.attested_model_public_key.clone(),
-            attestation_report: self.attestation_report.clone(),
-            verified_at: self.verified_at,
-        }
-    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -377,8 +337,6 @@ pub enum SessionError {
     InvalidModelId,
     #[error("request does not include a session identifier and session fallback is disabled")]
     MissingSessionIdentifier,
-    #[error("session fallback could not create a usable session identifier")]
-    FallbackExhausted,
     #[error("configured session header name {header:?} is invalid")]
     InvalidHeaderName { header: String },
     #[error("session header {header} contains non-UTF-8 data")]
@@ -387,8 +345,6 @@ pub enum SessionError {
     SessionNotFound { session_key: String },
     #[error("session expired before attestation state could be stored: {reason:?}")]
     SessionExpired { reason: SessionExpirationReason },
-    #[error("session store lock was poisoned")]
-    LockPoisoned,
 }
 
 fn header_identifier(
@@ -503,7 +459,7 @@ mod tests {
         assert_eq!(second.session.session_key, first.session.session_key);
         assert_eq!(second.session.request_count, 2);
         assert_eq!(second.session.last_used_at, now(5));
-        assert_eq!(manager.len().unwrap(), 1);
+        assert_eq!(manager.len(), 1);
     }
 
     #[test]
@@ -657,7 +613,7 @@ mod tests {
             first.session.agent_session_id,
             second.session.agent_session_id
         );
-        assert_eq!(manager.len().unwrap(), 2);
+        assert_eq!(manager.len(), 2);
     }
 
     #[test]
@@ -700,7 +656,7 @@ mod tests {
             error.to_string(),
             "request does not include a session identifier and session fallback is disabled"
         );
-        assert!(manager.is_empty().unwrap());
+        assert!(manager.is_empty());
     }
 
     #[test]
@@ -724,12 +680,10 @@ mod tests {
             .get_or_create_at(request("model-a", &headers_b), now(15))
             .expect("session b should create");
 
-        let removed = manager
-            .cleanup_expired_at(now(20))
-            .expect("cleanup should succeed");
+        let removed = manager.cleanup_expired_at(now(20));
 
         assert_eq!(removed, 1);
-        assert_eq!(manager.len().unwrap(), 1);
+        assert_eq!(manager.len(), 1);
         let reused_b = manager
             .get_or_create_at(request("model-a", &headers_b), now(21))
             .expect("session b should remain valid");

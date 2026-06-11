@@ -29,7 +29,6 @@ require_tdx = true
 require_nvidia = "when_present"
 allow_debug = false
 pccs_url = ""
-nras_url = "https://nras.attestation.nvidia.com/v3/attest/gpu"
 
 [e2ee]
 hkdf_info = "ecdsa_encryption"
