@@ -42,7 +42,7 @@ pub fn generate_tool_call_id() -> String {
 /// by the full output size.
 const CORRECTION_INVALID_OUTPUT_MAX_BYTES: usize = 4_096;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolEmulationContext {
     config: ToolsConfig,
     tools: Vec<ChatToolDefinition>,
@@ -165,15 +165,18 @@ impl ToolEmulationContext {
             format!("\n- If no tool is needed, answer normally and do not use {TOOL_CALL_START}.")
         };
 
-        // Venice E2EE rejects repeated tool-controller `system` prompts when a
-        // multi-turn request includes prior assistant/tool history. Keep the
-        // controller instruction model-visible as a user message so real
-        // OpenAI-style tool conversations can continue across turns.
+        // The HTTP layer appends this content to the request's system prompt
+        // for tool-emulated requests. Keep the role as a harmless container for
+        // callers/tests that inspect the standalone message.
         NormalizedChatMessage::new(
             "user",
             format!(
-                "You have access to tools.\n\n{requirement}\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- arguments must be valid JSON and must satisfy the tool schema.\n- Emit one marker block per tool call.\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
-                r#"{"name":"TOOL_NAME","arguments":{...}}"#, self.tool_schemas_json,
+                "You have access to tools.\n\n{requirement}\n\nRequired tool-call format:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nInside each {TOOL_CALL_START} block, output ONLY one valid JSON object with exactly these top-level keys:\n- \"name\": the tool name as a JSON string.\n- \"arguments\": a JSON object containing the tool arguments.\n\nValid single-call example:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nValid multi-call example:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nInvalid formats. NEVER use these:\n- {TOOL_CALL_START}TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}){TOOL_CALL_END}\n- {TOOL_CALL_START}TOOL_NAME{{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}{TOOL_CALL_END}\n- TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}})\n- {{\"tool\":\"TOOL_NAME\",\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- Always put the tool name in the JSON \"name\" field.\n- Always put tool arguments inside the JSON \"arguments\" object.\n- Do not put arguments directly after the tool name.\n- Do not use function-call syntax like TOOL_NAME(...).\n- arguments must be valid JSON and must satisfy the tool schema.\n- Emit one marker block per tool call.\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
+                r#"{"name":"TOOL_NAME","arguments":{...}}"#,
+                r#"{"name":"TOOL_NAME","arguments":{"ARGUMENT_NAME":"ARGUMENT_VALUE"}}"#,
+                r#"{"name":"TOOL_NAME_1","arguments":{"ARGUMENT_NAME":"ARGUMENT_VALUE"}}"#,
+                r#"{"name":"TOOL_NAME_2","arguments":{"ARGUMENT_NAME":"ARGUMENT_VALUE"}}"#,
+                self.tool_schemas_json,
             ),
         )
     }
@@ -188,8 +191,10 @@ impl ToolEmulationContext {
         NormalizedChatMessage::new(
             "system",
             format!(
-                "Your previous response attempted a tool call, but it was invalid.\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}\n\nYou must now return only valid tool calls and nothing else.\n\nUse this exact format:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nRules:\n- TOOL_NAME must exactly match one of the available tools.\n- arguments must be a JSON object.\n- arguments must satisfy the tool schema.\n- Do not include markdown fences.\n- Do not include explanations.\n- Do not answer the user directly.\n\nAvailable tools:\n{}",
-                r#"{"name":"TOOL_NAME","arguments":{...}}"#, self.tool_schemas_json,
+                "Your previous response attempted a tool call, but it was invalid.\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}\n\nYou must now return only valid tool calls and nothing else.\n\nUse this exact format:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nInside each {TOOL_CALL_START} block, output ONLY one valid JSON object with exactly these top-level keys:\n- \"name\": the tool name as a JSON string.\n- \"arguments\": a JSON object containing the tool arguments.\n\nValid example:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nInvalid formats. NEVER use these:\n- {TOOL_CALL_START}TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}){TOOL_CALL_END}\n- {TOOL_CALL_START}TOOL_NAME{{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}{TOOL_CALL_END}\n- TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}})\n\nRules:\n- TOOL_NAME must exactly match one of the available tools.\n- Always put the tool name in the JSON \"name\" field.\n- Always put tool arguments inside the JSON \"arguments\" object.\n- Do not put arguments directly after the tool name.\n- Do not use function-call syntax like TOOL_NAME(...).\n- arguments must be a JSON object.\n- arguments must satisfy the tool schema.\n- Do not include markdown fences.\n- Do not include explanations.\n- Do not answer the user directly.\n\nAvailable tools:\n{}",
+                r#"{"name":"TOOL_NAME","arguments":{...}}"#,
+                r#"{"name":"TOOL_NAME","arguments":{"ARGUMENT_NAME":"ARGUMENT_VALUE"}}"#,
+                self.tool_schemas_json,
             ),
         )
     }

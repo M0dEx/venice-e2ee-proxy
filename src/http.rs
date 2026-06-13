@@ -23,7 +23,6 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
-use vllm_tool_parser::{ToolCallDelta, ToolParseResult, ToolParser};
 
 use crate::{
     attestation::{AttestationError, AttestationVerifier},
@@ -32,12 +31,12 @@ use crate::{
     keys::ProxyInstanceKey,
     openai::{
         ErrorResponse,
-        chat::{ChatCompletionRequest, ChatConstructionError, ChatRequestError},
+        chat::{
+            ChatCompletionRequest, ChatConstructionError, ChatRequestError, NormalizedChatMessage,
+        },
     },
     sessions::{AttestedModelState, SessionContext, SessionError, SessionManager, SessionRequest},
-    tools::{
-        ToolEmulationContext, ToolOutputClassification, ValidatedToolCall, generate_tool_call_id,
-    },
+    tools::{ToolEmulationContext, ToolOutputClassification, ValidatedToolCall},
     venice::{VeniceClient, VeniceClientError},
 };
 
@@ -460,19 +459,10 @@ async fn tool_emulated_upstream_stream(
     model_public_key: &str,
     correction: Option<&(String, String)>,
 ) -> Result<reqwest::Response, ProxyError> {
-    let controller_messages = [tool_context.controller_message()];
-    let correction_messages: Vec<_> = correction
-        .map(|(validation_error, invalid_output)| {
-            tool_context.correction_message(validation_error, invalid_output)
-        })
-        .into_iter()
-        .collect();
-    let prepared = request.to_venice_e2ee_request_with_messages(
-        codec,
-        model_public_key,
-        &controller_messages,
-        &correction_messages,
-    )?;
+    let messages = tool_emulated_messages(request, tool_context, correction);
+    let mut tool_request = request.clone();
+    tool_request.messages = messages;
+    let prepared = tool_request.to_venice_e2ee_request(codec, model_public_key)?;
     Ok(state
         .venice_client()
         .create_chat_completion_stream(
@@ -481,6 +471,35 @@ async fn tool_emulated_upstream_stream(
             model_public_key,
         )
         .await?)
+}
+
+fn tool_emulated_messages(
+    request: &ChatCompletionRequest,
+    tool_context: &ToolEmulationContext,
+    correction: Option<&(String, String)>,
+) -> Vec<NormalizedChatMessage> {
+    let mut messages = request.messages.clone();
+    let mut tool_system_content = tool_context.controller_message().content;
+    if let Some((validation_error, invalid_output)) = correction {
+        tool_system_content.push_str("\n\n");
+        tool_system_content.push_str(
+            &tool_context
+                .correction_message(validation_error, invalid_output)
+                .content,
+        );
+    }
+
+    append_to_system_message(&mut messages, tool_system_content);
+    messages
+}
+
+fn append_to_system_message(messages: &mut Vec<NormalizedChatMessage>, content: String) {
+    if let Some(system_message) = messages.iter_mut().find(|message| message.role == "system") {
+        system_message.content.push_str("\n\n");
+        system_message.content.push_str(&content);
+    } else {
+        messages.insert(0, NormalizedChatMessage::new("system", content));
+    }
 }
 
 fn openai_tool_call_completion(completion: Value, tool_calls: Vec<ValidatedToolCall>) -> Value {
@@ -1314,32 +1333,23 @@ impl ChatSseTransformer for OpenAiChatStreamTransformer {
     }
 }
 
-/// Per-call streaming state for one parser-reported tool call.
-struct ToolStreamState {
-    /// Parser-local tool index; the position in `tool_states` is the OpenAI
-    /// `tool_calls` index (order of first appearance).
-    parser_index: usize,
-    id: String,
-    argument_bytes: usize,
-}
+const TOOL_CALL_START_MARKER: &str = "<tool_call>";
 
-/// Streaming transformer that feeds decrypted assistant text through a
-/// model-family tool parser and emits standard OpenAI incremental
-/// `delta.tool_calls` chunks.
+/// Streaming transformer for tool-emulated responses.
 ///
-/// Unlike the non-streaming path, streamed tool calls are NOT validated
-/// against tool names or schemas: parser output is forwarded as-is, matching
-/// standard inference-engine behavior. Validation and the retry/correction
-/// loop remain non-streaming features. Parser errors fail the stream closed.
+/// Plain assistant text is streamed until the first tool-call marker appears.
+/// From that marker onward, output is buffered and parsed/validated as a full
+/// tool-call block before OpenAI `delta.tool_calls` chunks are emitted.
 struct OpenAiToolEmulatedChatStreamTransformer {
     ctx: ChunkContext,
+    tool_context: ToolEmulationContext,
     include_usage_requested: bool,
     sent_role: bool,
     sent_final_finish: bool,
-    parser: Box<dyn ToolParser>,
-    parser_finished: bool,
-    tool_call_max_bytes: usize,
-    tool_states: Vec<ToolStreamState>,
+    pending_text: String,
+    tool_buffer: String,
+    buffering_tool_call: bool,
+    emitted_tool_calls: bool,
 }
 
 impl OpenAiToolEmulatedChatStreamTransformer {
@@ -1350,18 +1360,16 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         fallback_model: String,
         include_usage_requested: bool,
     ) -> Result<Self, ChatStreamError> {
-        let parser = tool_context
-            .create_parser()
-            .map_err(|error| ChatStreamError::malformed_event(error.to_string()))?;
         Ok(Self {
             ctx: ChunkContext::new(codec, proxy_instance_key, fallback_model),
+            tool_context: tool_context.clone(),
             include_usage_requested,
             sent_role: false,
             sent_final_finish: false,
-            parser,
-            parser_finished: false,
-            tool_call_max_bytes: tool_context.config().tool_call_max_bytes,
-            tool_states: Vec::new(),
+            pending_text: String::new(),
+            tool_buffer: String::new(),
+            buffering_tool_call: false,
+            emitted_tool_calls: false,
         })
     }
 
@@ -1383,65 +1391,132 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             && let Some(content) = self.ctx.decrypt(Some(content))?
             && !self.sent_final_finish
         {
-            let result = self.push_parser(&content)?;
-            output.extend(self.emit_parse_result(value, index, result)?);
+            output.extend(self.push_decrypted_content(value, index, &content)?);
         }
 
         if !finish_reason.is_null() && !self.sent_final_finish {
-            let result = self.finish_parser()?;
-            output.extend(self.emit_parse_result(value, index, result)?);
-            let finish_reason = if self.tool_states.is_empty() {
-                finish_reason
-            } else {
-                Value::String("tool_calls".to_owned())
-            };
-            output.push(StreamOutput::Json(self.ctx.chunk_with_choice(
-                value,
-                index,
-                json!({}),
-                finish_reason,
-            )));
-            self.sent_final_finish = true;
+            output.extend(self.finish_buffered_content(value, index, finish_reason)?);
         }
 
         Ok(output)
     }
 
-    /// Feeds one decrypted content delta into the tool parser (fail closed on
-    /// parser errors).
-    fn push_parser(&mut self, content: &str) -> Result<ToolParseResult, ChatStreamError> {
-        self.parser.push(content).map_err(|error| {
-            ChatStreamError::malformed_event(format!("tool call parsing failed: {error}"))
-        })
-    }
-
-    /// Flushes the tool parser at end of output (fail closed on parser
-    /// errors, e.g. an unterminated tool call).
-    fn finish_parser(&mut self) -> Result<ToolParseResult, ChatStreamError> {
-        if self.parser_finished {
-            return Ok(ToolParseResult::default());
-        }
-        self.parser_finished = true;
-        self.parser.finish().map_err(|error| {
-            ChatStreamError::malformed_event(format!("tool call parsing failed: {error}"))
-        })
-    }
-
-    /// Emits parser output as OpenAI content and incremental tool-call deltas.
-    fn emit_parse_result(
+    fn push_decrypted_content(
         &mut self,
         upstream: &Value,
         index: u64,
-        result: ToolParseResult,
+        content: &str,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        if self.buffering_tool_call {
+            self.tool_buffer.push_str(content);
+            self.ensure_tool_buffer_within_limit()?;
+            return Ok(Vec::new());
+        }
+
+        self.pending_text.push_str(content);
+        if let Some(marker_index) = self.pending_text.find(TOOL_CALL_START_MARKER) {
+            let text = self.pending_text[..marker_index].to_owned();
+            self.tool_buffer = self.pending_text[marker_index..].to_owned();
+            self.pending_text.clear();
+            self.buffering_tool_call = true;
+            self.ensure_tool_buffer_within_limit()?;
+            return Ok(if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.text_chunk(upstream, index, text)]
+            });
+        }
+
+        let streamable_len = streamable_pending_text_len(&self.pending_text);
+        if streamable_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let text = self.pending_text[..streamable_len].to_owned();
+        self.pending_text.drain(..streamable_len);
+        Ok(vec![self.text_chunk(upstream, index, text)])
+    }
+
+    fn finish_buffered_content(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+        finish_reason: Value,
     ) -> Result<Vec<StreamOutput>, ChatStreamError> {
         let mut output = Vec::new();
-        if !result.normal_text.is_empty() {
-            output.push(self.text_chunk(upstream, index, result.normal_text));
+        if self.buffering_tool_call {
+            output.extend(self.buffered_tool_call_chunks(upstream, index)?);
+        } else if !self.pending_text.is_empty() {
+            let text = std::mem::take(&mut self.pending_text);
+            output.push(self.text_chunk(upstream, index, text));
         }
-        for call in result.calls {
-            output.push(self.tool_call_chunk(upstream, index, call)?);
-        }
+
+        let finish_reason = if self.emitted_tool_calls {
+            Value::String("tool_calls".to_owned())
+        } else {
+            finish_reason
+        };
+        output.push(StreamOutput::Json(self.ctx.chunk_with_choice(
+            upstream,
+            index,
+            json!({}),
+            finish_reason,
+        )));
+        self.sent_final_finish = true;
         Ok(output)
+    }
+
+    fn buffered_tool_call_chunks(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+    ) -> Result<Vec<StreamOutput>, ChatStreamError> {
+        self.ensure_tool_buffer_within_limit()?;
+        match self
+            .tool_context
+            .classify_assistant_output(&self.tool_buffer)
+        {
+            ToolOutputClassification::ToolCalls(tool_calls) => {
+                self.emitted_tool_calls = true;
+                Ok(tool_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(tool_index, tool_call)| {
+                        self.full_tool_call_chunk(upstream, index, tool_index, tool_call)
+                    })
+                    .collect())
+            }
+            ToolOutputClassification::NormalText => {
+                let text = std::mem::take(&mut self.tool_buffer);
+                self.buffering_tool_call = false;
+                Ok(if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![self.text_chunk(upstream, index, text)]
+                })
+            }
+            ToolOutputClassification::InvalidToolCall { error, .. } => {
+                error!(
+                    validation_error = %error,
+                    payload_bytes = self.tool_buffer.len(),
+                    payload = %self.tool_buffer,
+                    "buffered streamed tool-call payload failed validation"
+                );
+                Err(ChatStreamError::malformed_event(format!(
+                    "tool call parsing failed: {error}"
+                )))
+            }
+        }
+    }
+
+    fn ensure_tool_buffer_within_limit(&self) -> Result<(), ChatStreamError> {
+        if self.tool_buffer.len() > self.tool_context.config().tool_call_max_bytes {
+            return Err(ChatStreamError::malformed_event(format!(
+                "tool call output exceeded max size of {} bytes",
+                self.tool_context.config().tool_call_max_bytes
+            )));
+        }
+        Ok(())
     }
 
     fn text_chunk(&mut self, upstream: &Value, index: u64, text: String) -> StreamOutput {
@@ -1460,71 +1535,30 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         ))
     }
 
-    /// Emits one incremental OpenAI tool-call delta: id, type, and name on the
-    /// first fragment for a call, argument fragments after.
-    fn tool_call_chunk(
+    fn full_tool_call_chunk(
         &mut self,
         upstream: &Value,
         index: u64,
-        call: ToolCallDelta,
-    ) -> Result<StreamOutput, ChatStreamError> {
-        let (openai_index, is_first) = match self
-            .tool_states
-            .iter()
-            .position(|state| state.parser_index == call.tool_index)
-        {
-            Some(openai_index) => (openai_index, false),
-            None => {
-                self.tool_states.push(ToolStreamState {
-                    parser_index: call.tool_index,
-                    id: generate_tool_call_id(),
-                    argument_bytes: 0,
-                });
-                (self.tool_states.len() - 1, true)
-            }
-        };
-        // This caps emitted argument bytes per call; text the parser buffers
-        // internally before emitting (e.g. an unfinished tool-call header) is
-        // not counted and is bounded only by the upstream stream length.
-        let state = &mut self.tool_states[openai_index];
-        state.argument_bytes += call.arguments.len();
-        if state.argument_bytes > self.tool_call_max_bytes {
-            return Err(ChatStreamError::malformed_event(format!(
-                "tool call arguments exceeded max size of {} bytes",
-                self.tool_call_max_bytes
-            )));
-        }
-
-        let mut function = serde_json::Map::new();
-        if let Some(name) = call.name {
-            function.insert("name".to_owned(), Value::String(name));
-        }
-        function.insert("arguments".to_owned(), Value::String(call.arguments));
-
-        let mut tool_call = serde_json::Map::new();
-        tool_call.insert("index".to_owned(), json!(openai_index));
-        if is_first {
-            tool_call.insert("id".to_owned(), Value::String(state.id.clone()));
-            tool_call.insert("type".to_owned(), Value::String("function".to_owned()));
-        }
-        tool_call.insert("function".to_owned(), Value::Object(function));
-
+        tool_index: usize,
+        tool_call: &ValidatedToolCall,
+    ) -> StreamOutput {
         let mut delta = serde_json::Map::new();
         if !self.sent_role {
             delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
             self.sent_role = true;
         }
-        delta.insert(
-            "tool_calls".to_owned(),
-            Value::Array(vec![Value::Object(tool_call)]),
-        );
+        let mut tool_call_value = tool_call.to_openai_value();
+        if let Some(tool_call_object) = tool_call_value.as_object_mut() {
+            tool_call_object.insert("index".to_owned(), json!(tool_index));
+        }
+        delta.insert("tool_calls".to_owned(), Value::Array(vec![tool_call_value]));
 
-        Ok(StreamOutput::Json(self.ctx.chunk_with_choice(
+        StreamOutput::Json(self.ctx.chunk_with_choice(
             upstream,
             index,
             Value::Object(delta),
             Value::Null,
-        )))
+        ))
     }
 
     fn handle_usage_chunk(&self, value: &Value) -> Result<Vec<StreamOutput>, ChatStreamError> {
@@ -1548,24 +1582,28 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         let upstream = &Value::Null;
         let mut output = Vec::new();
         if !self.sent_final_finish {
-            let result = self.finish_parser()?;
-            output.extend(self.emit_parse_result(upstream, 0, result)?);
-            let finish_reason = if self.tool_states.is_empty() {
-                "stop"
-            } else {
-                "tool_calls"
-            };
-            output.push(StreamOutput::Json(self.ctx.chunk_with_choice(
+            output.extend(self.finish_buffered_content(
                 upstream,
                 0,
-                json!({}),
-                Value::String(finish_reason.to_owned()),
-            )));
-            self.sent_final_finish = true;
+                Value::String("stop".to_owned()),
+            )?);
         }
         output.push(StreamOutput::Done);
         Ok(output)
     }
+}
+
+fn streamable_pending_text_len(pending_text: &str) -> usize {
+    let protected_suffix_len = TOOL_CALL_START_MARKER.len().saturating_sub(1);
+    if pending_text.len() <= protected_suffix_len {
+        return 0;
+    }
+
+    let mut split_at = pending_text.len() - protected_suffix_len;
+    while !pending_text.is_char_boundary(split_at) {
+        split_at -= 1;
+    }
+    split_at
 }
 
 impl ChatSseTransformer for OpenAiToolEmulatedChatStreamTransformer {
@@ -2616,15 +2654,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_body(response).await;
-        let data = sse_data(&body);
-        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
-        assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
-        assert_eq!(
-            first["choices"][0]["delta"]["content"],
-            "Hello without tools"
-        );
-        assert!(first["choices"][0]["delta"].get("tool_calls").is_none());
-        assert_eq!(data.last().copied(), Some("[DONE]"));
+        let chunks = sse_json_chunks(&body);
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(streamed_content(&chunks), "Hello without tools");
+        assert!(streamed_tool_call_deltas(&chunks).is_empty());
     }
 
     #[tokio::test]
@@ -2642,13 +2675,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_body(response).await;
-        let data = sse_data(&body);
-        let first: Value = serde_json::from_str(data[0]).expect("first chunk should be JSON");
+        let chunks = sse_json_chunks(&body);
         assert_eq!(
-            first["choices"][0]["delta"]["content"],
+            streamed_content(&chunks),
             "<tool_cal>{not actually a marker}"
         );
-        assert!(first["choices"][0]["delta"].get("tool_calls").is_none());
+        assert!(streamed_tool_call_deltas(&chunks).is_empty());
     }
 
     #[tokio::test]
