@@ -25,8 +25,8 @@ open_webui = "X-OpenWebUI-Chat-Id"
 
 [attestation]
 mode = "independent"
-require_tdx = true
-require_nvidia = "when_present"
+require_tdx = false
+require_nvidia = "never"
 allow_debug = false
 pccs_url = ""
 

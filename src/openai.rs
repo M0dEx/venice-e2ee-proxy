@@ -77,6 +77,8 @@ pub struct ModelCapabilities {
     pub web_search: bool,
     pub code_interpreter: bool,
     pub vision: bool,
+    pub reasoning: bool,
+    pub reasoning_effort: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,14 +88,26 @@ pub struct VeniceModelMetadata {
     pub supports_e2ee: bool,
     #[serde(rename = "supportsTeeAttestation")]
     pub supports_tee_attestation: bool,
+    #[serde(rename = "supportsReasoning")]
+    pub supports_reasoning: bool,
+    #[serde(rename = "supportsReasoningEffort")]
+    pub supports_reasoning_effort: bool,
 }
 
 impl VeniceModelMetadata {
-    pub fn new(id: impl Into<String>, supports_e2ee: bool, supports_tee_attestation: bool) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        supports_e2ee: bool,
+        supports_tee_attestation: bool,
+        supports_reasoning: bool,
+        supports_reasoning_effort: bool,
+    ) -> Self {
         Self {
             id: id.into(),
             supports_e2ee,
             supports_tee_attestation,
+            supports_reasoning,
+            supports_reasoning_effort,
         }
     }
 }

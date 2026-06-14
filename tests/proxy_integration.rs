@@ -55,6 +55,10 @@ async fn mock_venice_models_lists_e2ee_models_and_safe_headers() {
     assert_eq!(body.data[0].id, TEST_MODEL);
     assert!(body.data[0].venice.supports_e2ee);
     assert!(body.data[0].venice.supports_tee_attestation);
+    assert!(body.data[0].venice.supports_reasoning);
+    assert!(body.data[0].venice.supports_reasoning_effort);
+    assert!(body.data[0].info.meta.capabilities.reasoning);
+    assert!(body.data[0].info.meta.capabilities.reasoning_effort);
 
     assert_eq!(
         mock.counts(),
@@ -117,6 +121,121 @@ async fn streaming_chat_completion_decrypts_split_sse_and_sets_verified_headers(
             ..Default::default()
         }
     );
+}
+
+#[tokio::test]
+async fn streaming_chat_completion_decrypts_reasoning_content() {
+    let mock = MockVeniceServer::spawn(MockVeniceOptions::with_attempts(vec![vec![
+        MockStreamFrame::Reasoning("Thinking..."),
+        MockStreamFrame::Text("Final answer"),
+        MockStreamFrame::Finish("stop"),
+        MockStreamFrame::Done,
+    ]]))
+    .await;
+    let app = proxy_app(&mock.base_url, Duration::from_secs(1));
+
+    let response = request_chat(
+        app,
+        TEST_SESSION_ID,
+        json!({
+            "model": TEST_MODEL,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "reasoning": {"effort": "high"}
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_verified_chat_headers(&response, TEST_SESSION_ID, None);
+
+    let body = response_text(response).await;
+    let data = sse_data(&body);
+    assert_eq!(data.len(), 4);
+
+    let reasoning: Value = serde_json::from_str(data[0]).expect("reasoning chunk should be JSON");
+    assert_eq!(reasoning["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(
+        reasoning["choices"][0]["delta"]["reasoning_content"],
+        "Thinking..."
+    );
+    assert!(reasoning["choices"][0]["delta"].get("content").is_none());
+
+    let answer: Value = serde_json::from_str(data[1]).expect("answer chunk should be JSON");
+    assert!(answer["choices"][0]["delta"].get("role").is_none());
+    assert_eq!(answer["choices"][0]["delta"]["content"], "Final answer");
+
+    let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
+    assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
+    assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+    assert_eq!(data[3], "[DONE]");
+}
+
+#[tokio::test]
+async fn non_streaming_chat_completion_buffers_decrypted_reasoning_content() {
+    let mock = MockVeniceServer::spawn(MockVeniceOptions::with_attempts(vec![vec![
+        MockStreamFrame::Reasoning("Think "),
+        MockStreamFrame::Reasoning("carefully."),
+        MockStreamFrame::Text("Final answer"),
+        MockStreamFrame::Finish("stop"),
+        MockStreamFrame::Done,
+    ]]))
+    .await;
+    let app = proxy_app(&mock.base_url, Duration::from_secs(1));
+
+    let response = request_chat(
+        app,
+        TEST_SESSION_ID,
+        json!({
+            "model": TEST_MODEL,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+            "reasoning_effort": "medium",
+            "venice_parameters": {"strip_thinking_response": false}
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_verified_chat_headers(&response, TEST_SESSION_ID, None);
+
+    let body: Value = response_json(response).await;
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_content"],
+        "Think carefully."
+    );
+    assert_eq!(body["choices"][0]["message"]["content"], "Final answer");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn plaintext_reasoning_content_fails_closed() {
+    let mock = MockVeniceServer::spawn(MockVeniceOptions::with_attempts(vec![vec![
+        MockStreamFrame::Raw("data: {\"id\":\"chatcmpl-upstream-test\",\"object\":\"chat.completion.chunk\",\"created\":1717171717,\"model\":\"e2ee-test\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"plaintext thinking\"},\"finish_reason\":null}]}\n\n"),
+        MockStreamFrame::Done,
+    ]]))
+    .await;
+    let app = proxy_app(&mock.base_url, Duration::from_secs(1));
+
+    let response = request_chat(
+        app,
+        TEST_SESSION_ID,
+        json!({
+            "model": TEST_MODEL,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+        }),
+    )
+    .await;
+
+    assert_proxy_error(
+        response,
+        StatusCode::BAD_GATEWAY,
+        "proxy_e2ee_error",
+        "e2ee_response_decryption_failed",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -485,6 +604,7 @@ impl Default for MockVeniceOptions {
 #[derive(Debug, Clone)]
 enum MockStreamFrame {
     Text(&'static str),
+    Reasoning(&'static str),
     SplitText(&'static str),
     TextForWrongRecipient(&'static str),
     Finish(&'static str),
@@ -639,7 +759,9 @@ async fn mock_models(State(state): State<MockVeniceState>, headers: HeaderMap) -
                         "supportsBuiltinTools": false,
                         "supportsWebSearch": false,
                         "supportsCodeInterpreter": false,
-                        "supportsVision": false
+                        "supportsVision": false,
+                        "supportsReasoning": true,
+                        "supportsReasoningEffort": true
                     }
                 }
             },
@@ -778,6 +900,13 @@ fn render_mock_sse_chunks(frames: &[MockStreamFrame], client_public_key: &str) -
             MockStreamFrame::Text(content) => {
                 chunks.push(encrypted_content_event(&codec, content, client_public_key));
             }
+            MockStreamFrame::Reasoning(content) => {
+                chunks.push(encrypted_reasoning_event(
+                    &codec,
+                    content,
+                    client_public_key,
+                ));
+            }
             MockStreamFrame::SplitText(content) => {
                 let event = encrypted_content_event(&codec, content, client_public_key);
                 let split = event.len() / 2;
@@ -814,6 +943,14 @@ fn encrypted_content_event(codec: &E2eeCodec, content: &str, client_public_key: 
     format!("data: {}\n\n", upstream_content_chunk(encrypted))
 }
 
+fn encrypted_reasoning_event(codec: &E2eeCodec, content: &str, client_public_key: &str) -> String {
+    let encrypted = codec
+        .encrypt_content(content, client_public_key)
+        .expect("mock response reasoning content should encrypt")
+        .into_hex();
+    format!("data: {}\n\n", upstream_reasoning_content_chunk(encrypted))
+}
+
 fn upstream_content_chunk(encrypted_content: String) -> Value {
     json!({
         "id": "chatcmpl-upstream-test",
@@ -823,6 +960,20 @@ fn upstream_content_chunk(encrypted_content: String) -> Value {
         "choices": [{
             "index": 0,
             "delta": { "content": encrypted_content },
+            "finish_reason": null,
+        }],
+    })
+}
+
+fn upstream_reasoning_content_chunk(encrypted_content: String) -> Value {
+    json!({
+        "id": "chatcmpl-upstream-test",
+        "object": "chat.completion.chunk",
+        "created": 1_717_171_717,
+        "model": TEST_MODEL,
+        "choices": [{
+            "index": 0,
+            "delta": { "reasoning_content": encrypted_content },
             "finish_reason": null,
         }],
     })

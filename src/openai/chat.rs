@@ -13,6 +13,8 @@ pub struct ChatCompletionRequest {
     pub stream_options: OpenAiStreamOptions,
     pub venice_parameters: VeniceParameters,
     pub passthrough: OpenAiPassthroughFields,
+    pub reasoning: Option<ReasoningOptions>,
+    pub reasoning_effort: Option<String>,
     pub tools: Vec<ChatToolDefinition>,
     pub tool_choice: ChatToolChoice,
     pub parallel_tool_calls: Option<bool>,
@@ -35,6 +37,8 @@ impl ChatCompletionRequest {
                 "max_tokens",
                 "max_completion_tokens",
                 "stop",
+                "reasoning",
+                "reasoning_effort",
                 "tools",
                 "tool_choice",
                 "parallel_tool_calls",
@@ -55,6 +59,9 @@ impl ChatCompletionRequest {
         let stream_options = OpenAiStreamOptions::parse(object.get("stream_options"))?;
         let venice_parameters = VeniceParameters::parse(object.get("venice_parameters"))?;
         let passthrough = OpenAiPassthroughFields::parse(object)?;
+        let reasoning = ReasoningOptions::parse(object.get("reasoning"))?;
+        let reasoning_effort = optional_non_empty_string(object, "reasoning_effort")?;
+        validate_reasoning_effort_consistency(reasoning.as_ref(), reasoning_effort.as_deref())?;
         let tools = parse_tools(object.get("tools"))?;
         validate_tools(&tools)?;
         let tool_choice = parse_tool_choice(object.get("tool_choice"))?;
@@ -68,6 +75,8 @@ impl ChatCompletionRequest {
             stream_options,
             venice_parameters,
             passthrough,
+            reasoning,
+            reasoning_effort,
             tools,
             tool_choice,
             parallel_tool_calls,
@@ -117,6 +126,8 @@ impl ChatCompletionRequest {
                 max_tokens: self.passthrough.max_tokens,
                 max_completion_tokens: self.passthrough.max_completion_tokens,
                 stop: self.passthrough.stop.clone(),
+                reasoning: self.reasoning.clone(),
+                reasoning_effort: self.reasoning_effort.clone(),
             },
         })
     }
@@ -250,6 +261,32 @@ pub struct OpenAiStreamOptions {
     pub include_usage: Option<bool>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningOptions {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_bool_reject_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_empty_string_reject_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub effort: Option<String>,
+}
+
+impl ReasoningOptions {
+    fn parse(value: Option<&Value>) -> Result<Option<Self>, ChatRequestError> {
+        match value {
+            None => Ok(None),
+            Some(value) => deserialize_typed_value("reasoning", value).map(Some),
+        }
+    }
+}
+
 impl OpenAiStreamOptions {
     fn parse(value: Option<&Value>) -> Result<Self, ChatRequestError> {
         let Some(value) = value else {
@@ -263,6 +300,8 @@ impl OpenAiStreamOptions {
 pub struct VeniceParameters {
     pub enable_e2ee: bool,
     pub include_venice_system_prompt: bool,
+    pub strip_thinking_response: bool,
+    pub disable_thinking: bool,
     pub enable_web_search: String,
 }
 
@@ -271,6 +310,8 @@ impl Default for VeniceParameters {
         Self {
             enable_e2ee: true,
             include_venice_system_prompt: false,
+            strip_thinking_response: false,
+            disable_thinking: false,
             enable_web_search: "off".to_owned(),
         }
     }
@@ -298,6 +339,9 @@ impl VeniceParameters {
             });
         }
 
+        let strip_thinking_response = raw.strip_thinking_response.unwrap_or(false);
+        let disable_thinking = raw.disable_thinking.unwrap_or(false);
+
         let enable_web_search = match raw.enable_web_search {
             None => "off".to_owned(),
             Some(RawVeniceWebSearch::String(value)) if value == "off" => "off".to_owned(),
@@ -321,6 +365,8 @@ impl VeniceParameters {
         Ok(Self {
             enable_e2ee,
             include_venice_system_prompt,
+            strip_thinking_response,
+            disable_thinking,
             enable_web_search,
         })
     }
@@ -370,6 +416,10 @@ pub struct VeniceE2eeChatRequest {
     pub max_completion_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StopSequence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +441,10 @@ struct RawVeniceParameters {
     enable_e2ee: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_bool_reject_null")]
     include_venice_system_prompt: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool_reject_null")]
+    strip_thinking_response: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool_reject_null")]
+    disable_thinking: Option<bool>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_web_search_reject_null"
@@ -772,6 +826,25 @@ fn validate_tool_choice(tool_choice: &ChatToolChoice) -> Result<(), ChatRequestE
     Ok(())
 }
 
+fn validate_reasoning_effort_consistency(
+    reasoning: Option<&ReasoningOptions>,
+    reasoning_effort: Option<&str>,
+) -> Result<(), ChatRequestError> {
+    let Some(nested_effort) = reasoning.and_then(|reasoning| reasoning.effort.as_deref()) else {
+        return Ok(());
+    };
+    let Some(flat_effort) = reasoning_effort else {
+        return Ok(());
+    };
+    if nested_effort != flat_effort {
+        return Err(ChatRequestError::invalid_field(
+            "reasoning_effort",
+            "must match reasoning.effort when both are provided",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_ignored_client_only_fields(
     object: &Map<String, Value>,
 ) -> Result<(), ChatRequestError> {
@@ -831,6 +904,23 @@ fn optional_bool(
         .transpose()
 }
 
+fn optional_non_empty_string(
+    object: &Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<String>, ChatRequestError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => {
+            Err(ChatRequestError::invalid_field(field, "must not be empty"))
+        }
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(value) => Err(ChatRequestError::invalid_field(
+            field,
+            format!("expected string, got {}", json_kind(value)),
+        )),
+    }
+}
+
 fn optional_number(
     object: &Map<String, Value>,
     field: &'static str,
@@ -885,6 +975,25 @@ where
         Value::Bool(value) => Ok(Some(value)),
         other => Err(serde::de::Error::custom(format!(
             "expected boolean, got {}",
+            json_kind(&other)
+        ))),
+    }
+}
+
+fn deserialize_optional_non_empty_string_reject_null<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(value) if value.trim().is_empty() => {
+            Err(serde::de::Error::custom("must not be empty"))
+        }
+        Value::String(value) => Ok(Some(value)),
+        other => Err(serde::de::Error::custom(format!(
+            "expected string, got {}",
             json_kind(&other)
         ))),
     }
@@ -1246,6 +1355,18 @@ mod tests {
             web_search_error.api_error_code(),
             "unsupported_venice_parameter"
         );
+
+        let mismatched_reasoning_effort = ChatCompletionRequest::parse(&json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "reasoning": {"effort": "low"},
+            "reasoning_effort": "high"
+        }))
+        .expect_err("mismatched reasoning efforts should be rejected");
+        assert_eq!(
+            mismatched_reasoning_effort.api_error_code(),
+            "invalid_request"
+        );
     }
 
     #[test]
@@ -1388,6 +1509,49 @@ mod tests {
             content_part_non_object.api_error_code(),
             "unsupported_message_content"
         );
+    }
+
+    #[test]
+    fn parses_and_forwards_reasoning_controls() {
+        let model_key = SecretKey::random(&mut rand_core::OsRng);
+        let model_public_key = model_public_key_hex(&model_key);
+        let codec = E2eeCodec::default();
+        let request = parse(json!({
+            "model": "e2ee-test",
+            "messages": [{"role":"user", "content":"hi"}],
+            "reasoning": {"enabled": true, "effort": "high"},
+            "reasoning_effort": "high",
+            "venice_parameters": {
+                "strip_thinking_response": true,
+                "disable_thinking": false
+            }
+        }));
+
+        let reasoning = request.reasoning.as_ref().expect("reasoning should parse");
+        assert_eq!(reasoning.enabled, Some(true));
+        assert_eq!(reasoning.effort.as_deref(), Some("high"));
+        assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
+        assert!(request.venice_parameters.strip_thinking_response);
+        assert!(!request.venice_parameters.disable_thinking);
+
+        let prepared = request
+            .to_venice_e2ee_request(&codec, &model_public_key)
+            .expect("request should encrypt");
+        assert_eq!(prepared.upstream.reasoning, request.reasoning);
+        assert_eq!(prepared.upstream.reasoning_effort.as_deref(), Some("high"));
+        assert!(prepared.upstream.venice_parameters.strip_thinking_response);
+        assert!(!prepared.upstream.venice_parameters.disable_thinking);
+
+        let upstream =
+            serde_json::to_value(&prepared.upstream).expect("upstream request should serialize");
+        assert_eq!(upstream["reasoning"]["enabled"], true);
+        assert_eq!(upstream["reasoning"]["effort"], "high");
+        assert_eq!(upstream["reasoning_effort"], "high");
+        assert_eq!(
+            upstream["venice_parameters"]["strip_thinking_response"],
+            true
+        );
+        assert_eq!(upstream["venice_parameters"]["disable_thinking"], false);
     }
 
     #[test]

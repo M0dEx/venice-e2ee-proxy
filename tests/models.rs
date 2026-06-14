@@ -60,9 +60,13 @@ async fn get_models_returns_filtered_openai_model_list() {
     assert!(model.info.meta.capabilities.web_search);
     assert!(model.info.meta.capabilities.code_interpreter);
     assert!(!model.info.meta.capabilities.vision);
+    assert!(model.info.meta.capabilities.reasoning);
+    assert!(model.info.meta.capabilities.reasoning_effort);
     assert_eq!(model.venice.id, "e2ee-qwen3-5-122b-a10b");
     assert!(model.venice.supports_e2ee);
     assert!(model.venice.supports_tee_attestation);
+    assert!(model.venice.supports_reasoning);
+    assert!(model.venice.supports_reasoning_effort);
 }
 
 #[tokio::test]
@@ -168,7 +172,9 @@ async fn successful_models(headers: axum::http::HeaderMap) -> Response {
                         "supportsBuiltinTools": true,
                         "supportsWebSearch": true,
                         "supportsCodeInterpreter": true,
-                        "supportsVision": false
+                        "supportsVision": false,
+                        "supportsReasoning": true,
+                        "supportsReasoningEffort": true
                     }
                 }
             },

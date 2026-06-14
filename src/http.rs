@@ -514,6 +514,20 @@ fn openai_tool_call_completion(completion: Value, tool_calls: Vec<ValidatedToolC
         .iter()
         .map(ValidatedToolCall::to_openai_value)
         .collect();
+    let reasoning_content = choice
+        .get("message")
+        .and_then(|message| message.get("reasoning_content"))
+        .and_then(Value::as_str);
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_owned(), Value::String("assistant".to_owned()));
+    message.insert("content".to_owned(), Value::Null);
+    if let Some(reasoning_content) = reasoning_content {
+        message.insert(
+            "reasoning_content".to_owned(),
+            Value::String(reasoning_content.to_owned()),
+        );
+    }
+    message.insert("tool_calls".to_owned(), Value::Array(tool_call_values));
 
     json!({
         "id": string_field(&completion, "id").unwrap_or("chatcmpl-local"),
@@ -522,11 +536,7 @@ fn openai_tool_call_completion(completion: Value, tool_calls: Vec<ValidatedToolC
         "model": string_field(&completion, "model").unwrap_or("unknown"),
         "choices": [{
             "index": index,
-            "message": {
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": tool_call_values,
-            },
+            "message": Value::Object(message),
             "finish_reason": "tool_calls",
         }],
         "usage": completion.get("usage").cloned().unwrap_or(Value::Null),
@@ -982,8 +992,9 @@ struct OpenAiChatCompletionBuffer {
     created: Option<i64>,
     model: Option<String>,
     choice_index: Option<u64>,
-    saw_encrypted_content: bool,
+    saw_encrypted_response_field: bool,
     content: String,
+    reasoning_content: String,
     finish_reason: Option<Value>,
     usage: Option<Value>,
 }
@@ -996,8 +1007,9 @@ impl OpenAiChatCompletionBuffer {
             created: None,
             model: None,
             choice_index: None,
-            saw_encrypted_content: false,
+            saw_encrypted_response_field: false,
             content: String::new(),
+            reasoning_content: String::new(),
             finish_reason: None,
             usage: None,
         }
@@ -1006,7 +1018,7 @@ impl OpenAiChatCompletionBuffer {
     fn handle_event(&mut self, event: RawSseEvent) -> Result<bool, ChatStreamError> {
         match classify_upstream_event(event, &BUFFERED_UPSTREAM_EVENT_LOG)? {
             UpstreamEventKind::Done => {
-                if !self.saw_encrypted_content {
+                if !self.saw_encrypted_response_field {
                     self.ctx.decrypt(None)?;
                 }
                 if self.finish_reason.is_none() {
@@ -1057,16 +1069,18 @@ impl OpenAiChatCompletionBuffer {
         let finish_reason = normalized_finish_reason(choice.get("finish_reason"))?;
         let delta = choice.get("delta").unwrap_or(&Value::Null);
         let content = encrypted_delta_content(delta)?;
+        let reasoning_content = encrypted_delta_reasoning_content(delta)?;
         debug!(
             choice_index = index,
             has_encrypted_content = content.is_some(),
+            has_encrypted_reasoning_content = reasoning_content.is_some(),
             has_finish_reason = !finish_reason.is_null(),
             "transforming buffered upstream choice chunk"
         );
 
         if let Some(content) = content {
             let decrypted = self.ctx.decrypt(Some(content))?;
-            self.saw_encrypted_content = true;
+            self.saw_encrypted_response_field = true;
             debug!(
                 choice_index = index,
                 has_decrypted_content = decrypted.is_some(),
@@ -1074,6 +1088,19 @@ impl OpenAiChatCompletionBuffer {
             );
             if let Some(content) = decrypted {
                 self.content.push_str(&content);
+            }
+        }
+
+        if let Some(reasoning_content) = reasoning_content {
+            let decrypted = self.ctx.decrypt(Some(reasoning_content))?;
+            self.saw_encrypted_response_field = true;
+            debug!(
+                choice_index = index,
+                has_decrypted_reasoning_content = decrypted.is_some(),
+                "decrypted buffered upstream reasoning content chunk"
+            );
+            if let Some(reasoning_content) = decrypted {
+                self.reasoning_content.push_str(&reasoning_content);
             }
         }
 
@@ -1103,6 +1130,16 @@ impl OpenAiChatCompletionBuffer {
     }
 
     fn into_response(self) -> Value {
+        let mut message = serde_json::Map::new();
+        message.insert("role".to_owned(), Value::String("assistant".to_owned()));
+        if !self.reasoning_content.is_empty() {
+            message.insert(
+                "reasoning_content".to_owned(),
+                Value::String(self.reasoning_content),
+            );
+        }
+        message.insert("content".to_owned(), Value::String(self.content));
+
         json!({
             "id": self.id.unwrap_or(self.ctx.fallback_id),
             "object": "chat.completion",
@@ -1110,10 +1147,7 @@ impl OpenAiChatCompletionBuffer {
             "model": self.model.unwrap_or(self.ctx.fallback_model),
             "choices": [{
                 "index": self.choice_index.unwrap_or(0),
-                "message": {
-                    "role": "assistant",
-                    "content": self.content,
-                },
+                "message": Value::Object(message),
                 "finish_reason": self.finish_reason.unwrap_or_else(|| Value::String("stop".to_owned())),
             }],
             "usage": self.usage.unwrap_or(Value::Null),
@@ -1212,14 +1246,16 @@ impl OpenAiChatStreamTransformer {
         let finish_reason = normalized_finish_reason(choice.get("finish_reason"))?;
         let delta = choice.get("delta").unwrap_or(&Value::Null);
         let content = encrypted_delta_content(delta)?;
+        let reasoning_content = encrypted_delta_reasoning_content(delta)?;
         debug!(
             has_encrypted_content = content.is_some(),
+            has_encrypted_reasoning_content = reasoning_content.is_some(),
             has_finish_reason = !finish_reason.is_null(),
             "transforming streaming upstream choice chunk"
         );
 
         let mut output = Vec::new();
-        if content.is_none() {
+        if content.is_none() && reasoning_content.is_none() {
             if !finish_reason.is_null() {
                 output.push(StreamOutput::Json(self.chunk_with_choice(
                     value,
@@ -1232,19 +1268,35 @@ impl OpenAiChatStreamTransformer {
             return Ok(output);
         }
 
-        let decrypted = self.ctx.decrypt(content)?;
+        let decrypted_content = match content {
+            Some(content) => self.ctx.decrypt(Some(content))?,
+            None => None,
+        };
+        let decrypted_reasoning_content = match reasoning_content {
+            Some(reasoning_content) => self.ctx.decrypt(Some(reasoning_content))?,
+            None => None,
+        };
         debug!(
-            has_decrypted_content = decrypted.is_some(),
+            has_decrypted_content = decrypted_content.is_some(),
+            has_decrypted_reasoning_content = decrypted_reasoning_content.is_some(),
             "decrypted streaming upstream content chunk"
         );
 
-        if let Some(content) = decrypted {
+        if decrypted_content.is_some() || decrypted_reasoning_content.is_some() {
             let mut delta = serde_json::Map::new();
             if !self.sent_role {
                 delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
                 self.sent_role = true;
             }
-            delta.insert("content".to_owned(), Value::String(content));
+            if let Some(reasoning_content) = decrypted_reasoning_content {
+                delta.insert(
+                    "reasoning_content".to_owned(),
+                    Value::String(reasoning_content),
+                );
+            }
+            if let Some(content) = decrypted_content {
+                delta.insert("content".to_owned(), Value::String(content));
+            }
 
             let final_finish = !finish_reason.is_null();
             let content_finish_reason = if final_finish {
@@ -1385,8 +1437,15 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         let finish_reason = normalized_finish_reason(choice.get("finish_reason"))?;
         let delta = choice.get("delta").unwrap_or(&Value::Null);
         let content = encrypted_delta_content(delta)?;
+        let reasoning_content = encrypted_delta_reasoning_content(delta)?;
 
         let mut output = Vec::new();
+        if let Some(reasoning_content) = reasoning_content
+            && let Some(reasoning_content) = self.ctx.decrypt(Some(reasoning_content))?
+            && !self.sent_final_finish
+        {
+            output.push(self.reasoning_chunk(value, index, reasoning_content));
+        }
         if let Some(content) = content
             && let Some(content) = self.ctx.decrypt(Some(content))?
             && !self.sent_final_finish
@@ -1521,10 +1580,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
 
     fn text_chunk(&mut self, upstream: &Value, index: u64, text: String) -> StreamOutput {
         let mut delta = serde_json::Map::new();
-        if !self.sent_role {
-            delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
-            self.sent_role = true;
-        }
+        self.insert_role_if_needed(&mut delta);
         delta.insert("content".to_owned(), Value::String(text));
 
         StreamOutput::Json(self.ctx.chunk_with_choice(
@@ -1535,6 +1591,34 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         ))
     }
 
+    fn reasoning_chunk(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+        reasoning_content: String,
+    ) -> StreamOutput {
+        let mut delta = serde_json::Map::new();
+        self.insert_role_if_needed(&mut delta);
+        delta.insert(
+            "reasoning_content".to_owned(),
+            Value::String(reasoning_content),
+        );
+
+        StreamOutput::Json(self.ctx.chunk_with_choice(
+            upstream,
+            index,
+            Value::Object(delta),
+            Value::Null,
+        ))
+    }
+
+    fn insert_role_if_needed(&mut self, delta: &mut serde_json::Map<String, Value>) {
+        if !self.sent_role {
+            delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
+            self.sent_role = true;
+        }
+    }
+
     fn full_tool_call_chunk(
         &mut self,
         upstream: &Value,
@@ -1543,10 +1627,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         tool_call: &ValidatedToolCall,
     ) -> StreamOutput {
         let mut delta = serde_json::Map::new();
-        if !self.sent_role {
-            delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
-            self.sent_role = true;
-        }
+        self.insert_role_if_needed(&mut delta);
         let mut tool_call_value = tool_call.to_openai_value();
         if let Some(tool_call_object) = tool_call_value.as_object_mut() {
             tool_call_object.insert("index".to_owned(), json!(tool_index));
@@ -1647,19 +1728,30 @@ fn normalized_finish_reason(value: Option<&Value>) -> Result<Value, ChatStreamEr
 }
 
 fn encrypted_delta_content(delta: &Value) -> Result<Option<&str>, ChatStreamError> {
-    match delta.get("content") {
+    encrypted_delta_text_field(delta, "content")
+}
+
+fn encrypted_delta_reasoning_content(delta: &Value) -> Result<Option<&str>, ChatStreamError> {
+    encrypted_delta_text_field(delta, "reasoning_content")
+}
+
+fn encrypted_delta_text_field<'a>(
+    delta: &'a Value,
+    field: &'static str,
+) -> Result<Option<&'a str>, ChatStreamError> {
+    match delta.get(field) {
         Some(Value::Null) => {
-            debug!("ignoring null upstream delta.content");
+            debug!(field, "ignoring null upstream delta text field");
             Ok(None)
         }
         Some(Value::String(content)) if content.is_empty() => {
-            debug!("ignoring empty upstream delta.content");
+            debug!(field, "ignoring empty upstream delta text field");
             Ok(None)
         }
         Some(Value::String(content)) => Ok(Some(content.as_str())),
-        Some(_) => Err(ChatStreamError::malformed_event(
-            "upstream delta.content must be a string or null",
-        )),
+        Some(_) => Err(ChatStreamError::malformed_event(format!(
+            "upstream delta.{field} must be a string or null"
+        ))),
         None => Ok(None),
     }
 }
@@ -2170,6 +2262,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_route_streams_decrypted_reasoning_content() {
+        let response = streaming_chat_response(
+            "chat-route-reasoning-stream",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":true,"reasoning":{"effort":"high"}}"#,
+            vec![
+                MockStreamFrame::Reasoning("Thinking"),
+                MockStreamFrame::Text("Answer"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let data = sse_data(&body);
+        assert_eq!(data.len(), 4);
+        let reasoning: Value =
+            serde_json::from_str(data[0]).expect("reasoning chunk should be JSON");
+        let answer: Value = serde_json::from_str(data[1]).expect("answer chunk should be JSON");
+
+        assert_eq!(reasoning["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(
+            reasoning["choices"][0]["delta"]["reasoning_content"],
+            "Thinking"
+        );
+        assert!(answer["choices"][0]["delta"].get("role").is_none());
+        assert_eq!(answer["choices"][0]["delta"]["content"], "Answer");
+        assert_eq!(data.last().copied(), Some("[DONE]"));
+    }
+
+    #[tokio::test]
     async fn chat_route_streams_multiple_decrypted_content_chunks() {
         let response = streaming_chat_response(
             "chat-route-multiple-chunks",
@@ -2251,6 +2375,30 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
         assert!(body["usage"].is_null());
+    }
+
+    #[tokio::test]
+    async fn chat_route_returns_buffered_reasoning_content() {
+        let response = chat_response(
+            "chat-route-reasoning-non-streaming",
+            r#"{"model":"e2ee-test","messages":[{"role":"user","content":"hello"}],"stream":false,"reasoning_effort":"medium"}"#,
+            vec![
+                MockStreamFrame::Reasoning("Think "),
+                MockStreamFrame::Reasoning("first."),
+                MockStreamFrame::Text("Answer"),
+                MockStreamFrame::Finish("stop"),
+                MockStreamFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["choices"][0]["message"]["reasoning_content"],
+            "Think first."
+        );
+        assert_eq!(body["choices"][0]["message"]["content"], "Answer");
     }
 
     #[tokio::test]
@@ -3027,6 +3175,7 @@ mod tests {
         NullContent,
         EmptyContent,
         Text(&'static str),
+        Reasoning(&'static str),
         TextForWrongRecipient(&'static str),
         Finish(&'static str),
         Usage,
@@ -3355,6 +3504,16 @@ mod tests {
                         .into_hex();
                     output.push_str(&format!("data: {}\n\n", upstream_content_chunk(encrypted)));
                 }
+                MockStreamFrame::Reasoning(content) => {
+                    let encrypted = codec
+                        .encrypt_content(content, client_public_key)
+                        .expect("mock reasoning content should encrypt")
+                        .into_hex();
+                    output.push_str(&format!(
+                        "data: {}\n\n",
+                        upstream_reasoning_content_chunk(encrypted)
+                    ));
+                }
                 MockStreamFrame::TextForWrongRecipient(content) => {
                     let wrong_key = ProxyInstanceKey::generate();
                     let encrypted = codec
@@ -3405,6 +3564,20 @@ mod tests {
             "choices": [{
                 "index": 0,
                 "delta": { "content": encrypted_content },
+                "finish_reason": null,
+            }],
+        })
+    }
+
+    fn upstream_reasoning_content_chunk(encrypted_content: String) -> Value {
+        json!({
+            "id": "chatcmpl-upstream-test",
+            "object": "chat.completion.chunk",
+            "created": 1_717_171_717,
+            "model": "e2ee-test",
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_content": encrypted_content },
                 "finish_reason": null,
             }],
         })

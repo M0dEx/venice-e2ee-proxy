@@ -330,6 +330,8 @@ impl VeniceModel {
             self.id.clone(),
             capabilities.supports_e2ee,
             capabilities.supports_tee_attestation,
+            capabilities.supports_reasoning.unwrap_or(false),
+            capabilities.supports_reasoning_effort.unwrap_or(false),
         );
         let openai_capabilities = capabilities.to_openai_capabilities();
 
@@ -364,6 +366,10 @@ struct VeniceCapabilities {
     supports_code_interpreter: Option<bool>,
     #[serde(default, rename = "supportsVision")]
     supports_vision: Option<bool>,
+    #[serde(default, rename = "supportsReasoning")]
+    supports_reasoning: Option<bool>,
+    #[serde(default, rename = "supportsReasoningEffort")]
+    supports_reasoning_effort: Option<bool>,
 }
 
 impl VeniceCapabilities {
@@ -380,6 +386,8 @@ impl VeniceCapabilities {
             web_search,
             code_interpreter,
             vision: self.supports_vision.unwrap_or(false),
+            reasoning: self.supports_reasoning.unwrap_or(false),
+            reasoning_effort: self.supports_reasoning_effort.unwrap_or(false),
         }
     }
 }
@@ -411,7 +419,9 @@ mod tests {
                   "supportsBuiltinTools": true,
                   "supportsWebSearch": true,
                   "supportsCodeInterpreter": true,
-                  "supportsVision": false
+                  "supportsVision": false,
+                  "supportsReasoning": true,
+                  "supportsReasoningEffort": true
                 }
               }
             },
@@ -454,9 +464,13 @@ mod tests {
         assert!(model.info.meta.capabilities.web_search);
         assert!(model.info.meta.capabilities.code_interpreter);
         assert!(!model.info.meta.capabilities.vision);
+        assert!(model.info.meta.capabilities.reasoning);
+        assert!(model.info.meta.capabilities.reasoning_effort);
         assert_eq!(model.venice.id, "e2ee-qwen3-5-122b-a10b");
         assert!(model.venice.supports_e2ee);
         assert!(model.venice.supports_tee_attestation);
+        assert!(model.venice.supports_reasoning);
+        assert!(model.venice.supports_reasoning_effort);
     }
 
     #[test]
@@ -580,6 +594,8 @@ mod tests {
             max_tokens: None,
             max_completion_tokens: None,
             stop: None,
+            reasoning: None,
+            reasoning_effort: None,
         };
 
         let mut response = client
