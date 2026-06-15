@@ -81,10 +81,9 @@ impl ProxyConfig {
                 "must be greater than zero",
             ));
         }
-        validate_header_name("session.headers.preferred", &self.session.headers.preferred)?;
         validate_header_name(
-            "session.headers.open_webui",
-            &self.session.headers.open_webui,
+            "session.headers.incoming_session_id",
+            &self.session.headers.incoming_session_id,
         )?;
 
         validate_http_url("attestation.pccs_url", &self.attestation.pccs_url, true)?;
@@ -218,16 +217,14 @@ impl Default for SessionConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionHeadersConfig {
-    pub preferred: String,
-    pub open_webui: String,
+    pub incoming_session_id: String,
 }
 
 impl Default for SessionHeadersConfig {
-    /// Returns the default preferred and Open WebUI compatibility session headers.
+    /// Returns the default incoming session-id header.
     fn default() -> Self {
         Self {
-            preferred: "X-Venice-Proxy-Session-Id".to_owned(),
-            open_webui: "X-OpenWebUI-Chat-Id".to_owned(),
+            incoming_session_id: "X-Venice-Proxy-Session-Id".to_owned(),
         }
     }
 }
@@ -478,10 +475,9 @@ mod tests {
         assert_eq!(config.session.max_requests, 100);
         assert_eq!(config.session.fallback_scope, SessionFallbackScope::Request);
         assert_eq!(
-            config.session.headers.preferred,
+            config.session.headers.incoming_session_id,
             "X-Venice-Proxy-Session-Id"
         );
-        assert_eq!(config.session.headers.open_webui, "X-OpenWebUI-Chat-Id");
         assert_eq!(config.attestation.mode, AttestationMode::Independent);
         assert!(!config.attestation.require_tdx);
         assert_eq!(config.attestation.require_nvidia, NvidiaRequirement::Never);
