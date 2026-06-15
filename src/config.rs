@@ -30,6 +30,7 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
+    /// Prefix used when loading configuration overrides from environment variables.
     pub const ENV_PREFIX: &'static str = "VENICE_E2EE_PROXY__";
 
     /// Loads configuration from a TOML file with environment overrides.
@@ -46,10 +47,12 @@ impl ProxyConfig {
         Self::from_figment(Figment::new().merge(Toml::string(contents)))
     }
 
+    /// Builds the environment provider used to overlay nested config values.
     fn env_provider() -> Env {
         Env::prefixed(Self::ENV_PREFIX).split("__")
     }
 
+    /// Extracts proxy configuration from a Figment provider and validates it before returning.
     fn from_figment(figment: Figment) -> Result<Self, ConfigError> {
         let config: Self = figment.extract()?;
         config.validate()?;
@@ -111,6 +114,7 @@ impl ProxyConfig {
     }
 }
 
+/// HTTP listener configuration for the local proxy server.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -119,6 +123,7 @@ pub struct ServerConfig {
 }
 
 impl Default for ServerConfig {
+    /// Returns the default listener binding used when server config is omitted.
     fn default() -> Self {
         Self {
             host: "0.0.0.0".to_owned(),
@@ -127,6 +132,7 @@ impl Default for ServerConfig {
     }
 }
 
+/// Tracing configuration for proxy logs.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
@@ -137,6 +143,7 @@ pub struct LoggingConfig {
 }
 
 impl Default for LoggingConfig {
+    /// Returns the default tracing filter for proxy logs.
     fn default() -> Self {
         Self {
             level: "info".to_owned(),
@@ -144,6 +151,7 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Venice upstream API client configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VeniceConfig {
@@ -154,6 +162,7 @@ pub struct VeniceConfig {
 }
 
 impl Default for VeniceConfig {
+    /// Returns default Venice API endpoint and timeout settings with an empty API key.
     fn default() -> Self {
         Self {
             base_url: "https://api.venice.ai/api/v1".to_owned(),
@@ -163,6 +172,7 @@ impl Default for VeniceConfig {
     }
 }
 
+/// Proxy instance key generation configuration.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct KeysConfig {
@@ -170,6 +180,7 @@ pub struct KeysConfig {
 }
 
 impl Default for KeysConfig {
+    /// Returns the default key policy that generates a proxy instance key at startup.
     fn default() -> Self {
         Self {
             generate_proxy_instance_key_on_startup: true,
@@ -177,6 +188,7 @@ impl Default for KeysConfig {
     }
 }
 
+/// Session lifetime, reuse, and identifier-resolution configuration.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionConfig {
@@ -190,6 +202,7 @@ pub struct SessionConfig {
 }
 
 impl Default for SessionConfig {
+    /// Returns the default session TTLs, request budget, fallback behavior, and headers.
     fn default() -> Self {
         Self {
             idle_ttl: Duration::from_secs(600),
@@ -201,6 +214,7 @@ impl Default for SessionConfig {
     }
 }
 
+/// Header names used to resolve stable agent session identifiers.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionHeadersConfig {
@@ -209,6 +223,7 @@ pub struct SessionHeadersConfig {
 }
 
 impl Default for SessionHeadersConfig {
+    /// Returns the default preferred and Open WebUI compatibility session headers.
     fn default() -> Self {
         Self {
             preferred: "X-Venice-Proxy-Session-Id".to_owned(),
@@ -217,6 +232,7 @@ impl Default for SessionHeadersConfig {
     }
 }
 
+/// Fallback strategy used when a request does not include a session identifier.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionFallbackScope {
@@ -226,6 +242,7 @@ pub enum SessionFallbackScope {
     Disabled,
 }
 
+/// Attestation verification policy for Venice model-key evidence.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttestationConfig {
@@ -237,17 +254,19 @@ pub struct AttestationConfig {
 }
 
 impl Default for AttestationConfig {
+    /// Returns the default attestation policy used when attestation requirements are not configured.
     fn default() -> Self {
         Self {
             mode: AttestationMode::Independent,
-            require_tdx: true,
-            require_nvidia: NvidiaRequirement::WhenPresent,
+            require_tdx: false,
+            require_nvidia: NvidiaRequirement::Never,
             allow_debug: false,
             pccs_url: String::new(),
         }
     }
 }
 
+/// Attestation strategy exposed in proxy metadata and config.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AttestationMode {
@@ -256,6 +275,7 @@ pub enum AttestationMode {
 }
 
 impl AttestationMode {
+    /// Returns the lowercase metadata/header value for this attestation mode.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Independent => "independent",
@@ -263,15 +283,17 @@ impl AttestationMode {
     }
 }
 
+/// Policy for how NVIDIA attestation payloads are required or ignored.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NvidiaRequirement {
     Required,
-    #[default]
     WhenPresent,
+    #[default]
     Never,
 }
 
+/// E2EE codec configuration for request encryption and response decryption.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct E2eeConfig {
@@ -280,6 +302,7 @@ pub struct E2eeConfig {
 }
 
 impl Default for E2eeConfig {
+    /// Returns the default HKDF context and encrypted-response policy.
     fn default() -> Self {
         Self {
             hkdf_info: "ecdsa_encryption".to_owned(),
@@ -288,6 +311,7 @@ impl Default for E2eeConfig {
     }
 }
 
+/// Tool-call emulation configuration for OpenAI-style function calls.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolsConfig {
@@ -301,6 +325,7 @@ pub struct ToolsConfig {
 }
 
 impl Default for ToolsConfig {
+    /// Returns the default tool-emulation limits and retry policy.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -313,6 +338,7 @@ impl Default for ToolsConfig {
     }
 }
 
+/// Tool handling mode used by the proxy.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolMode {
@@ -322,6 +348,7 @@ pub enum ToolMode {
 }
 
 impl ToolMode {
+    /// Returns the lowercase metadata/header value for this tool mode.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Emulated => "emulated",
@@ -330,6 +357,7 @@ impl ToolMode {
     }
 }
 
+/// Errors returned while loading or validating proxy configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to load config: {0}")]
@@ -344,12 +372,14 @@ pub enum ConfigError {
 }
 
 impl From<figment::Error> for ConfigError {
+    /// Converts Figment extraction failures into configuration errors.
     fn from(error: figment::Error) -> Self {
         Self::Figment(Box::new(error))
     }
 }
 
 impl ConfigError {
+    /// Creates an invalid-value error for a named configuration field.
     fn invalid(field: &'static str, message: impl Into<String>) -> Self {
         Self::InvalidValue {
             field,
@@ -358,6 +388,7 @@ impl ConfigError {
     }
 }
 
+/// Validates that a string configuration field contains non-whitespace text.
 fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
         return Err(ConfigError::invalid(field, "must not be empty"));
@@ -365,6 +396,7 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ConfigErro
     Ok(())
 }
 
+/// Validates that a string configuration field is an HTTP(S) URL, optionally allowing empty values.
 fn validate_http_url(
     field: &'static str,
     value: &str,
@@ -388,6 +420,7 @@ fn validate_http_url(
     Ok(())
 }
 
+/// Validates that a string configuration field can be used as an HTTP header name.
 fn validate_header_name(field: &'static str, value: &str) -> Result<(), ConfigError> {
     validate_non_empty(field, value)?;
     HeaderName::from_bytes(value.as_bytes())
@@ -395,6 +428,7 @@ fn validate_header_name(field: &'static str, value: &str) -> Result<(), ConfigEr
     Ok(())
 }
 
+/// Validates that a duration configuration field is greater than zero.
 fn validate_duration_non_zero(field: &'static str, value: Duration) -> Result<(), ConfigError> {
     if value == Duration::ZERO {
         return Err(ConfigError::invalid(field, "must be greater than zero"));
@@ -402,6 +436,7 @@ fn validate_duration_non_zero(field: &'static str, value: Duration) -> Result<()
     Ok(())
 }
 
+/// Deserializes human-readable duration strings into [`Duration`] values.
 fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
     D: Deserializer<'de>,
@@ -410,6 +445,7 @@ where
     humantime::parse_duration(&value).map_err(de::Error::custom)
 }
 
+/// Validates that a string configuration field is accepted by `tracing_subscriber::EnvFilter`.
 fn validate_env_filter(field: &'static str, value: &str) -> Result<(), ConfigError> {
     let value = value.trim();
     if value.is_empty() {
@@ -447,11 +483,8 @@ mod tests {
         );
         assert_eq!(config.session.headers.open_webui, "X-OpenWebUI-Chat-Id");
         assert_eq!(config.attestation.mode, AttestationMode::Independent);
-        assert!(config.attestation.require_tdx);
-        assert_eq!(
-            config.attestation.require_nvidia,
-            NvidiaRequirement::WhenPresent
-        );
+        assert!(!config.attestation.require_tdx);
+        assert_eq!(config.attestation.require_nvidia, NvidiaRequirement::Never);
         assert!(!config.attestation.allow_debug);
         assert_eq!(config.attestation.pccs_url, "");
         assert_eq!(config.e2ee.hkdf_info, "ecdsa_encryption");

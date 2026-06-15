@@ -44,6 +44,7 @@ const TDX_REPORT_DATA_OFFSET: usize = TDX_REPORT_BODY_OFFSET + 520;
 const TDX_REPORT_DATA_LEN: usize = 64;
 const TDX_REPORT_DATA_END: usize = TDX_REPORT_DATA_OFFSET + TDX_REPORT_DATA_LEN;
 
+/// Verifies Venice model attestation evidence according to the configured policy.
 #[derive(Clone, Debug)]
 pub struct AttestationVerifier {
     policy: AttestationConfig,
@@ -51,10 +52,12 @@ pub struct AttestationVerifier {
 }
 
 impl AttestationVerifier {
+    /// Builds a verifier from proxy configuration and the Venice client used to fetch evidence.
     pub fn from_config(config: &ProxyConfig, venice_client: VeniceClient) -> Self {
         Self::new(config.attestation.clone(), venice_client)
     }
 
+    /// Builds a verifier from an attestation policy and Venice client.
     pub fn new(policy: AttestationConfig, venice_client: VeniceClient) -> Self {
         Self {
             policy,
@@ -62,6 +65,7 @@ impl AttestationVerifier {
         }
     }
 
+    /// Returns the attestation policy used by this verifier.
     pub fn policy(&self) -> &AttestationConfig {
         &self.policy
     }
@@ -88,8 +92,7 @@ impl AttestationVerifier {
         self.verify_evidence(model_id, nonce.as_str(), evidence)
     }
 
-    /// Verifies already-fetched evidence. This is public so route/session tests
-    /// can exercise policy without a live Venice request.
+    /// Verifies already-fetched evidence for a requested model and nonce.
     pub fn verify_evidence(
         &self,
         requested_model_id: &str,
@@ -105,27 +108,32 @@ impl AttestationVerifier {
     }
 }
 
+/// Fresh random nonce sent to Venice and checked against attestation evidence.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AttestationNonce(String);
 
 impl AttestationNonce {
+    /// Generates a 32-byte nonce encoded as lowercase hex.
     pub fn generate() -> Self {
         let mut bytes = [0_u8; ATTESTATION_NONCE_BYTES];
         OsRng.fill_bytes(&mut bytes);
         Self(hex::encode(bytes))
     }
 
+    /// Returns the nonce as a hex string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 impl fmt::Debug for AttestationNonce {
+    /// Formats the nonce for diagnostics.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AttestationNonce").field(&self.0).finish()
     }
 }
 
+/// Successful attestation result cached with a session and exposed through proxy metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedAttestation {
     pub model_id: String,
@@ -138,6 +146,7 @@ pub struct VerifiedAttestation {
     pub attestation_report: Value,
 }
 
+/// Summary of TDX evidence presence, local checks, and debug status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TdxVerificationSummary {
     pub present: bool,
@@ -147,6 +156,7 @@ pub struct TdxVerificationSummary {
 }
 
 impl TdxVerificationSummary {
+    /// Returns a summary representing absent TDX evidence.
     fn not_present() -> Self {
         Self {
             present: false,
@@ -157,6 +167,7 @@ impl TdxVerificationSummary {
     }
 }
 
+/// Summary of NVIDIA attestation evidence presence and verification status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvidiaVerificationSummary {
     pub present: bool,
@@ -164,6 +175,7 @@ pub struct NvidiaVerificationSummary {
 }
 
 impl NvidiaVerificationSummary {
+    /// Returns a summary representing absent NVIDIA evidence.
     fn not_present() -> Self {
         Self {
             present: false,
@@ -172,6 +184,7 @@ impl NvidiaVerificationSummary {
     }
 }
 
+/// Verification status for NVIDIA attestation evidence under the configured policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaVerificationStatus {
     NotPresent,
@@ -180,6 +193,7 @@ pub enum NvidiaVerificationStatus {
 }
 
 impl NvidiaVerificationStatus {
+    /// Returns the metadata header value for this NVIDIA verification status.
     pub fn as_header_value(self) -> &'static str {
         match self {
             Self::NotPresent => "not-present",
@@ -189,6 +203,7 @@ impl NvidiaVerificationStatus {
     }
 }
 
+/// Errors returned while fetching or validating attestation evidence.
 #[derive(Debug, Error)]
 pub enum AttestationError {
     #[error("invalid attestation request: {message}")]
@@ -212,6 +227,7 @@ pub enum AttestationError {
 }
 
 impl AttestationError {
+    /// Returns the OpenAI-compatible error type exposed for this attestation error.
     pub fn api_error_type(&self) -> &'static str {
         match self {
             Self::InvalidRequest { .. } => "invalid_request_error",
@@ -223,6 +239,7 @@ impl AttestationError {
         }
     }
 
+    /// Returns the proxy error code exposed for this attestation error.
     pub fn api_error_code(&self) -> &'static str {
         match self {
             Self::InvalidRequest { .. } => "invalid_attestation_request",
@@ -234,11 +251,13 @@ impl AttestationError {
         }
     }
 
+    /// Returns whether the error indicates a required external attestation verifier is unavailable.
     pub fn verifier_unavailable(&self) -> bool {
         matches!(self, Self::ExternalVerifierUnavailable { .. })
     }
 }
 
+/// Stable failure codes for attestation policy violations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestationFailureCode {
     UpstreamNotVerified,
@@ -254,6 +273,7 @@ pub enum AttestationFailureCode {
 }
 
 impl AttestationFailureCode {
+    /// Returns the stable string form used in proxy error responses.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::UpstreamNotVerified => "attestation_upstream_not_verified",
@@ -270,6 +290,7 @@ impl AttestationFailureCode {
     }
 }
 
+/// Validates a Venice attestation response against the expected model, nonce, and policy.
 fn verify_attestation_evidence(
     policy: &AttestationConfig,
     requested_model_id: &str,
@@ -280,6 +301,7 @@ fn verify_attestation_evidence(
 
     let evidence = evidence_object(&upstream_response)?;
     let verified = required_bool(evidence, "verified")?;
+
     if !verified {
         return policy_error(
             AttestationFailureCode::UpstreamNotVerified,
@@ -288,6 +310,7 @@ fn verify_attestation_evidence(
     }
 
     let nonce = required_string(evidence, "nonce")?;
+
     if nonce != client_nonce {
         return policy_error(
             AttestationFailureCode::NonceMismatch,
@@ -296,6 +319,7 @@ fn verify_attestation_evidence(
     }
 
     let model = required_string(evidence, "model")?;
+
     if model != requested_model_id {
         return policy_error(
             AttestationFailureCode::ModelMismatch,
@@ -315,6 +339,7 @@ fn verify_attestation_evidence(
     let signing_address = optional_non_empty_string(evidence, "signing_address")
         .map(normalize_ethereum_address)
         .transpose()?;
+
     if let Some(signing_address) = &signing_address
         && signing_address != &derived_address
     {
@@ -353,6 +378,7 @@ fn verify_attestation_evidence(
     })
 }
 
+/// Evaluates TDX evidence fields against the configured TDX policy.
 fn evaluate_tdx_policy(
     policy: &AttestationConfig,
     evidence: &serde_json::Map<String, Value>,
@@ -371,6 +397,7 @@ fn evaluate_tdx_policy(
     };
 
     let parsed = parse_tdx_quote(intel_quote)?;
+
     if parsed.tee_type != TDX_TEE_TYPE {
         return policy_error(
             AttestationFailureCode::InvalidTdxEvidence,
@@ -380,6 +407,7 @@ fn evaluate_tdx_policy(
             ),
         );
     }
+
     if parsed.debug && !policy.allow_debug {
         return policy_error(
             AttestationFailureCode::DebugModeDetected,
@@ -397,6 +425,7 @@ fn evaluate_tdx_policy(
         } else {
             "attestation.require_tdx=true requires independent DCAP/QVL quote verification; PCCS URL is configured but this v0.1 verifier has no DCAP/QVL backend linked".to_owned()
         };
+
         return Err(AttestationError::ExternalVerifierUnavailable {
             verifier: "tdx-dcap-qvl",
             message,
@@ -411,6 +440,7 @@ fn evaluate_tdx_policy(
     })
 }
 
+/// Evaluates NVIDIA evidence fields against the configured NVIDIA policy.
 fn evaluate_nvidia_policy(
     policy: &AttestationConfig,
     evidence: &serde_json::Map<String, Value>,
@@ -443,12 +473,14 @@ fn evaluate_nvidia_policy(
     }
 }
 
+/// TDX quote fields used by local policy checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedTdxQuote {
     tee_type: u32,
     debug: bool,
 }
 
+/// Parses a TDX quote string and returns the fields needed by policy evaluation.
 fn parse_tdx_quote(value: &str) -> Result<ParsedTdxQuote, AttestationError> {
     let bytes = decode_tdx_quote(value)?;
 
@@ -477,6 +509,7 @@ fn parse_tdx_quote(value: &str) -> Result<ParsedTdxQuote, AttestationError> {
     Ok(ParsedTdxQuote { tee_type, debug })
 }
 
+/// Decodes a TDX quote supplied as hex or base64 text.
 fn decode_tdx_quote(value: &str) -> Result<Vec<u8>, AttestationError> {
     let value = value.trim();
     let hex = value.strip_prefix("0x").unwrap_or(value);
@@ -495,6 +528,7 @@ fn decode_tdx_quote(value: &str) -> Result<Vec<u8>, AttestationError> {
         })
 }
 
+/// Verifies that TDX report data binds to the attested signing key or signing address.
 fn verify_reportdata_binding(
     reportdata_hex: &str,
     signing_key: &str,
@@ -538,6 +572,7 @@ fn verify_reportdata_binding(
     )
 }
 
+/// Returns the attestation object from either a wrapped or direct upstream response.
 fn evidence_object(response: &Value) -> Result<&serde_json::Map<String, Value>, AttestationError> {
     if let Value::Object(root) = response {
         if let Some(Value::Object(attestation)) = root.get("attestation") {
@@ -554,6 +589,7 @@ fn evidence_object(response: &Value) -> Result<&serde_json::Map<String, Value>, 
     })
 }
 
+/// Reads a required boolean field from an attestation evidence object.
 fn required_bool(
     object: &serde_json::Map<String, Value>,
     field: &'static str,
@@ -567,6 +603,7 @@ fn required_bool(
     }
 }
 
+/// Reads a required non-empty string field from an attestation evidence object.
 fn required_string<'a>(
     object: &'a serde_json::Map<String, Value>,
     field: &'static str,
@@ -583,6 +620,7 @@ fn required_string<'a>(
     }
 }
 
+/// Reads an optional string field and ignores missing, null, or empty values.
 fn optional_non_empty_string<'a>(
     object: &'a serde_json::Map<String, Value>,
     field: &'static str,
@@ -593,6 +631,7 @@ fn optional_non_empty_string<'a>(
     }
 }
 
+/// Reads the top-level debug flag from either supported attestation evidence field name.
 fn top_level_debug(object: &serde_json::Map<String, Value>) -> Option<bool> {
     object
         .get("debug")
@@ -600,6 +639,7 @@ fn top_level_debug(object: &serde_json::Map<String, Value>) -> Option<bool> {
         .and_then(Value::as_bool)
 }
 
+/// Parses a secp256k1 public key hex string and returns uncompressed SEC1 lowercase hex.
 fn normalize_public_key_hex(value: &str) -> Result<String, AttestationError> {
     let value = value.trim().strip_prefix("0x").unwrap_or(value.trim());
     let mut bytes = hex::decode(value).map_err(|error| AttestationError::PolicyViolation {
@@ -632,6 +672,7 @@ fn normalize_public_key_hex(value: &str) -> Result<String, AttestationError> {
     Ok(hex::encode(public_key.to_encoded_point(false).as_bytes()))
 }
 
+/// Derives the lowercase Ethereum address for an uncompressed secp256k1 public key hex string.
 fn ethereum_address_from_uncompressed_key_hex(value: &str) -> Result<String, AttestationError> {
     let bytes = hex::decode(value).map_err(|error| AttestationError::PolicyViolation {
         code: AttestationFailureCode::InvalidSigningKey,
@@ -648,6 +689,7 @@ fn ethereum_address_from_uncompressed_key_hex(value: &str) -> Result<String, Att
     Ok(format!("0x{}", hex::encode(&hash[12..])))
 }
 
+/// Validates an Ethereum address string and returns it in lowercase `0x` form.
 fn normalize_ethereum_address(value: &str) -> Result<String, AttestationError> {
     let value = value.trim();
     let stripped = value.strip_prefix("0x").unwrap_or(value);
@@ -660,6 +702,7 @@ fn normalize_ethereum_address(value: &str) -> Result<String, AttestationError> {
     Ok(format!("0x{}", stripped.to_ascii_lowercase()))
 }
 
+/// Validates that a nonce is the expected number of hex characters.
 fn validate_nonce_hex(value: &str) -> Result<(), AttestationError> {
     if value.len() != ATTESTATION_NONCE_HEX_CHARS {
         return Err(AttestationError::InvalidRequest {
@@ -676,6 +719,7 @@ fn validate_nonce_hex(value: &str) -> Result<(), AttestationError> {
     Ok(())
 }
 
+/// Returns an attestation policy-violation error with the supplied code and message.
 fn policy_error<T>(
     code: AttestationFailureCode,
     message: impl Into<String>,

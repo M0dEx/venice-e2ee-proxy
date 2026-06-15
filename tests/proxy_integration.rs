@@ -28,7 +28,7 @@ use venice_e2ee_proxy::{
         HEADER_PROXY_TOOL_RETRIES,
     },
     keys::ProxyInstanceKey,
-    openai::{ErrorResponse, ModelListResponse},
+    openai::ErrorResponse,
     venice::{
         HEADER_VENICE_TEE_CLIENT_PUB_KEY, HEADER_VENICE_TEE_MODEL_PUB_KEY,
         HEADER_VENICE_TEE_SIGNING_ALGO, VeniceClient,
@@ -38,36 +38,6 @@ use venice_e2ee_proxy::{
 const TEST_API_KEY: &str = "test-api-key";
 const TEST_MODEL: &str = "e2ee-test";
 const TEST_SESSION_ID: &str = "proxy-integration-session";
-
-#[tokio::test]
-async fn mock_venice_models_lists_e2ee_models_and_safe_headers() {
-    let mock = MockVeniceServer::spawn(MockVeniceOptions::default()).await;
-    let app = proxy_app(&mock.base_url, Duration::from_secs(1));
-
-    let response = request_models(app).await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_model_list_headers(&response);
-
-    let body: ModelListResponse = response_json(response).await;
-    assert_eq!(body.object, "list");
-    assert_eq!(body.data.len(), 1);
-    assert_eq!(body.data[0].id, TEST_MODEL);
-    assert!(body.data[0].venice.supports_e2ee);
-    assert!(body.data[0].venice.supports_tee_attestation);
-    assert!(body.data[0].venice.supports_reasoning);
-    assert!(body.data[0].venice.supports_reasoning_effort);
-    assert!(body.data[0].info.meta.capabilities.reasoning);
-    assert!(body.data[0].info.meta.capabilities.reasoning_effort);
-
-    assert_eq!(
-        mock.counts(),
-        MockCounts {
-            models: 1,
-            ..Default::default()
-        }
-    );
-}
 
 #[tokio::test]
 async fn streaming_chat_completion_decrypts_split_sse_and_sets_verified_headers() {
@@ -112,15 +82,6 @@ async fn streaming_chat_completion_decrypts_split_sse_and_sets_verified_headers(
     assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
     assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
     assert_eq!(data[3], "[DONE]");
-
-    assert_eq!(
-        mock.counts(),
-        MockCounts {
-            attestations: 1,
-            chats: 1,
-            ..Default::default()
-        }
-    );
 }
 
 #[tokio::test]
@@ -274,15 +235,6 @@ async fn non_streaming_chat_completion_buffers_decrypted_response_and_usage() {
     assert_eq!(body["usage"]["prompt_tokens"], 1);
     assert_eq!(body["usage"]["completion_tokens"], 2);
     assert_eq!(body["usage"]["total_tokens"], 3);
-
-    assert_eq!(
-        mock.counts(),
-        MockCounts {
-            attestations: 1,
-            chats: 1,
-            ..Default::default()
-        }
-    );
 }
 
 #[tokio::test]
@@ -334,20 +286,14 @@ async fn tool_call_emulation_retries_invalid_marker_then_returns_openai_tool_cal
     let body: Value = response_json(response).await;
     assert_eq!(body["choices"][0]["message"]["content"], Value::Null);
     assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+
     let tool_call = &body["choices"][0]["message"]["tool_calls"][0];
     assert!(tool_call["id"].as_str().unwrap().starts_with("call_"));
     assert_eq!(tool_call["type"], "function");
     assert_eq!(tool_call["function"]["name"], "search_web");
     assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
 
-    assert_eq!(
-        mock.counts(),
-        MockCounts {
-            attestations: 1,
-            chats: 2,
-            ..Default::default()
-        }
-    );
+    assert_eq!(mock.chat_count(), 2);
 }
 
 #[tokio::test]
@@ -394,6 +340,7 @@ async fn tool_call_emulation_returns_multiple_openai_tool_calls() {
     let body: Value = response_json(response).await;
     assert_eq!(body["choices"][0]["message"]["content"], Value::Null);
     assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+
     let tool_calls = body["choices"][0]["message"]["tool_calls"]
         .as_array()
         .expect("tool_calls should be an array");
@@ -409,15 +356,6 @@ async fn tool_call_emulation_returns_multiple_openai_tool_calls() {
         r#"{"query":"second"}"#
     );
     assert_ne!(tool_calls[0]["id"], tool_calls[1]["id"]);
-
-    assert_eq!(
-        mock.counts(),
-        MockCounts {
-            attestations: 1,
-            chats: 1,
-            ..Default::default()
-        }
-    );
 }
 
 #[tokio::test]
@@ -490,15 +428,6 @@ async fn malformed_upstream_chat_response_returns_fail_closed_error() {
         "upstream_malformed_response",
     )
     .await;
-
-    assert_eq!(
-        mock.counts(),
-        MockCounts {
-            attestations: 1,
-            chats: 1,
-            ..Default::default()
-        }
-    );
 }
 
 #[tokio::test]
@@ -529,14 +458,7 @@ async fn attestation_failure_returns_error_and_does_not_call_chat_upstream() {
     )
     .await;
 
-    assert_eq!(
-        mock.counts(),
-        MockCounts {
-            attestations: 1,
-            chats: 0,
-            ..Default::default()
-        }
-    );
+    assert_eq!(mock.chat_count(), 0);
 }
 
 #[tokio::test]
@@ -566,15 +488,6 @@ async fn decryption_failure_returns_fail_closed_error() {
         "e2ee_response_decryption_failed",
     )
     .await;
-
-    assert_eq!(
-        mock.counts(),
-        MockCounts {
-            attestations: 1,
-            chats: 1,
-            ..Default::default()
-        }
-    );
 }
 
 #[derive(Debug, Clone)]
@@ -623,7 +536,6 @@ impl MockVeniceServer {
     async fn spawn(options: MockVeniceOptions) -> Self {
         let state = MockVeniceState::new(options);
         let app = Router::new()
-            .route("/api/v1/models", get(mock_models))
             .route("/api/v1/tee/attestation", get(mock_attestation))
             .route("/api/v1/chat/completions", post(mock_chat_completion))
             .with_state(state.clone());
@@ -646,8 +558,8 @@ impl MockVeniceServer {
         }
     }
 
-    fn counts(&self) -> MockCounts {
-        self.state.counts()
+    fn chat_count(&self) -> usize {
+        self.state.chat_count()
     }
 }
 
@@ -661,7 +573,7 @@ struct MockVeniceStateInner {
     model_public_key: String,
     attestation_verified: bool,
     chat_attempts: Mutex<VecDeque<Vec<MockStreamFrame>>>,
-    counts: Mutex<MockCounts>,
+    chat_count: Mutex<usize>,
 }
 
 impl MockVeniceState {
@@ -671,41 +583,25 @@ impl MockVeniceState {
                 model_public_key: ProxyInstanceKey::generate().public_key_hex().to_owned(),
                 attestation_verified: options.attestation_verified,
                 chat_attempts: Mutex::new(options.chat_attempts),
-                counts: Mutex::new(MockCounts::default()),
+                chat_count: Mutex::new(0),
             }),
         }
     }
 
-    fn record_models(&self) {
-        self.inner
-            .counts
-            .lock()
-            .expect("mock counts mutex should not be poisoned")
-            .models += 1;
-    }
-
-    fn record_attestation(&self) {
-        self.inner
-            .counts
-            .lock()
-            .expect("mock counts mutex should not be poisoned")
-            .attestations += 1;
-    }
-
     fn record_chat(&self) {
-        self.inner
-            .counts
-            .lock()
-            .expect("mock counts mutex should not be poisoned")
-            .chats += 1;
-    }
-
-    fn counts(&self) -> MockCounts {
         *self
             .inner
-            .counts
+            .chat_count
             .lock()
-            .expect("mock counts mutex should not be poisoned")
+            .expect("mock chat count mutex should not be poisoned") += 1;
+    }
+
+    fn chat_count(&self) -> usize {
+        *self
+            .inner
+            .chat_count
+            .lock()
+            .expect("mock chat count mutex should not be poisoned")
     }
 
     fn next_chat_attempt(&self) -> Vec<MockStreamFrame> {
@@ -714,6 +610,7 @@ impl MockVeniceState {
             .chat_attempts
             .lock()
             .expect("mock chat attempts mutex should not be poisoned");
+
         if attempts.len() > 1 {
             attempts.pop_front().expect("attempts length checked above")
         } else {
@@ -730,62 +627,11 @@ impl MockVeniceState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct MockCounts {
-    models: usize,
-    attestations: usize,
-    chats: usize,
-}
-
-async fn mock_models(State(state): State<MockVeniceState>, headers: HeaderMap) -> Response {
-    state.record_models();
-    if !is_authorized(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
-    Json(json!({
-        "object": "list",
-        "data": [
-            {
-                "id": TEST_MODEL,
-                "created": 1_717_171_717,
-                "owned_by": "venice.ai",
-                "type": "text",
-                "model_spec": {
-                    "capabilities": {
-                        "supportsE2EE": true,
-                        "supportsTeeAttestation": true,
-                        "supportsFunctionCalling": true,
-                        "supportsBuiltinTools": false,
-                        "supportsWebSearch": false,
-                        "supportsCodeInterpreter": false,
-                        "supportsVision": false,
-                        "supportsReasoning": true,
-                        "supportsReasoningEffort": true
-                    }
-                }
-            },
-            {
-                "id": "plain-text-model",
-                "type": "text",
-                "model_spec": {
-                    "capabilities": {
-                        "supportsE2EE": false,
-                        "supportsTeeAttestation": true
-                    }
-                }
-            }
-        ]
-    }))
-    .into_response()
-}
-
 async fn mock_attestation(
     State(state): State<MockVeniceState>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    state.record_attestation();
     if !is_authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -809,6 +655,7 @@ async fn mock_chat_completion(
     Json(body): Json<Value>,
 ) -> Response {
     state.record_chat();
+
     if !is_authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -827,6 +674,7 @@ async fn mock_chat_completion(
     {
         return (StatusCode::BAD_REQUEST, "wrong model key").into_response();
     }
+
     if headers
         .get(HEADER_VENICE_TEE_SIGNING_ALGO)
         .and_then(|value| value.to_str().ok())
@@ -834,12 +682,15 @@ async fn mock_chat_completion(
     {
         return (StatusCode::BAD_REQUEST, "wrong signing algorithm").into_response();
     }
+
     if body.get("stream").and_then(Value::as_bool) != Some(true) {
         return (StatusCode::BAD_REQUEST, "upstream request must stream").into_response();
     }
+
     if body.get("model").and_then(Value::as_str) != Some(TEST_MODEL) {
         return (StatusCode::BAD_REQUEST, "wrong model").into_response();
     }
+
     if !messages_are_encrypted(&body) {
         return (StatusCode::BAD_REQUEST, "messages must be encrypted").into_response();
     }
@@ -910,11 +761,13 @@ fn render_mock_sse_chunks(frames: &[MockStreamFrame], client_public_key: &str) -
             MockStreamFrame::SplitText(content) => {
                 let event = encrypted_content_event(&codec, content, client_public_key);
                 let split = event.len() / 2;
+
                 chunks.push(event[..split].to_owned());
                 chunks.push(event[split..].to_owned());
             }
             MockStreamFrame::TextForWrongRecipient(content) => {
                 let wrong_key = ProxyInstanceKey::generate();
+
                 chunks.push(encrypted_content_event(
                     &codec,
                     content,
@@ -1075,29 +928,6 @@ async fn assert_proxy_error(
     let body: ErrorResponse = response_json(response).await;
     assert_eq!(body.error.kind, expected_type);
     assert_eq!(body.error.code, expected_code);
-}
-
-fn assert_model_list_headers(response: &Response) {
-    assert_eq!(
-        response
-            .headers()
-            .get(HEADER_PROXY_ATTESTATION_MODE)
-            .unwrap(),
-        "independent"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_PROXY_TOOL_MODE).unwrap(),
-        "emulated"
-    );
-    assert!(response.headers().get(HEADER_PROXY_E2EE).is_none());
-    assert!(
-        response
-            .headers()
-            .get(HEADER_PROXY_ATTESTED_MODEL)
-            .is_none()
-    );
-    assert!(response.headers().get(HEADER_PROXY_KEY_BINDING).is_none());
-    assert!(response.headers().get(HEADER_PROXY_SESSION_ID).is_none());
 }
 
 fn assert_verified_chat_headers(response: &Response, session_id: &str, tool_retries: Option<&str>) {

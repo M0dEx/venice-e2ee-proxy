@@ -13,6 +13,7 @@ use venice_e2ee_proxy::{
     venice::VeniceClientError,
 };
 
+/// Command-line arguments for starting the proxy process.
 #[derive(Debug, Parser)]
 #[command(
     name = "venice-e2ee-proxy",
@@ -25,6 +26,7 @@ struct Cli {
 
 type EnvFilterReloadHandle = reload::Handle<EnvFilter, Registry>;
 
+/// Starts the async runtime, initializes tracing, and exits with a non-zero status on startup errors.
 #[tokio::main]
 async fn main() {
     let tracing_reload_handle = init_tracing();
@@ -35,6 +37,7 @@ async fn main() {
     }
 }
 
+/// Initializes stdout tracing and returns a handle that can replace the filter after config loads.
 fn init_tracing() -> EnvFilterReloadHandle {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let (env_filter, reload_handle) = reload::Layer::new(env_filter);
@@ -47,6 +50,7 @@ fn init_tracing() -> EnvFilterReloadHandle {
     reload_handle
 }
 
+/// Applies the configured tracing filter string to an existing tracing reload handle.
 fn configure_tracing(reload_handle: &EnvFilterReloadHandle, level: &str) -> Result<(), RunError> {
     let env_filter = EnvFilter::try_new(level).map_err(|source| RunError::TracingFilter {
         message: source.to_string(),
@@ -59,6 +63,7 @@ fn configure_tracing(reload_handle: &EnvFilterReloadHandle, level: &str) -> Resu
     Ok(())
 }
 
+/// Loads configuration, builds the HTTP router, binds the configured listener, and serves requests.
 async fn run(tracing_reload_handle: &EnvFilterReloadHandle) -> Result<(), RunError> {
     let cli = Cli::parse();
     let config = ProxyConfig::load_from_path(&cli.config)?;
@@ -75,6 +80,7 @@ async fn run(tracing_reload_handle: &EnvFilterReloadHandle) -> Result<(), RunErr
     Ok(())
 }
 
+/// Startup errors returned while loading configuration, building the router, or serving HTTP traffic.
 #[derive(Debug, Error)]
 enum RunError {
     #[error(transparent)]

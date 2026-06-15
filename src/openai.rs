@@ -15,6 +15,7 @@ pub struct ModelListResponse {
 }
 
 impl ModelListResponse {
+    /// Builds a model-list response from already-normalized model objects.
     pub fn new(data: Vec<ModelObject>) -> Self {
         Self {
             object: "list".to_owned(),
@@ -37,6 +38,7 @@ pub struct ModelObject {
 }
 
 impl ModelObject {
+    /// Builds an OpenAI-compatible model object with mirrored `id` and `name` fields.
     pub fn new(
         id: impl Into<String>,
         created: i64,
@@ -60,16 +62,19 @@ impl ModelObject {
     }
 }
 
+/// OpenAI-compatible model information wrapper containing model metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub meta: ModelMeta,
 }
 
+/// OpenAI-compatible model metadata containing capability flags.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMeta {
     pub capabilities: ModelCapabilities,
 }
 
+/// Capability flags exposed in the OpenAI-compatible model metadata.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     pub function_calling: bool,
@@ -81,6 +86,7 @@ pub struct ModelCapabilities {
     pub reasoning_effort: bool,
 }
 
+/// Venice-specific model metadata preserved alongside the OpenAI-compatible model object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VeniceModelMetadata {
     pub id: String,
@@ -95,6 +101,7 @@ pub struct VeniceModelMetadata {
 }
 
 impl VeniceModelMetadata {
+    /// Builds Venice metadata from the upstream model id and supported feature flags.
     pub fn new(
         id: impl Into<String>,
         supports_e2ee: bool,
@@ -119,6 +126,7 @@ pub struct ErrorResponse {
 }
 
 impl ErrorResponse {
+    /// Builds an OpenAI-compatible error response from message, type, and code strings.
     pub fn new(
         message: impl Into<String>,
         error_type: impl Into<String>,
@@ -134,7 +142,7 @@ impl ErrorResponse {
     }
 }
 
-/// OpenAI-compatible error object.
+/// OpenAI-compatible error object containing the client-facing message, type, and code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorObject {
     pub message: String,

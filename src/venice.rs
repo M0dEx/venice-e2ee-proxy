@@ -26,6 +26,7 @@ pub const HEADER_VENICE_TEE_CLIENT_PUB_KEY: &str = "X-Venice-TEE-Client-Pub-Key"
 pub const HEADER_VENICE_TEE_MODEL_PUB_KEY: &str = "X-Venice-TEE-Model-Pub-Key";
 pub const HEADER_VENICE_TEE_SIGNING_ALGO: &str = "X-Venice-TEE-Signing-Algo";
 
+/// Authenticated HTTP client for Venice model, chat, and attestation endpoints.
 #[derive(Clone)]
 pub struct VeniceClient {
     http: reqwest::Client,
@@ -35,6 +36,7 @@ pub struct VeniceClient {
 }
 
 impl VeniceClient {
+    /// Builds a Venice client from proxy configuration and the configured API key.
     pub fn from_config(config: &ProxyConfig) -> Result<Self, VeniceClientError> {
         let api_key = config.venice_api_key()?;
         Self::new(
@@ -44,6 +46,7 @@ impl VeniceClient {
         )
     }
 
+    /// Builds a Venice client from a base API URL, bearer token, and request timeout.
     pub fn new(
         base_url: impl AsRef<str>,
         api_key: impl Into<String>,
@@ -64,6 +67,7 @@ impl VeniceClient {
         })
     }
 
+    /// Fetches Venice models and returns only E2EE/TEE-supported models in OpenAI shape.
     pub async fn list_models(&self) -> Result<ModelListResponse, VeniceClientError> {
         let url = self.models_url()?;
         let response = self
@@ -75,6 +79,7 @@ impl VeniceClient {
             .send()
             .await
             .map_err(VeniceClientError::request_failure)?;
+
         let response = Self::check_status(response)?;
 
         let body = response
@@ -84,6 +89,7 @@ impl VeniceClient {
         parse_model_list_response(&body)
     }
 
+    /// Sends an encrypted chat request to Venice and returns the upstream SSE response.
     pub async fn create_chat_completion_stream(
         &self,
         request: &VeniceE2eeChatRequest,
@@ -108,6 +114,7 @@ impl VeniceClient {
         Self::check_status(response)
     }
 
+    /// Fetches attestation evidence for a model and nonce as raw JSON.
     pub async fn fetch_attestation_evidence(
         &self,
         model_id: &str,
@@ -123,6 +130,7 @@ impl VeniceClient {
             .send()
             .await
             .map_err(VeniceClientError::request_failure)?;
+
         let response = Self::check_status(response)?;
 
         response
@@ -134,35 +142,43 @@ impl VeniceClient {
     /// Maps unauthorized/forbidden and other non-success statuses to errors.
     fn check_status(response: reqwest::Response) -> Result<reqwest::Response, VeniceClientError> {
         let status = response.status();
+
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(VeniceClientError::Authentication {
                 status: status.as_u16(),
             });
         }
+
         if !status.is_success() {
             return Err(VeniceClientError::UpstreamStatus {
                 status: status.as_u16(),
             });
         }
+
         Ok(response)
     }
 
+    /// Returns the Venice models endpoint URL.
     fn models_url(&self) -> Result<Url, VeniceClientError> {
         self.endpoint_url("models")
     }
 
+    /// Returns the Venice chat completions endpoint URL.
     fn chat_completions_url(&self) -> Result<Url, VeniceClientError> {
         self.endpoint_url("chat/completions")
     }
 
+    /// Returns the Venice attestation endpoint URL for a model and nonce.
     fn attestation_url(&self, model_id: &str, nonce: &str) -> Result<Url, VeniceClientError> {
         let mut url = self.endpoint_url("tee/attestation")?;
         url.query_pairs_mut()
             .append_pair("model", model_id)
             .append_pair("nonce", nonce);
+
         Ok(url)
     }
 
+    /// Joins an endpoint path onto the configured Venice base URL.
     fn endpoint_url(&self, path: &str) -> Result<Url, VeniceClientError> {
         self.base_url
             .join(path)
@@ -173,6 +189,7 @@ impl VeniceClient {
 }
 
 impl fmt::Debug for VeniceClient {
+    /// Formats client metadata while redacting the API key.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VeniceClient")
             .field("base_url", &self.base_url)
@@ -181,6 +198,7 @@ impl fmt::Debug for VeniceClient {
     }
 }
 
+/// Parses a Venice base URL and ensures relative endpoint joins work consistently.
 fn parse_base_url(value: &str) -> Result<Url, VeniceClientError> {
     let mut url = Url::parse(value).map_err(|source| VeniceClientError::InvalidBaseUrl {
         base_url: value.to_owned(),
@@ -195,12 +213,14 @@ fn parse_base_url(value: &str) -> Result<Url, VeniceClientError> {
     Ok(url)
 }
 
+/// Parses a Venice model-list payload and maps it into an OpenAI-compatible response.
 fn parse_model_list_response(body: &[u8]) -> Result<ModelListResponse, VeniceClientError> {
     let payload: VeniceModelListPayload =
         serde_json::from_slice(body).map_err(VeniceClientError::malformed_payload)?;
     Ok(payload.into_openai_model_list())
 }
 
+/// Errors returned by the Venice upstream client.
 #[derive(Debug, Error)]
 pub enum VeniceClientError {
     #[error(transparent)]
@@ -226,6 +246,7 @@ pub enum VeniceClientError {
 }
 
 impl VeniceClientError {
+    /// Returns the OpenAI-compatible error type exposed for this Venice client error.
     pub fn api_error_type(&self) -> &'static str {
         match self {
             Self::Config(_)
@@ -241,6 +262,7 @@ impl VeniceClientError {
         }
     }
 
+    /// Returns the proxy error code exposed for this Venice client error.
     pub fn api_error_code(&self) -> &'static str {
         match self {
             Self::Config(ConfigError::MissingApiKey) => "venice_api_key_missing",
@@ -258,12 +280,14 @@ impl VeniceClientError {
         }
     }
 
+    /// Converts an HTTP client builder error into a Venice client error.
     fn client_build(source: reqwest::Error) -> Self {
         Self::ClientBuild {
             message: source.to_string(),
         }
     }
 
+    /// Converts a request failure into timeout or generic upstream request errors.
     fn request_failure(source: reqwest::Error) -> Self {
         if source.is_timeout() {
             Self::Timeout
@@ -274,12 +298,14 @@ impl VeniceClientError {
         }
     }
 
+    /// Converts a model-list JSON parse error into a malformed-payload error.
     fn malformed_payload(source: serde_json::Error) -> Self {
         Self::MalformedPayload {
             message: source.to_string(),
         }
     }
 
+    /// Converts an attestation JSON parse error into a malformed-attestation error.
     fn malformed_attestation_payload(source: reqwest::Error) -> Self {
         Self::MalformedAttestationPayload {
             message: source.to_string(),
@@ -287,12 +313,14 @@ impl VeniceClientError {
     }
 }
 
+/// Raw Venice model-list response payload.
 #[derive(Debug, Deserialize)]
 struct VeniceModelListPayload {
     data: Vec<VeniceModel>,
 }
 
 impl VeniceModelListPayload {
+    /// Converts raw Venice models into a filtered OpenAI-compatible model list.
     fn into_openai_model_list(self) -> ModelListResponse {
         let data = self
             .data
@@ -304,6 +332,7 @@ impl VeniceModelListPayload {
     }
 }
 
+/// Raw Venice model object used for OpenAI-compatible model-list mapping.
 #[derive(Debug, Deserialize)]
 struct VeniceModel {
     id: String,
@@ -317,6 +346,7 @@ struct VeniceModel {
 }
 
 impl VeniceModel {
+    /// Converts a supported Venice text/E2EE/TEE model into an OpenAI model object.
     fn into_openai_model_if_supported(self) -> Option<ModelObject> {
         let capabilities = self.model_spec.capabilities;
         if self.model_type != "text"
@@ -345,11 +375,13 @@ impl VeniceModel {
     }
 }
 
+/// Raw Venice model specification containing capability metadata.
 #[derive(Debug, Deserialize)]
 struct VeniceModelSpec {
     capabilities: VeniceCapabilities,
 }
 
+/// Raw Venice capability flags used to decide model support and OpenAI metadata.
 #[derive(Debug, Deserialize)]
 struct VeniceCapabilities {
     #[serde(rename = "supportsE2EE")]
@@ -373,6 +405,7 @@ struct VeniceCapabilities {
 }
 
 impl VeniceCapabilities {
+    /// Maps Venice capability flags into the OpenAI-compatible capability object.
     fn to_openai_capabilities(&self) -> ModelCapabilities {
         let web_search = self.supports_web_search.unwrap_or(false);
         let code_interpreter = self.supports_code_interpreter.unwrap_or(false);

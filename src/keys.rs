@@ -18,24 +18,28 @@ pub struct ProxyInstanceKey {
     inner: Arc<ProxyInstanceKeyInner>,
 }
 
+/// Shared key material stored behind [`ProxyInstanceKey`] clones.
 struct ProxyInstanceKeyInner {
-    // Stored for E2EE response decryption while the public key is sent upstream.
     private_key: ProxyInstancePrivateKey,
     public_key_hex: String,
 }
 
+/// Redacted, zeroizing wrapper around the proxy instance private key.
 struct ProxyInstancePrivateKey(SecretKey);
 
 impl ProxyInstancePrivateKey {
+    /// Wraps a secp256k1 private key for redacted debug output and zeroizing drop behavior.
     fn new(private_key: SecretKey) -> Self {
         Self(private_key)
     }
 
+    /// Returns the matching uncompressed SEC1 public key as lowercase hex.
     fn public_key_hex(&self) -> String {
         let public_key = self.0.public_key();
         hex::encode(public_key.to_encoded_point(false).as_bytes())
     }
 
+    /// Returns the wrapped private key for local E2EE response decryption.
     fn secret_key(&self) -> &SecretKey {
         &self.0
     }
@@ -44,6 +48,7 @@ impl ProxyInstancePrivateKey {
 impl ZeroizeOnDrop for ProxyInstancePrivateKey {}
 
 impl fmt::Debug for ProxyInstancePrivateKey {
+    /// Formats the private key wrapper without exposing key material.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("[redacted]")
     }
@@ -56,13 +61,14 @@ impl ProxyInstanceKey {
         Self::from_private_key(private_key)
     }
 
-    /// Applies `keys.generate_proxy_instance_key_on_startup`.
+    /// Generates a key when `keys.generate_proxy_instance_key_on_startup` is enabled.
     pub fn generate_from_config(config: &KeysConfig) -> Option<Self> {
         config
             .generate_proxy_instance_key_on_startup
             .then(Self::generate)
     }
 
+    /// Builds proxy instance key state from an existing private key.
     fn from_private_key(private_key: SecretKey) -> Self {
         let private_key = ProxyInstancePrivateKey::new(private_key);
         let public_key_hex = private_key.public_key_hex();
@@ -82,6 +88,7 @@ impl ProxyInstanceKey {
         &self.inner.public_key_hex
     }
 
+    /// Returns the private key used to decrypt Venice E2EE response chunks.
     #[allow(dead_code)]
     pub(crate) fn private_key(&self) -> &SecretKey {
         self.inner.private_key.secret_key()
@@ -89,6 +96,7 @@ impl ProxyInstanceKey {
 }
 
 impl fmt::Debug for ProxyInstanceKey {
+    /// Formats key metadata while redacting private key material.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyInstanceKey")
             .field("private_key", &"[redacted]")

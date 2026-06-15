@@ -1,73 +1,192 @@
 # Venice E2EE OpenAI Proxy
 
-Local OpenAI-compatible proxy for Venice.AI E2EE models.
+A local OpenAI-compatible proxy for Venice.ai E2EE models.
 
-The repository implements a local HTTP proxy shell, typed configuration loading, route registration, shared OpenAI-style errors, safe response-header helpers, the Venice HTTP client, Venice model mapping, `GET /v1/models`, proxy key/session lifecycle, the Venice E2EE codec, attestation fetch/policy checks, request-side chat normalization/E2EE request construction, streaming and buffered non-streaming encrypted chat, tool-call emulation backed by vLLM's vllm-tool-parser Hermes parser with lenient recovery, and mocked proxy integration tests.
+It lets OpenAI-style clients call Venice E2EE chat models without learning Venice's TEE/E2EE request format. The proxy accepts normal `/v1/chat/completions` requests, verifies the model attestation envelope, encrypts the prompt for Venice, sends the request upstream, decrypts the response, and returns OpenAI-shaped JSON or SSE.
 
-## Stack
+The Venice API key lives on the proxy. Clients talk to the proxy as if it were an OpenAI-compatible base URL.
 
-- Language/runtime: Rust, using the Cargo package manager.
-- HTTP/runtime: async Rust with `tokio` and `axum` for the OpenAI-compatible HTTP server.
-- Upstream/client direction: typed JSON with `serde`, `reqwest` for Venice HTTP calls, and `toml`/environment configuration.
-- Crate layout: one binary entrypoint in `src/main.rs` plus a library surface in `src/lib.rs` for implementation modules.
-- Dependency policy: keep dependencies minimal and add new crates only when they support implemented behavior.
+## Why this exists
 
-## Commands
+Venice E2EE is useful, but it is not a drop-in OpenAI endpoint:
 
-Use direct Cargo commands only.
+- requests need Venice TEE headers and encrypted message content
+- responses arrive as encrypted SSE chunks
+- model attestation has to be fetched and checked before key use
+- E2EE models do not expose native server-side OpenAI tool calls, because the tool definitions are encrypted
 
-| Purpose | Command |
-| --- | --- |
-| Install/fetch dependencies | `cargo fetch` |
-| Local development entrypoint | `VENICE_E2EE_PROXY__VENICE__API_KEY=... cargo run -- config/default.toml` |
-| Local development entrypoint with custom config | `VENICE_E2EE_PROXY__VENICE__API_KEY=... cargo run -- path/to/config.toml` |
-| Build container image | `docker build -t venice-e2ee-proxy:local .` |
-| Run container image | `docker run --rm -p 8080:8080 -e VENICE_E2EE_PROXY__VENICE__API_KEY=... venice-e2ee-proxy:local` |
-| Format code | `cargo fmt` |
-| Check formatting | `cargo fmt --check` |
-| Lint | `cargo clippy --all-targets --all-features -- -D warnings` |
-| Typecheck | `cargo check --all-targets --all-features` |
-| Unit tests | `cargo test --lib` |
-| Mocked models integration tests | `cargo test --test models` |
-| Mocked proxy integration tests | `cargo test --test proxy_integration` |
-| All tests | `cargo test --all-targets --all-features` |
-| Baseline validation | Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` |
+This proxy handles that glue locally.
 
-The proxy requires a TOML config path. Configure the Venice API key either as `venice.api_key` in TOML or with the Figment environment override `VENICE_E2EE_PROXY__VENICE__API_KEY`. Configure stdout tracing with `logging.level`; it accepts simple levels like `info`/`debug` or full tracing filter directives like `venice_e2ee_proxy=debug,tower_http=warn`, and can be overridden with `VENICE_E2EE_PROXY__LOGGING__LEVEL`. Duration settings use human-readable strings like `"10s"`, `"10m"`, or `"1h"` for fields such as `venice.request_timeout`, `session.idle_ttl`, and `tools.tool_call_marker_timeout`. The checked-in `config/default.toml` exposes all default values and is copied into the image at `/etc/venice-e2ee-proxy/config.toml`; mount over that path to provide a container config file. Use direct Cargo commands only; this project intentionally does not use a Makefile.
+The main extra feature is tool-call emulation. When a client sends OpenAI `tools`, the proxy adds a model-specific controller prompt, decrypts the model output, parses tool calls with `vllm-tool-parser`, validates the function name and JSON arguments against the requested tools, and returns OpenAI-style `tool_calls`.
 
+Prompt/parser formats are selected by model id:
 
-## Module boundaries
+- GLM models: GLM XML format
+- Qwen models: Qwen XML-wrapped JSON format
+- everything else: Hermes-style JSON format
 
-The module boundaries are:
+This is not the same as native upstream function calling, but it makes common OpenAI tool clients usable with Venice E2EE models.
 
-- `src/config`: configuration loading and validation.
-- `src/http`: HTTP server, route wiring, shared headers, and route errors.
-- `src/venice`: Venice upstream API client and model mapping.
-- `src/keys`: startup proxy-instance key management.
-- `src/sessions`: per-agent-session lifecycle and attestation/model-key state.
-- `src/e2ee`: Venice E2EE encryption/decryption codec.
-- `src/attestation`: attestation fetch, verification policy, and fail-closed checks.
-- `src/openai`: OpenAI-compatible request/response formatting.
-- `src/tools`: OpenAI-style tool-call emulation.
+## What is supported
 
-Implementation should continue using these modules rather than creating parallel subsystems.
+Endpoints:
 
-## Attestation v0.1 notes
+- `GET /v1/models`
+- `POST /v1/chat/completions`
 
-- `src/attestation` generates a fresh 32-byte nonce and fetches `/tee/attestation` per verification call; it does not maintain an internal cache. Successful results are intended to be cached only by session state according to the session TTL/request limits.
-- Basic envelope checks, secp256k1 signing-key normalization, Ethereum-style signing-address checks, debug-policy gates, and TDX/NVIDIA policy surfaces are implemented fail-closed.
-- Full Intel DCAP/QVL and NVIDIA NRAS cryptographic verifier backends are not linked in v0.1. When `attestation.require_tdx = true` or NVIDIA evidence is required/present under verification policy, the verifier returns a structured `attestation_verifier_unavailable` error rather than allowing encrypted chat.
-- Measurement allowlists are intentionally not implemented for v0.1.
+`/v1/models` proxies Venice's model list and only returns text models that advertise both E2EE and TEE attestation support.
 
-## Tests
+`/v1/chat/completions` supports:
 
-- Unit tests in `src/config` cover defaults, validation, and safe Venice API key lookup.
-- Unit tests in `src/venice` cover Venice-to-OpenAI model mapping, missing optional metadata defaults, malformed upstream model payloads, and API-key redaction in debug output.
-- Unit tests in `src/attestation` cover valid evidence, missing fields, debug evidence, required TDX/NVIDIA failures, malformed upstream evidence, and upstream fetch failures.
-- Unit tests in `src/openai/chat` cover chat message normalization, unsupported request shapes, Venice parameter policy, and encrypted Venice request construction.
-- Unit tests in `src/http` cover route registration, streaming and buffered encrypted chat success/fail-closed paths, tool-call response/retry handling, chat request construction gating, unknown routes/methods, Axum JSON extractor rejections for malformed/non-object JSON, and safe header helpers.
-- Unit tests in `src/main.rs` cover the optional config path CLI shape.
-- `src/lib.rs` still verifies the module boundary list.
-- `tests/models.rs` verifies mocked Venice success, authentication failures, server errors, malformed payloads, and upstream timeout handling for `GET /v1/models`.
-- `tests/proxy_integration.rs` provides a mocked Venice harness covering model listing, streaming and non-streaming chat, attestation success/failure, encrypted response success/failure, tool-call emulation with correction retry headers, fail-closed startup/upstream/protocol paths, and proxy metadata response-header expectations.
+- streaming and non-streaming OpenAI chat responses
+- text-only `system`, `developer`, `user`, `assistant`, and `tool` messages
+- string content and text-only content parts
+- `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, and `stop`
+- `stream_options.include_usage`
+- Venice reasoning fields: `reasoning` and `reasoning_effort`
+- OpenAI function tools via local emulation
+- session reuse through `X-Venice-Proxy-Session-Id`, `X-OpenWebUI-Chat-Id`, or `metadata.session_id` / `metadata.chat_id`
 
+## Build
+
+Requirements:
+
+- recent stable Rust with edition 2024 support
+- a C toolchain for the Rust dependencies used by the release build
+- network access when Cargo fetches the git dependency `vllm-tool-parser`
+
+Fetch and build:
+
+```bash
+cargo fetch
+cargo build --release --locked
+```
+
+Install from this checkout:
+
+```bash
+cargo install --path . --locked
+```
+
+The binary requires one positional argument: a TOML config path.
+
+## Configure
+
+Start from `config/default.toml`. It contains all current config fields.
+
+Do not put a real Venice API key in a committed config file. Prefer the environment override:
+
+```bash
+VENICE_E2EE_PROXY__VENICE__API_KEY=... cargo run -- config/default.toml
+```
+
+Useful config sections:
+
+- `[server]`: bind host and port. Defaults in `config/default.toml` are `0.0.0.0:8080`.
+- `[venice]`: Venice base URL, API key, and request timeout.
+- `[session]`: in-memory attestation/model-key reuse policy and session-id headers.
+- `[attestation]`: local attestation policy gates.
+- `[e2ee]`: E2EE codec settings.
+- `[tools]`: tool emulation mode, retry count, marker timeout, max parsed output size, and schema validation.
+
+Any nested config value can be overridden with `VENICE_E2EE_PROXY__...` environment variables. Examples:
+
+```bash
+VENICE_E2EE_PROXY__SERVER__PORT=9000
+VENICE_E2EE_PROXY__LOGGING__LEVEL=venice_e2ee_proxy=debug,tower_http=warn
+VENICE_E2EE_PROXY__TOOLS__ENABLED=false
+```
+
+Durations use strings such as `30s`, `10m`, or `1h`.
+
+## Run locally
+
+```bash
+VENICE_E2EE_PROXY__VENICE__API_KEY=... cargo run -- config/default.toml
+```
+
+Or with the release binary:
+
+```bash
+VENICE_E2EE_PROXY__VENICE__API_KEY=... ./target/release/venice-e2ee-proxy config/default.toml
+```
+
+List supported E2EE models:
+
+```bash
+curl http://localhost:8080/v1/models
+```
+
+Send a chat request:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Venice-Proxy-Session-Id: local-dev' \
+  -d '{
+    "model": "<model-from-/v1/models>",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "stream": false
+  }'
+```
+
+For OpenAI SDKs, set the base URL to:
+
+```text
+http://localhost:8080/v1
+```
+
+The client `Authorization` header is not used by the proxy. The upstream Venice API key comes from the proxy config or environment.
+
+## Docker
+
+Build the image:
+
+```bash
+docker build -t venice-e2ee-proxy:local .
+```
+
+Run with the bundled default config:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e VENICE_E2EE_PROXY__VENICE__API_KEY=... \
+  venice-e2ee-proxy:local
+```
+
+Run with your own config:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e VENICE_E2EE_PROXY__VENICE__API_KEY=... \
+  -v /absolute/path/to/config.toml:/etc/venice-e2ee-proxy/config.toml:ro \
+  venice-e2ee-proxy:local
+```
+
+The image entrypoint runs:
+
+```text
+venice-e2ee-proxy /etc/venice-e2ee-proxy/config.toml
+```
+
+## Deploy
+
+This service is just an HTTP proxy. Put it somewhere your OpenAI-compatible client can reach, set the Venice API key as an environment variable, and point the client base URL at `/v1` on the proxy.
+
+Keep these deployment details in mind:
+
+- The proxy does not implement client authentication, TLS termination, rate limits, or tenant isolation. Do not expose it directly to the public internet unless something in front of it handles that.
+- Sessions and attestation state are in memory. They do not survive restarts and are not shared across replicas.
+- The proxy instance key is generated at startup by default. Leave `keys.generate_proxy_instance_key_on_startup = true`; chat requests fail without an instance key.
+- If you run more than one replica, use sticky sessions or expect each replica to fetch and cache attestation independently.
+
+## Caveats
+
+- This is not the full OpenAI API. Unknown chat fields are rejected, and only the endpoints listed above exist.
+- Message content is text-only. Vision, audio, image inputs, and other multimodal content are not supported.
+- Venice web search and Venice system prompt injection are intentionally rejected for E2EE requests.
+- `metadata` is accepted for session ids, but it is not forwarded upstream.
+- Tool calls are emulated with prompts and parsers. They depend on the model following the requested format. Non-streaming tool requests can retry with correction prompts; streaming tool-call parsing cannot retry after bad output and will fail the stream.
+- Tool schema validation supports the subset used by this proxy: object/array/string/integer/number/boolean/null types, `properties`, `required`, `items`, `additionalProperties`, and `enum`.
+- Attestation support is intentionally conservative. The verifier checks the Venice attestation envelope, nonce, model key binding, signing-address shape, debug policy, and local TDX/NVIDIA policy gates. Full Intel DCAP/QVL and NVIDIA NRAS verifier backends are not linked. If you configure those as required, requests fail closed.
+- The checked-in `config/default.toml` relaxes attestation with `require_tdx = false` and `require_nvidia = "never"` so the proxy can run with the current verifier limitations. Tighten this only when the verifier support you need is present.

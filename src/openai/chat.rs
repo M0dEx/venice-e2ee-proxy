@@ -1,3 +1,5 @@
+//! OpenAI chat request parsing and Venice E2EE request construction.
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -5,6 +7,7 @@ use thiserror::Error;
 use crate::e2ee::{E2eeCodec, E2eeCodecError};
 use crate::util::json_kind;
 
+/// Normalized OpenAI chat-completion request accepted by the proxy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -21,6 +24,7 @@ pub struct ChatCompletionRequest {
 }
 
 impl ChatCompletionRequest {
+    /// Parses a raw JSON request body into the normalized chat request shape.
     pub fn parse(value: &Value) -> Result<Self, ChatRequestError> {
         let object = value
             .as_object()
@@ -83,6 +87,7 @@ impl ChatCompletionRequest {
         })
     }
 
+    /// Encrypts request messages and builds the Venice upstream request.
     pub fn to_venice_e2ee_request(
         &self,
         codec: &E2eeCodec,
@@ -91,6 +96,7 @@ impl ChatCompletionRequest {
         self.to_venice_e2ee_request_with_messages(codec, model_public_key_hex, &[], &[])
     }
 
+    /// Encrypts request messages with extra prefix/suffix messages for controller prompts or retries.
     pub fn to_venice_e2ee_request_with_messages(
         &self,
         codec: &E2eeCodec,
@@ -133,6 +139,7 @@ impl ChatCompletionRequest {
     }
 }
 
+/// Chat message normalized to a role and plaintext content string before E2EE encryption.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedChatMessage {
     pub role: String,
@@ -140,6 +147,7 @@ pub struct NormalizedChatMessage {
 }
 
 impl NormalizedChatMessage {
+    /// Builds a normalized chat message from role and content values.
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
@@ -148,6 +156,7 @@ impl NormalizedChatMessage {
     }
 }
 
+/// Supported OpenAI tool definition passed by a chat-completion request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatToolDefinition {
@@ -157,21 +166,25 @@ pub enum ChatToolDefinition {
 }
 
 impl ChatToolDefinition {
+    /// Returns the function definition for a supported tool.
     pub fn function(&self) -> &ChatToolFunctionDefinition {
         match self {
             Self::Function { function } => function,
         }
     }
 
+    /// Returns the function tool name.
     pub fn name(&self) -> &str {
         &self.function().name
     }
 
+    /// Returns the function parameters JSON schema when one was provided.
     pub fn parameters_schema(&self) -> Option<&Map<String, Value>> {
         self.function().parameters.as_ref().map(JsonSchema::as_map)
     }
 }
 
+/// Function tool metadata from an OpenAI `tools` entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatToolFunctionDefinition {
@@ -182,16 +195,19 @@ pub struct ChatToolFunctionDefinition {
     pub parameters: Option<JsonSchema>,
 }
 
+/// JSON schema object stored for tool argument validation and prompt rendering.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct JsonSchema(Map<String, Value>);
 
 impl JsonSchema {
+    /// Returns the schema as a JSON object map.
     pub fn as_map(&self) -> &Map<String, Value> {
         &self.0
     }
 }
 
+/// Normalized OpenAI tool-choice setting for a chat request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ChatToolChoice {
     #[default]
@@ -204,6 +220,7 @@ pub enum ChatToolChoice {
 }
 
 impl<'de> Deserialize<'de> for ChatToolChoice {
+    /// Deserializes OpenAI string or object tool-choice values into a normalized choice.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -213,6 +230,7 @@ impl<'de> Deserialize<'de> for ChatToolChoice {
 }
 
 impl From<ChatToolChoiceWire> for ChatToolChoice {
+    /// Converts accepted wire shapes into the normalized tool-choice enum.
     fn from(value: ChatToolChoiceWire) -> Self {
         match value {
             ChatToolChoiceWire::Mode(ChatToolChoiceMode::Auto) => Self::Auto,
@@ -227,6 +245,7 @@ impl From<ChatToolChoiceWire> for ChatToolChoice {
     }
 }
 
+/// Wire representation for OpenAI `tool_choice` string or object values.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 enum ChatToolChoiceWire {
@@ -234,6 +253,7 @@ enum ChatToolChoiceWire {
     Object(ChatToolChoiceObject),
 }
 
+/// String-mode variants accepted for OpenAI `tool_choice`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ChatToolChoiceMode {
@@ -242,18 +262,21 @@ enum ChatToolChoiceMode {
     Required,
 }
 
+/// Object-form OpenAI `tool_choice` value selecting a specific function.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ChatToolChoiceObject {
     Function { function: ChatToolChoiceFunction },
 }
 
+/// Function selector payload inside object-form `tool_choice`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChatToolChoiceFunction {
     name: String,
 }
 
+/// OpenAI stream options accepted by the chat route.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenAiStreamOptions {
@@ -261,6 +284,7 @@ pub struct OpenAiStreamOptions {
     pub include_usage: Option<bool>,
 }
 
+/// Reasoning options accepted by the proxy and forwarded to Venice.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReasoningOptions {
@@ -279,6 +303,7 @@ pub struct ReasoningOptions {
 }
 
 impl ReasoningOptions {
+    /// Parses optional `reasoning` settings from a raw request field.
     fn parse(value: Option<&Value>) -> Result<Option<Self>, ChatRequestError> {
         match value {
             None => Ok(None),
@@ -288,6 +313,7 @@ impl ReasoningOptions {
 }
 
 impl OpenAiStreamOptions {
+    /// Parses optional `stream_options`, returning defaults when absent.
     fn parse(value: Option<&Value>) -> Result<Self, ChatRequestError> {
         let Some(value) = value else {
             return Ok(Self::default());
@@ -296,6 +322,7 @@ impl OpenAiStreamOptions {
     }
 }
 
+/// Venice parameters allowed for encrypted upstream chat requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VeniceParameters {
     pub enable_e2ee: bool,
@@ -306,6 +333,7 @@ pub struct VeniceParameters {
 }
 
 impl Default for VeniceParameters {
+    /// Returns safe Venice parameter defaults for E2EE chat requests.
     fn default() -> Self {
         Self {
             enable_e2ee: true,
@@ -318,12 +346,14 @@ impl Default for VeniceParameters {
 }
 
 impl VeniceParameters {
+    /// Parses optional `venice_parameters` and rejects settings incompatible with E2EE.
     fn parse(value: Option<&Value>) -> Result<Self, ChatRequestError> {
         let Some(value) = value else {
             return Ok(Self::default());
         };
         let raw: RawVeniceParameters = deserialize_typed_value("venice_parameters", value)?;
         let enable_e2ee = raw.enable_e2ee.unwrap_or(true);
+
         if !enable_e2ee {
             return Err(ChatRequestError::UnsupportedVeniceParameter {
                 field: "venice_parameters.enable_e2ee",
@@ -332,6 +362,7 @@ impl VeniceParameters {
         }
 
         let include_venice_system_prompt = raw.include_venice_system_prompt.unwrap_or(false);
+
         if include_venice_system_prompt {
             return Err(ChatRequestError::UnsupportedVeniceParameter {
                 field: "venice_parameters.include_venice_system_prompt",
@@ -372,6 +403,7 @@ impl VeniceParameters {
     }
 }
 
+/// OpenAI scalar fields preserved and forwarded to the Venice request.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OpenAiPassthroughFields {
     pub temperature: Option<Value>,
@@ -382,6 +414,7 @@ pub struct OpenAiPassthroughFields {
 }
 
 impl OpenAiPassthroughFields {
+    /// Parses pass-through generation fields from the normalized request object.
     fn parse(object: &Map<String, Value>) -> Result<Self, ChatRequestError> {
         Ok(Self {
             temperature: optional_number(object, "temperature")?,
@@ -393,12 +426,14 @@ impl OpenAiPassthroughFields {
     }
 }
 
+/// Prepared Venice upstream request plus the original client streaming preference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedVeniceChatRequest {
     pub client_stream: bool,
     pub upstream: VeniceE2eeChatRequest,
 }
 
+/// Venice chat request payload containing encrypted messages and forwarded options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VeniceE2eeChatRequest {
     pub model: String,
@@ -422,6 +457,7 @@ pub struct VeniceE2eeChatRequest {
     pub reasoning_effort: Option<String>,
 }
 
+/// OpenAI stop sequence value accepted as a string or list of strings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StopSequence {
@@ -429,11 +465,13 @@ pub enum StopSequence {
     Strings(Vec<String>),
 }
 
+/// Venice stream options derived from OpenAI stream options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct VeniceStreamOptions {
     pub include_usage: bool,
 }
 
+/// Raw nullable Venice parameters accepted before policy validation.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVeniceParameters {
@@ -452,6 +490,7 @@ struct RawVeniceParameters {
     enable_web_search: Option<RawVeniceWebSearch>,
 }
 
+/// Raw Venice web-search setting accepted as string or boolean before validation.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 enum RawVeniceWebSearch {
@@ -459,6 +498,7 @@ enum RawVeniceWebSearch {
     Bool(bool),
 }
 
+/// Raw assistant tool-call history object accepted from OpenAI messages.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAssistantToolCall {
@@ -468,6 +508,7 @@ struct RawAssistantToolCall {
     function: RawAssistantToolFunction,
 }
 
+/// Raw assistant function-call payload accepted from OpenAI tool-call history.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAssistantToolFunction {
@@ -475,6 +516,7 @@ struct RawAssistantToolFunction {
     arguments: String,
 }
 
+/// Raw text content part accepted from OpenAI multi-part message content.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTextContentPart {
@@ -484,12 +526,14 @@ struct RawTextContentPart {
     text: String,
 }
 
+/// Supported content part type for text-only OpenAI message content arrays.
 #[derive(Debug, Clone, Deserialize)]
 enum TextContentPartType {
     #[serde(rename = "text")]
     Text,
 }
 
+/// Errors returned while parsing or validating an OpenAI chat request.
 #[derive(Debug, Error)]
 pub enum ChatRequestError {
     #[error("missing required field {field}")]
@@ -517,6 +561,7 @@ pub enum ChatRequestError {
 }
 
 impl ChatRequestError {
+    /// Returns the proxy error code exposed for this chat request error.
     pub fn api_error_code(&self) -> &'static str {
         match self {
             Self::MissingField { .. } | Self::InvalidRequest { .. } | Self::InvalidField { .. } => {
@@ -530,12 +575,14 @@ impl ChatRequestError {
         }
     }
 
+    /// Creates a generic invalid-request error with the supplied message.
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::InvalidRequest {
             message: message.into(),
         }
     }
 
+    /// Creates an invalid-field error for a named request field.
     pub(crate) fn invalid_field(field: &'static str, message: impl Into<String>) -> Self {
         Self::InvalidField {
             field,
@@ -543,6 +590,7 @@ impl ChatRequestError {
         }
     }
 
+    /// Creates an unsupported-content error for a message-content JSON path.
     pub(crate) fn unsupported_content(path: impl Into<String>, message: impl Into<String>) -> Self {
         Self::UnsupportedMessageContent {
             path: path.into(),
@@ -550,6 +598,7 @@ impl ChatRequestError {
         }
     }
 
+    /// Creates an invalid tool-call history error with the supplied message.
     pub(crate) fn invalid_tool_history(message: impl Into<String>) -> Self {
         Self::InvalidToolCallHistory {
             message: message.into(),
@@ -557,6 +606,7 @@ impl ChatRequestError {
     }
 }
 
+/// Errors returned while constructing the encrypted Venice chat request.
 #[derive(Debug, Error)]
 pub enum ChatConstructionError {
     #[error(transparent)]
@@ -564,6 +614,7 @@ pub enum ChatConstructionError {
 }
 
 impl ChatConstructionError {
+    /// Returns the proxy error code exposed for this construction error.
     pub fn api_error_code(&self) -> &'static str {
         match self {
             Self::E2ee(_) => "e2ee_request_encryption_failed",
@@ -571,6 +622,7 @@ impl ChatConstructionError {
     }
 }
 
+/// Normalizes the `messages` field into supported role/content strings.
 fn normalize_messages(value: &Value) -> Result<Vec<NormalizedChatMessage>, ChatRequestError> {
     let messages = value
         .as_array()
@@ -589,6 +641,7 @@ fn normalize_messages(value: &Value) -> Result<Vec<NormalizedChatMessage>, ChatR
         .collect()
 }
 
+/// Normalizes one OpenAI message at the supplied array index.
 fn normalize_message(
     index: usize,
     value: &Value,
@@ -615,6 +668,7 @@ fn normalize_message(
     }
 }
 
+/// Normalizes assistant messages, including supported prior tool-call history.
 fn normalize_assistant_message(
     index: usize,
     object: &Map<String, Value>,
@@ -650,6 +704,7 @@ fn normalize_assistant_message(
     Ok(NormalizedChatMessage::new("assistant", normalized_content))
 }
 
+/// Normalizes OpenAI tool-result messages into user-visible context text.
 fn normalize_tool_result_message(
     index: usize,
     object: &Map<String, Value>,
@@ -668,12 +723,14 @@ fn normalize_tool_result_message(
     Ok(NormalizedChatMessage::new("user", normalized))
 }
 
+/// Renders supported assistant tool-call history into model-visible text.
 fn normalize_assistant_tool_calls(
     value: Option<&Value>,
 ) -> Result<Option<String>, ChatRequestError> {
     let Some(value) = value else {
         return Ok(None);
     };
+
     if !value.is_array() {
         return Err(ChatRequestError::invalid_tool_history(
             "assistant tool_calls must be an array",
@@ -686,6 +743,7 @@ fn normalize_assistant_tool_calls(
             ))
         },
     )?;
+
     if tool_calls.is_empty() {
         return Err(ChatRequestError::invalid_tool_history(
             "assistant tool_calls must not be empty when provided",
@@ -700,16 +758,19 @@ fn normalize_assistant_tool_calls(
     Ok(Some(rendered.join("\n")))
 }
 
+/// Renders one prior assistant function call into the proxy's textual history format.
 fn render_assistant_tool_call(
     tool_call: &RawAssistantToolCall,
 ) -> Result<String, ChatRequestError> {
     let id = non_empty_typed_string(&tool_call.id, "tool_call.id")?;
+
     if tool_call.kind != "function" {
         return Err(ChatRequestError::invalid_tool_history(format!(
             "only function tool calls are supported, got {:?}",
             tool_call.kind
         )));
     }
+
     let name = non_empty_typed_string(&tool_call.function.name, "tool_call.function.name")?;
     let arguments = non_empty_typed_string(
         &tool_call.function.arguments,
@@ -734,12 +795,14 @@ fn render_assistant_tool_call(
     ))
 }
 
+/// Reads required message content as normalized text from a raw JSON value.
 fn required_content_text(value: Option<&Value>, path: &str) -> Result<String, ChatRequestError> {
     optional_content_text(value, path, false)?.ok_or_else(|| {
         ChatRequestError::unsupported_content(path, "content is required and must not be null")
     })
 }
 
+/// Reads optional message content as normalized text, honoring the supplied null policy.
 fn optional_content_text(
     value: Option<&Value>,
     path: &str,
@@ -768,6 +831,7 @@ fn optional_content_text(
     }
 }
 
+/// Concatenates a text-only OpenAI content-parts array into one content string.
 fn normalize_text_parts(parts: &[Value], path: &str) -> Result<String, ChatRequestError> {
     if parts.is_empty() {
         return Err(ChatRequestError::unsupported_content(
@@ -789,6 +853,7 @@ fn normalize_text_parts(parts: &[Value], path: &str) -> Result<String, ChatReque
     Ok(text)
 }
 
+/// Parses optional OpenAI `tools` into supported function tool definitions.
 fn parse_tools(value: Option<&Value>) -> Result<Vec<ChatToolDefinition>, ChatRequestError> {
     match value {
         None => Ok(Vec::new()),
@@ -796,6 +861,7 @@ fn parse_tools(value: Option<&Value>) -> Result<Vec<ChatToolDefinition>, ChatReq
     }
 }
 
+/// Parses optional OpenAI `tool_choice`, defaulting to automatic behavior when absent or null.
 fn parse_tool_choice(value: Option<&Value>) -> Result<ChatToolChoice, ChatRequestError> {
     let Some(value) = value else {
         return Ok(ChatToolChoice::default());
@@ -804,6 +870,7 @@ fn parse_tool_choice(value: Option<&Value>) -> Result<ChatToolChoice, ChatReques
         .map(|choice| choice.unwrap_or_default())
 }
 
+/// Validates normalized tool definitions that require cross-field checks.
 fn validate_tools(tools: &[ChatToolDefinition]) -> Result<(), ChatRequestError> {
     if tools.iter().any(|tool| tool.name().trim().is_empty()) {
         return Err(ChatRequestError::invalid_field(
@@ -814,6 +881,7 @@ fn validate_tools(tools: &[ChatToolDefinition]) -> Result<(), ChatRequestError> 
     Ok(())
 }
 
+/// Validates the normalized tool-choice value.
 fn validate_tool_choice(tool_choice: &ChatToolChoice) -> Result<(), ChatRequestError> {
     if let ChatToolChoice::Function { name } = tool_choice
         && name.trim().is_empty()
@@ -826,6 +894,7 @@ fn validate_tool_choice(tool_choice: &ChatToolChoice) -> Result<(), ChatRequestE
     Ok(())
 }
 
+/// Validates that flat and nested reasoning effort values agree when both are provided.
 fn validate_reasoning_effort_consistency(
     reasoning: Option<&ReasoningOptions>,
     reasoning_effort: Option<&str>,
@@ -845,6 +914,7 @@ fn validate_reasoning_effort_consistency(
     Ok(())
 }
 
+/// Validates client-only fields that are accepted but not forwarded upstream.
 fn validate_ignored_client_only_fields(
     object: &Map<String, Value>,
 ) -> Result<(), ChatRequestError> {
@@ -859,6 +929,7 @@ fn validate_ignored_client_only_fields(
     Ok(())
 }
 
+/// Validates that a typed string field contains non-whitespace text.
 fn non_empty_typed_string<'a>(
     value: &'a str,
     field: &'static str,
@@ -871,6 +942,7 @@ fn non_empty_typed_string<'a>(
     Ok(value)
 }
 
+/// Reads a required non-empty string field from a JSON object.
 fn required_non_empty_string<'a>(
     object: &'a Map<String, Value>,
     field: &'static str,
@@ -887,6 +959,7 @@ fn required_non_empty_string<'a>(
     Ok(string)
 }
 
+/// Reads an optional boolean field from a JSON object.
 fn optional_bool(
     object: &Map<String, Value>,
     field: &'static str,
@@ -904,6 +977,7 @@ fn optional_bool(
         .transpose()
 }
 
+/// Reads an optional non-empty string field from a JSON object.
 fn optional_non_empty_string(
     object: &Map<String, Value>,
     field: &'static str,
@@ -921,6 +995,7 @@ fn optional_non_empty_string(
     }
 }
 
+/// Reads an optional JSON number field and preserves its original JSON number representation.
 fn optional_number(
     object: &Map<String, Value>,
     field: &'static str,
@@ -934,6 +1009,7 @@ fn optional_number(
     }
 }
 
+/// Reads an optional unsigned integer field from a JSON object.
 fn optional_u64(
     object: &Map<String, Value>,
     field: &'static str,
@@ -944,6 +1020,7 @@ fn optional_u64(
     }
 }
 
+/// Reads the optional OpenAI `stop` field as a supported stop-sequence shape.
 fn optional_stop(object: &Map<String, Value>) -> Result<Option<StopSequence>, ChatRequestError> {
     match object.get("stop") {
         None | Some(Value::Null) => Ok(None),
@@ -951,6 +1028,7 @@ fn optional_stop(object: &Map<String, Value>) -> Result<Option<StopSequence>, Ch
     }
 }
 
+/// Deserializes a raw JSON value into a typed request field and reports field-scoped errors.
 fn deserialize_typed_value<T>(field: &'static str, value: &Value) -> Result<T, ChatRequestError>
 where
     T: DeserializeOwned,
@@ -966,6 +1044,7 @@ where
     })
 }
 
+/// Deserializes an optional boolean field while rejecting explicit null values.
 fn deserialize_optional_bool_reject_null<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -980,6 +1059,7 @@ where
     }
 }
 
+/// Deserializes an optional non-empty string field while rejecting explicit null values.
 fn deserialize_optional_non_empty_string_reject_null<'de, D>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error>
@@ -999,6 +1079,7 @@ where
     }
 }
 
+/// Deserializes an optional Venice web-search value while rejecting explicit null values.
 fn deserialize_optional_web_search_reject_null<'de, D>(
     deserializer: D,
 ) -> Result<Option<RawVeniceWebSearch>, D::Error>
@@ -1016,6 +1097,7 @@ where
     }
 }
 
+/// Rejects the first object key that is not present in the supplied allowlist.
 fn reject_unknown_fields(
     object: &Map<String, Value>,
     allowed: &[&str],
@@ -1032,6 +1114,7 @@ fn reject_unknown_fields(
     Ok(())
 }
 
+/// Escapes text for use inside generated XML attribute values.
 fn xml_escape_attr(value: &str) -> String {
     let mut escaped = String::new();
     for ch in value.chars() {

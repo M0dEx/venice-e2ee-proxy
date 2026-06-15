@@ -54,6 +54,7 @@ pub const HEADER_PROXY_TOOL_MODE: &str = "X-Venice-Proxy-Tool-Mode";
 pub const HEADER_PROXY_TOOL_RETRIES: &str = "X-Venice-Proxy-Tool-Retries";
 pub const HEADER_PROXY_ERROR_CODE: &str = "X-Venice-Proxy-Error-Code";
 
+/// Shared HTTP application state used by route handlers.
 #[derive(Debug, Clone)]
 pub struct AppState {
     config: Arc<ProxyConfig>,
@@ -64,11 +65,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Builds application state from configuration and a Venice client created from that config.
     pub fn new(config: ProxyConfig) -> Result<Self, VeniceClientError> {
         let venice_client = VeniceClient::from_config(&config)?;
         Ok(Self::from_parts(config, venice_client))
     }
 
+    /// Builds application state from configuration and an already-created Venice client.
     pub fn from_parts(config: ProxyConfig, venice_client: VeniceClient) -> Self {
         let proxy_instance_key = ProxyInstanceKey::generate_from_config(&config.keys);
         let session_manager = SessionManager::new(config.session.clone());
@@ -83,22 +86,27 @@ impl AppState {
         }
     }
 
+    /// Returns the proxy configuration shared by handlers.
     pub fn config(&self) -> &ProxyConfig {
         &self.config
     }
 
+    /// Returns the Venice upstream client shared by handlers.
     pub fn venice_client(&self) -> &VeniceClient {
         &self.venice_client
     }
 
+    /// Returns the startup proxy instance key when key generation is enabled.
     pub fn proxy_instance_key(&self) -> Option<&ProxyInstanceKey> {
         self.proxy_instance_key.as_ref()
     }
 
+    /// Returns the in-memory session manager shared by handlers.
     pub fn session_manager(&self) -> &SessionManager {
         &self.session_manager
     }
 
+    /// Returns the attestation verifier shared by handlers.
     pub fn attestation_verifier(&self) -> &AttestationVerifier {
         &self.attestation_verifier
     }
@@ -118,6 +126,7 @@ pub fn router_with_venice_client(config: ProxyConfig, venice_client: VeniceClien
     router_from_state(AppState::from_parts(config, venice_client))
 }
 
+/// Builds route wiring from already-initialized application state.
 fn router_from_state(state: AppState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models).fallback(method_not_allowed))
@@ -134,6 +143,7 @@ pub async fn serve(listener: TcpListener, router: Router) -> io::Result<()> {
     axum::serve(listener, router).await
 }
 
+/// Handles `GET /v1/models` by proxying Venice's supported model list.
 async fn list_models(State(state): State<AppState>) -> Result<Response, ProxyError> {
     info!(route = "/v1/models", "listing Venice models");
     let models = state.venice_client().list_models().await?;
@@ -143,6 +153,7 @@ async fn list_models(State(state): State<AppState>) -> Result<Response, ProxyErr
     Ok(response)
 }
 
+/// Handles `POST /v1/chat/completions` by encrypting the request and transforming Venice's response.
 async fn create_chat_completion(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -243,6 +254,7 @@ async fn create_chat_completion(
     }
 }
 
+/// Returns a session with cached attestation state, fetching and storing it when absent.
 async fn ensure_attested_session(
     state: &AppState,
     session: SessionContext,
@@ -277,6 +289,7 @@ async fn ensure_attested_session(
         .set_attested_model_state(&session.session_key, state_update)?)
 }
 
+/// Buffers an upstream SSE chat response and returns one OpenAI chat completion JSON response.
 async fn openai_chat_buffered_response(
     upstream: reqwest::Response,
     codec: E2eeCodec,
@@ -291,6 +304,7 @@ async fn openai_chat_buffered_response(
     Ok(response)
 }
 
+/// Runs a chat request through tool-emulation response handling for streaming or buffered clients.
 async fn openai_tool_emulated_chat_response(
     state: &AppState,
     request: &ChatCompletionRequest,
@@ -462,7 +476,9 @@ async fn tool_emulated_upstream_stream(
     let messages = tool_emulated_messages(request, tool_context, correction);
     let mut tool_request = request.clone();
     tool_request.messages = messages;
+
     let prepared = tool_request.to_venice_e2ee_request(codec, model_public_key)?;
+
     Ok(state
         .venice_client()
         .create_chat_completion_stream(
@@ -473,6 +489,7 @@ async fn tool_emulated_upstream_stream(
         .await?)
 }
 
+/// Builds the message list for a tool-emulated upstream request, including any correction prompt.
 fn tool_emulated_messages(
     request: &ChatCompletionRequest,
     tool_context: &ToolEmulationContext,
@@ -480,6 +497,7 @@ fn tool_emulated_messages(
 ) -> Vec<NormalizedChatMessage> {
     let mut messages = request.messages.clone();
     let mut tool_system_content = tool_context.controller_message().content;
+
     if let Some((validation_error, invalid_output)) = correction {
         tool_system_content.push_str("\n\n");
         tool_system_content.push_str(
@@ -493,6 +511,7 @@ fn tool_emulated_messages(
     messages
 }
 
+/// Appends controller content to an existing system message or inserts a new system message.
 fn append_to_system_message(messages: &mut Vec<NormalizedChatMessage>, content: String) {
     if let Some(system_message) = messages.iter_mut().find(|message| message.role == "system") {
         system_message.content.push_str("\n\n");
@@ -502,6 +521,7 @@ fn append_to_system_message(messages: &mut Vec<NormalizedChatMessage>, content: 
     }
 }
 
+/// Rewrites a buffered text completion into an OpenAI completion containing tool calls.
 fn openai_tool_call_completion(completion: Value, tool_calls: Vec<ValidatedToolCall>) -> Value {
     let choice = completion
         .get("choices")
@@ -543,6 +563,7 @@ fn openai_tool_call_completion(completion: Value, tool_calls: Vec<ValidatedToolC
     })
 }
 
+/// Buffers upstream SSE events and returns one decrypted OpenAI completion object.
 async fn buffer_openai_chat_completion(
     mut upstream: reqwest::Response,
     codec: E2eeCodec,
@@ -637,9 +658,11 @@ const TOOL_EMULATED_CHAT_SSE_LOG: ChatSseLogMessages = ChatSseLogMessages {
 
 /// Transforms parsed upstream SSE events into client-facing stream outputs.
 trait ChatSseTransformer {
+    /// Converts one parsed upstream event into zero or more client-facing stream outputs.
     fn handle_event(&mut self, event: RawSseEvent) -> Result<Vec<StreamOutput>, ChatStreamError>;
 }
 
+/// Builds a client-facing SSE response from an upstream response and transformer.
 fn chat_sse_response<T>(
     upstream: reqwest::Response,
     transformer: T,
@@ -663,6 +686,7 @@ where
     response
 }
 
+/// Streams upstream SSE chunks through a transformer into OpenAI-compatible SSE events.
 fn chat_sse_event_stream<T>(
     mut upstream: reqwest::Response,
     mut transformer: T,
@@ -759,17 +783,20 @@ where
     }
 }
 
+/// Converts a chat-stream error into an Axum boxed stream error after logging it.
 fn box_chat_stream_error(error: ChatStreamError) -> axum::BoxError {
     error!(error = %error, "chat stream transformation failed");
     Box::new(error)
 }
 
+/// Incremental parser for upstream Server-Sent Event text chunks.
 #[derive(Debug, Default)]
 struct SseEventParser {
     buffer: String,
 }
 
 impl SseEventParser {
+    /// Adds one UTF-8 chunk and returns all complete SSE events parsed from the buffer.
     fn push(&mut self, chunk: &str) -> Result<Vec<RawSseEvent>, ChatStreamError> {
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
@@ -791,6 +818,7 @@ impl SseEventParser {
         Ok(events)
     }
 
+    /// Validates that no incomplete SSE event remains after the upstream stream ends.
     fn finish(&self) -> Result<(), ChatStreamError> {
         if self.buffer.trim().is_empty() {
             Ok(())
@@ -806,6 +834,7 @@ impl SseEventParser {
     }
 }
 
+/// Parsed upstream SSE event containing optional event type and joined data lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawSseEvent {
     event: Option<String>,
@@ -938,6 +967,7 @@ struct ChunkContext {
 }
 
 impl ChunkContext {
+    /// Creates chunk transformation context with fallback identity fields for emitted chunks.
     fn new(codec: E2eeCodec, proxy_instance_key: ProxyInstanceKey, fallback_model: String) -> Self {
         Self {
             codec,
@@ -948,12 +978,14 @@ impl ChunkContext {
         }
     }
 
+    /// Decrypts optional upstream encrypted content using the proxy instance key.
     fn decrypt(&self, content: Option<&str>) -> Result<Option<String>, ChatStreamError> {
         self.codec
             .decrypt_response_content(content, self.proxy_instance_key.private_key())
             .map_err(ChatStreamError::decryption)
     }
 
+    /// Builds an OpenAI chat-completion chunk with one choice and fallback metadata.
     fn chunk_with_choice(
         &self,
         upstream: &Value,
@@ -974,6 +1006,7 @@ impl ChunkContext {
         })
     }
 
+    /// Builds an OpenAI usage-only streaming chunk from upstream metadata and usage fields.
     fn usage_chunk(&self, upstream: &Value, usage: &Value) -> Value {
         json!({
             "id": string_field(upstream, "id").unwrap_or(&self.fallback_id),
@@ -986,6 +1019,7 @@ impl ChunkContext {
     }
 }
 
+/// Accumulates decrypted upstream SSE chunks into a non-streaming OpenAI completion.
 struct OpenAiChatCompletionBuffer {
     ctx: ChunkContext,
     id: Option<String>,
@@ -1000,6 +1034,7 @@ struct OpenAiChatCompletionBuffer {
 }
 
 impl OpenAiChatCompletionBuffer {
+    /// Creates an empty buffered completion transformer.
     fn new(codec: E2eeCodec, proxy_instance_key: ProxyInstanceKey, fallback_model: String) -> Self {
         Self {
             ctx: ChunkContext::new(codec, proxy_instance_key, fallback_model),
@@ -1015,6 +1050,7 @@ impl OpenAiChatCompletionBuffer {
         }
     }
 
+    /// Applies one upstream SSE event and returns whether the stream reached `[DONE]`.
     fn handle_event(&mut self, event: RawSseEvent) -> Result<bool, ChatStreamError> {
         match classify_upstream_event(event, &BUFFERED_UPSTREAM_EVENT_LOG)? {
             UpstreamEventKind::Done => {
@@ -1038,6 +1074,7 @@ impl OpenAiChatCompletionBuffer {
         }
     }
 
+    /// Stores a usage-only upstream chunk for the final buffered response.
     fn handle_usage_chunk(&mut self, value: &Value) -> Result<(), ChatStreamError> {
         let Some(usage) = value.get("usage") else {
             warn!("buffered upstream chunk has no choices and no usage");
@@ -1051,6 +1088,7 @@ impl OpenAiChatCompletionBuffer {
         Ok(())
     }
 
+    /// Decrypts and appends one upstream choice chunk into the buffered completion.
     fn handle_choice_chunk(&mut self, choice: &Value) -> Result<(), ChatStreamError> {
         let choice = choice.as_object().ok_or_else(|| {
             ChatStreamError::malformed_event("upstream choice must be a JSON object")
@@ -1111,6 +1149,7 @@ impl OpenAiChatCompletionBuffer {
         Ok(())
     }
 
+    /// Records the first available upstream id, timestamp, and model metadata.
     fn record_metadata(&mut self, value: &Value) {
         if self.id.is_none()
             && let Some(id) = string_field(value, "id")
@@ -1129,6 +1168,7 @@ impl OpenAiChatCompletionBuffer {
         }
     }
 
+    /// Consumes the buffer and returns an OpenAI chat-completion response object.
     fn into_response(self) -> Value {
         let mut message = serde_json::Map::new();
         message.insert("role".to_owned(), Value::String("assistant".to_owned()));
@@ -1155,6 +1195,7 @@ impl OpenAiChatCompletionBuffer {
     }
 }
 
+/// Finds the earliest complete SSE event delimiter in a parser buffer.
 fn sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
     ["\r\n\r\n", "\n\n", "\r\r"]
         .into_iter()
@@ -1162,6 +1203,7 @@ fn sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
         .min_by_key(|(index, _)| *index)
 }
 
+/// Parses one raw SSE event into its event type and data payload.
 fn parse_sse_event(raw: &str) -> Result<Option<RawSseEvent>, ChatStreamError> {
     let mut event = None;
     let mut data_lines = Vec::new();
@@ -1213,6 +1255,7 @@ fn parse_sse_event(raw: &str) -> Result<Option<RawSseEvent>, ChatStreamError> {
     }))
 }
 
+/// Transforms decrypted upstream SSE chunks into normal OpenAI streaming chat chunks.
 struct OpenAiChatStreamTransformer {
     ctx: ChunkContext,
     include_usage_requested: bool,
@@ -1221,6 +1264,7 @@ struct OpenAiChatStreamTransformer {
 }
 
 impl OpenAiChatStreamTransformer {
+    /// Creates a streaming transformer for encrypted non-tool chat responses.
     fn new(
         codec: E2eeCodec,
         proxy_instance_key: ProxyInstanceKey,
@@ -1235,6 +1279,7 @@ impl OpenAiChatStreamTransformer {
         }
     }
 
+    /// Converts one upstream choice chunk into decrypted client-facing stream chunks.
     fn handle_choice_chunk(
         &mut self,
         value: &Value,
@@ -1255,6 +1300,7 @@ impl OpenAiChatStreamTransformer {
         );
 
         let mut output = Vec::new();
+
         if content.is_none() && reasoning_content.is_none() {
             if !finish_reason.is_null() {
                 output.push(StreamOutput::Json(self.chunk_with_choice(
@@ -1284,16 +1330,19 @@ impl OpenAiChatStreamTransformer {
 
         if decrypted_content.is_some() || decrypted_reasoning_content.is_some() {
             let mut delta = serde_json::Map::new();
+
             if !self.sent_role {
                 delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
                 self.sent_role = true;
             }
+
             if let Some(reasoning_content) = decrypted_reasoning_content {
                 delta.insert(
                     "reasoning_content".to_owned(),
                     Value::String(reasoning_content),
                 );
             }
+
             if let Some(content) = decrypted_content {
                 delta.insert("content".to_owned(), Value::String(content));
             }
@@ -1325,6 +1374,7 @@ impl OpenAiChatStreamTransformer {
         Ok(output)
     }
 
+    /// Converts an upstream usage-only chunk into a client-facing usage event when requested.
     fn handle_usage_chunk(&self, value: &Value) -> Result<Vec<StreamOutput>, ChatStreamError> {
         let Some(usage) = value.get("usage") else {
             warn!("streaming upstream chunk has no choices and no usage");
@@ -1345,11 +1395,13 @@ impl OpenAiChatStreamTransformer {
         Ok(vec![StreamOutput::Json(self.ctx.usage_chunk(value, usage))])
     }
 
+    /// Builds a fallback final stop chunk for streams that reach `[DONE]` without one.
     fn finish_chunk(&self) -> Value {
         self.ctx
             .chunk_with_choice(&Value::Null, 0, json!({}), Value::String("stop".to_owned()))
     }
 
+    /// Builds a stream chunk after validating the optional upstream choice index.
     fn chunk_with_choice(
         &self,
         upstream: &Value,
@@ -1365,6 +1417,7 @@ impl OpenAiChatStreamTransformer {
 }
 
 impl ChatSseTransformer for OpenAiChatStreamTransformer {
+    /// Converts one parsed upstream SSE event into normal streaming chat outputs.
     fn handle_event(&mut self, event: RawSseEvent) -> Result<Vec<StreamOutput>, ChatStreamError> {
         match classify_upstream_event(event, &STREAMING_UPSTREAM_EVENT_LOG)? {
             UpstreamEventKind::Done => {
@@ -1405,6 +1458,7 @@ struct OpenAiToolEmulatedChatStreamTransformer {
 }
 
 impl OpenAiToolEmulatedChatStreamTransformer {
+    /// Creates a streaming transformer for encrypted tool-emulated responses.
     fn new(
         tool_context: &ToolEmulationContext,
         codec: E2eeCodec,
@@ -1425,6 +1479,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         })
     }
 
+    /// Converts one upstream choice chunk into normal text, reasoning, or tool-call stream chunks.
     fn handle_choice_chunk(
         &mut self,
         value: &Value,
@@ -1440,12 +1495,14 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         let reasoning_content = encrypted_delta_reasoning_content(delta)?;
 
         let mut output = Vec::new();
+
         if let Some(reasoning_content) = reasoning_content
             && let Some(reasoning_content) = self.ctx.decrypt(Some(reasoning_content))?
             && !self.sent_final_finish
         {
             output.push(self.reasoning_chunk(value, index, reasoning_content));
         }
+
         if let Some(content) = content
             && let Some(content) = self.ctx.decrypt(Some(content))?
             && !self.sent_final_finish
@@ -1460,6 +1517,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         Ok(output)
     }
 
+    /// Buffers decrypted text until it is safe to stream or parse as tool-call output.
     fn push_decrypted_content(
         &mut self,
         upstream: &Value,
@@ -1479,11 +1537,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             self.pending_text.clear();
             self.buffering_tool_call = true;
             self.ensure_tool_buffer_within_limit()?;
-            return Ok(if text.is_empty() {
-                Vec::new()
-            } else {
-                vec![self.text_chunk(upstream, index, text)]
-            });
+            return Ok(self.text_chunk_if_not_empty(upstream, index, text));
         }
 
         let streamable_len = streamable_pending_text_len(&self.pending_text);
@@ -1493,9 +1547,12 @@ impl OpenAiToolEmulatedChatStreamTransformer {
 
         let text = self.pending_text[..streamable_len].to_owned();
         self.pending_text.drain(..streamable_len);
-        Ok(vec![self.text_chunk(upstream, index, text)])
+        Ok(vec![
+            self.text_field_chunk(upstream, index, "content", text),
+        ])
     }
 
+    /// Flushes pending text or buffered tool-call output and emits the final finish chunk.
     fn finish_buffered_content(
         &mut self,
         upstream: &Value,
@@ -1503,11 +1560,12 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         finish_reason: Value,
     ) -> Result<Vec<StreamOutput>, ChatStreamError> {
         let mut output = Vec::new();
+
         if self.buffering_tool_call {
             output.extend(self.buffered_tool_call_chunks(upstream, index)?);
         } else if !self.pending_text.is_empty() {
             let text = std::mem::take(&mut self.pending_text);
-            output.push(self.text_chunk(upstream, index, text));
+            output.push(self.text_field_chunk(upstream, index, "content", text));
         }
 
         let finish_reason = if self.emitted_tool_calls {
@@ -1525,6 +1583,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         Ok(output)
     }
 
+    /// Parses buffered tool-call text and returns OpenAI streaming tool-call chunks.
     fn buffered_tool_call_chunks(
         &mut self,
         upstream: &Value,
@@ -1548,11 +1607,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             ToolOutputClassification::NormalText => {
                 let text = std::mem::take(&mut self.tool_buffer);
                 self.buffering_tool_call = false;
-                Ok(if text.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![self.text_chunk(upstream, index, text)]
-                })
+                Ok(self.text_chunk_if_not_empty(upstream, index, text))
             }
             ToolOutputClassification::InvalidToolCall { error, .. } => {
                 error!(
@@ -1568,6 +1623,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         }
     }
 
+    /// Validates that buffered tool-call text remains within the configured byte limit.
     fn ensure_tool_buffer_within_limit(&self) -> Result<(), ChatStreamError> {
         if self.tool_buffer.len() > self.tool_context.config().tool_call_max_bytes {
             return Err(ChatStreamError::malformed_event(format!(
@@ -1578,31 +1634,41 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         Ok(())
     }
 
-    fn text_chunk(&mut self, upstream: &Value, index: u64, text: String) -> StreamOutput {
-        let mut delta = serde_json::Map::new();
-        self.insert_role_if_needed(&mut delta);
-        delta.insert("content".to_owned(), Value::String(text));
-
-        StreamOutput::Json(self.ctx.chunk_with_choice(
-            upstream,
-            index,
-            Value::Object(delta),
-            Value::Null,
-        ))
+    /// Builds zero or one streaming content chunks from decrypted assistant text.
+    fn text_chunk_if_not_empty(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+        text: String,
+    ) -> Vec<StreamOutput> {
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.text_field_chunk(upstream, index, "content", text)]
+        }
     }
 
+    /// Builds a streaming reasoning-content chunk from decrypted assistant text.
     fn reasoning_chunk(
         &mut self,
         upstream: &Value,
         index: u64,
         reasoning_content: String,
     ) -> StreamOutput {
+        self.text_field_chunk(upstream, index, "reasoning_content", reasoning_content)
+    }
+
+    /// Builds a streaming delta containing one assistant text field.
+    fn text_field_chunk(
+        &mut self,
+        upstream: &Value,
+        index: u64,
+        field: &'static str,
+        text: String,
+    ) -> StreamOutput {
         let mut delta = serde_json::Map::new();
         self.insert_role_if_needed(&mut delta);
-        delta.insert(
-            "reasoning_content".to_owned(),
-            Value::String(reasoning_content),
-        );
+        delta.insert(field.to_owned(), Value::String(text));
 
         StreamOutput::Json(self.ctx.chunk_with_choice(
             upstream,
@@ -1612,6 +1678,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         ))
     }
 
+    /// Inserts the assistant role into the first emitted streaming delta.
     fn insert_role_if_needed(&mut self, delta: &mut serde_json::Map<String, Value>) {
         if !self.sent_role {
             delta.insert("role".to_owned(), Value::String("assistant".to_owned()));
@@ -1619,6 +1686,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         }
     }
 
+    /// Builds a streaming delta containing one complete validated tool call.
     fn full_tool_call_chunk(
         &mut self,
         upstream: &Value,
@@ -1628,7 +1696,9 @@ impl OpenAiToolEmulatedChatStreamTransformer {
     ) -> StreamOutput {
         let mut delta = serde_json::Map::new();
         self.insert_role_if_needed(&mut delta);
+
         let mut tool_call_value = tool_call.to_openai_value();
+
         if let Some(tool_call_object) = tool_call_value.as_object_mut() {
             tool_call_object.insert("index".to_owned(), json!(tool_index));
         }
@@ -1642,6 +1712,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         ))
     }
 
+    /// Converts a tool-emulated usage-only chunk into a client-facing usage event when requested.
     fn handle_usage_chunk(&self, value: &Value) -> Result<Vec<StreamOutput>, ChatStreamError> {
         let Some(usage) = value.get("usage") else {
             warn!("tool-emulated upstream chunk has no choices and no usage");
@@ -1650,8 +1721,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             ));
         };
 
-        // Usage normally arrives after the finish chunk; forward it whenever
-        // the client requested it.
+        // OpenAI include_usage permits a usage-only event after the finish chunk.
         if !self.include_usage_requested {
             return Ok(Vec::new());
         }
@@ -1659,9 +1729,11 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         Ok(vec![StreamOutput::Json(self.ctx.usage_chunk(value, usage))])
     }
 
+    /// Finishes the stream by flushing buffered output and adding the `[DONE]` sentinel.
     fn finish_stream(&mut self) -> Result<Vec<StreamOutput>, ChatStreamError> {
         let upstream = &Value::Null;
         let mut output = Vec::new();
+
         if !self.sent_final_finish {
             output.extend(self.finish_buffered_content(
                 upstream,
@@ -1669,11 +1741,13 @@ impl OpenAiToolEmulatedChatStreamTransformer {
                 Value::String("stop".to_owned()),
             )?);
         }
+
         output.push(StreamOutput::Done);
         Ok(output)
     }
 }
 
+/// Returns how many bytes of pending text can be streamed without splitting a possible tool marker.
 fn streamable_pending_text_len(pending_text: &str) -> usize {
     let protected_suffix_len = TOOL_CALL_START_MARKER.len().saturating_sub(1);
     if pending_text.len() <= protected_suffix_len {
@@ -1688,6 +1762,7 @@ fn streamable_pending_text_len(pending_text: &str) -> usize {
 }
 
 impl ChatSseTransformer for OpenAiToolEmulatedChatStreamTransformer {
+    /// Converts one parsed upstream SSE event into tool-emulated streaming outputs.
     fn handle_event(&mut self, event: RawSseEvent) -> Result<Vec<StreamOutput>, ChatStreamError> {
         match classify_upstream_event(event, &TOOL_EMULATED_UPSTREAM_EVENT_LOG)? {
             UpstreamEventKind::Done => self.finish_stream(),
@@ -1699,12 +1774,14 @@ impl ChatSseTransformer for OpenAiToolEmulatedChatStreamTransformer {
     }
 }
 
+/// Client-facing output emitted by chat SSE transformers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamOutput {
     Json(Value),
     Done,
 }
 
+/// Reads an optional upstream choice index as a non-negative integer, defaulting to zero.
 fn normalized_choice_index(index: Option<&Value>) -> Result<u64, ChatStreamError> {
     match index {
         Some(Value::Number(number)) => number.as_u64().ok_or_else(|| {
@@ -1717,6 +1794,7 @@ fn normalized_choice_index(index: Option<&Value>) -> Result<u64, ChatStreamError
     }
 }
 
+/// Reads an upstream finish reason as a string or null value.
 fn normalized_finish_reason(value: Option<&Value>) -> Result<Value, ChatStreamError> {
     match value {
         Some(Value::Null) | None => Ok(Value::Null),
@@ -1727,14 +1805,17 @@ fn normalized_finish_reason(value: Option<&Value>) -> Result<Value, ChatStreamEr
     }
 }
 
+/// Reads the encrypted `delta.content` field from an upstream chunk.
 fn encrypted_delta_content(delta: &Value) -> Result<Option<&str>, ChatStreamError> {
     encrypted_delta_text_field(delta, "content")
 }
 
+/// Reads the encrypted `delta.reasoning_content` field from an upstream chunk.
 fn encrypted_delta_reasoning_content(delta: &Value) -> Result<Option<&str>, ChatStreamError> {
     encrypted_delta_text_field(delta, "reasoning_content")
 }
 
+/// Reads an optional encrypted text field from an upstream delta object.
 fn encrypted_delta_text_field<'a>(
     delta: &'a Value,
     field: &'static str,
@@ -1756,14 +1837,17 @@ fn encrypted_delta_text_field<'a>(
     }
 }
 
+/// Reads an optional string field from a JSON object.
 fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
     value.get(field).and_then(Value::as_str)
 }
 
+/// Reads an optional signed integer field from a JSON object.
 fn integer_field(value: &Value, field: &str) -> Option<i64> {
     value.get(field).and_then(Value::as_i64)
 }
 
+/// Returns the current Unix timestamp in seconds, or zero if the system clock is before the epoch.
 fn unix_timestamp_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1771,14 +1855,17 @@ fn unix_timestamp_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Builds a method-not-allowed proxy error for an unsupported route method.
 async fn method_not_allowed(method: Method, uri: Uri) -> ProxyError {
     ProxyError::MethodNotAllowed { method, uri }
 }
 
+/// Builds a not-found proxy error for unmatched routes.
 async fn not_found(uri: Uri) -> ProxyError {
     ProxyError::NotFound { uri }
 }
 
+/// Errors returned while parsing, decrypting, or transforming upstream chat streams.
 #[derive(Debug, Error)]
 pub enum ChatStreamError {
     #[error("Venice upstream stream failed: {message}")]
@@ -1792,40 +1879,47 @@ pub enum ChatStreamError {
 }
 
 impl ChatStreamError {
+    /// Converts an upstream chunk-read failure into a stream error.
     fn upstream_stream(source: reqwest::Error) -> Self {
         Self::UpstreamStream {
             message: source.to_string(),
         }
     }
 
+    /// Creates an error for an upstream SSE or JSON error event.
     fn upstream_event(message: impl Into<String>) -> Self {
         Self::UpstreamEvent {
             message: message.into(),
         }
     }
 
+    /// Creates an error for malformed upstream stream content.
     fn malformed_event(message: impl Into<String>) -> Self {
         Self::MalformedEvent {
             message: message.into(),
         }
     }
 
+    /// Converts invalid UTF-8 upstream bytes into a malformed-event error.
     fn invalid_utf8(source: std::str::Utf8Error) -> Self {
         Self::MalformedEvent {
             message: format!("upstream SSE bytes are not valid UTF-8: {source}"),
         }
     }
 
+    /// Converts invalid upstream JSON SSE data into a malformed-event error.
     fn json_event(source: serde_json::Error) -> Self {
         Self::MalformedEvent {
             message: format!("upstream SSE data is not valid JSON: {source}"),
         }
     }
 
+    /// Converts E2EE decryption failure into a chat-stream error.
     fn decryption(source: E2eeCodecError) -> Self {
         Self::Decryption { source }
     }
 
+    /// Returns the OpenAI-compatible error type exposed for this stream error.
     fn api_error_type(&self) -> &'static str {
         match self {
             Self::UpstreamStream { .. }
@@ -1835,6 +1929,7 @@ impl ChatStreamError {
         }
     }
 
+    /// Returns the proxy error code exposed for this stream error.
     fn api_error_code(&self) -> &'static str {
         match self {
             Self::UpstreamStream { .. } => "upstream_stream_error",
@@ -1845,6 +1940,7 @@ impl ChatStreamError {
     }
 }
 
+/// Errors returned by HTTP handlers and rendered as OpenAI-compatible JSON errors.
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error(transparent)]
@@ -1877,6 +1973,7 @@ pub enum ProxyError {
 }
 
 impl ProxyError {
+    /// Returns the HTTP status code for this proxy error.
     fn status(&self) -> StatusCode {
         match self {
             Self::Venice(_) => StatusCode::BAD_GATEWAY,
@@ -1900,6 +1997,7 @@ impl ProxyError {
         }
     }
 
+    /// Returns the OpenAI-compatible error type for this proxy error.
     fn error_type(&self) -> &'static str {
         match self {
             Self::Venice(error) => error.api_error_type(),
@@ -1918,6 +2016,7 @@ impl ProxyError {
         }
     }
 
+    /// Returns the stable proxy error code for this proxy error.
     fn code(&self) -> &'static str {
         match self {
             Self::Venice(error) => error.api_error_code(),
@@ -1938,10 +2037,12 @@ impl ProxyError {
 }
 
 impl IntoResponse for ProxyError {
+    /// Converts a proxy error into an OpenAI-compatible JSON HTTP response.
     fn into_response(self) -> Response {
         let status = self.status();
         let error_code = self.code();
         let error_type = self.error_type();
+
         if status.is_server_error() {
             error!(
                 status = status.as_u16(),
@@ -1981,6 +2082,7 @@ impl IntoResponse for ProxyError {
             let body = ErrorResponse::new(self.to_string(), error_type, error_code);
             (status, Json(body)).into_response()
         };
+
         apply_error_headers(response.headers_mut(), error_code);
         response
     }
@@ -2017,6 +2119,7 @@ impl ProxyMetadataHeaders {
         }
     }
 
+    /// Creates metadata headers for a chat response after session attestation succeeds.
     pub fn for_verified_chat(config: &ProxyConfig, session: &SessionContext) -> Self {
         let evidence = session
             .attestation_report
@@ -2060,6 +2163,7 @@ impl ProxyMetadataHeaders {
         }
     }
 
+    /// Applies all present metadata fields to an HTTP header map.
     pub fn apply(&self, headers: &mut HeaderMap) {
         insert_optional_header(headers, HEADER_PROXY_E2EE, self.e2ee.as_deref());
         insert_optional_header(
@@ -2102,22 +2206,26 @@ impl ProxyMetadataHeaders {
     }
 }
 
+/// Applies proxy error metadata headers to an HTTP error response.
 pub fn apply_error_headers(headers: &mut HeaderMap, error_code: &str) {
     insert_header(headers, HEADER_PROXY_ERROR_CODE, error_code);
 }
 
+/// Inserts a string header only when a value is present.
 fn insert_optional_header(headers: &mut HeaderMap, name: &'static str, value: Option<&str>) {
     if let Some(value) = value {
         insert_header(headers, name, value);
     }
 }
 
+/// Inserts a boolean header only when a value is present.
 fn insert_optional_bool_header(headers: &mut HeaderMap, name: &'static str, value: Option<bool>) {
     if let Some(value) = value {
         insert_header(headers, name, if value { "true" } else { "false" });
     }
 }
 
+/// Inserts a header when both the name and value are valid HTTP header components.
 fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
     let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
         return;
@@ -2434,11 +2542,8 @@ mod tests {
         let body = response_body(response).await;
         let chunks = sse_json_chunks(&body);
 
-        // Role is sent once, on the first emitted chunk.
         assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
 
-        // First fragment for a call carries id, type, and name; later
-        // fragments carry only argument text.
         let tool_calls = streamed_tool_call_deltas(&chunks);
         assert!(!tool_calls.is_empty());
         let first = tool_calls[0];
@@ -2643,7 +2748,7 @@ mod tests {
         let body = response_body(response).await;
         let chunks = sse_json_chunks(&body);
 
-        // Usage arrives after the finish chunk and must still pass through.
+        // OpenAI include_usage can arrive after the finish chunk and must still pass through.
         let usage_chunk = chunks.last().expect("stream should have chunks");
         assert_eq!(usage_chunk["choices"], json!([]));
         assert_eq!(usage_chunk["usage"]["total_tokens"], 3);

@@ -29,6 +29,7 @@ pub enum SessionScope {
 }
 
 impl SessionScope {
+    /// Returns the lowercase header value for this session scope.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Agent => "agent",
@@ -38,6 +39,7 @@ impl SessionScope {
 }
 
 impl fmt::Display for SessionScope {
+    /// Formats the session scope using its lowercase header value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -92,6 +94,7 @@ pub struct SessionRequest<'a> {
 }
 
 impl<'a> SessionRequest<'a> {
+    /// Creates a session-resolution request from the model id and HTTP headers.
     pub fn new(model_id: &'a str, headers: &'a HeaderMap) -> Self {
         Self {
             model_id,
@@ -100,12 +103,14 @@ impl<'a> SessionRequest<'a> {
         }
     }
 
+    /// Adds the JSON request body so metadata can contribute session identifiers.
     pub fn with_body(mut self, body: &'a Value) -> Self {
         self.body = Some(body);
         self
     }
 }
 
+/// In-memory session manager that resolves request identifiers and tracks session expiry.
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     config: SessionConfig,
@@ -114,6 +119,7 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// Creates an empty session manager using the supplied session policy.
     pub fn new(config: SessionConfig) -> Self {
         Self {
             config,
@@ -199,6 +205,7 @@ impl SessionManager {
         let expired = sessions
             .get(session_key)
             .and_then(|session| self.expiration_reason(session, now));
+
         if let Some(reason) = expired {
             sessions.remove(session_key);
             return Err(SessionError::SessionExpired { reason });
@@ -230,28 +237,22 @@ impl SessionManager {
         before - sessions.len()
     }
 
+    /// Returns the number of sessions currently stored by the manager.
     pub fn len(&self) -> usize {
         self.lock_sessions().len()
     }
 
+    /// Returns whether the manager currently stores no sessions.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Resolves the request's session identifier from headers, metadata, or configured fallback behavior.
     fn resolve_identifier(
         &self,
         request: SessionRequest<'_>,
     ) -> Result<ResolvedSessionIdentifier, SessionError> {
-        if let Some(value) = header_identifier(request.headers, &self.config.headers.preferred)? {
-            return Ok(ResolvedSessionIdentifier::agent(value));
-        }
-        if let Some(value) = header_identifier(request.headers, &self.config.headers.open_webui)? {
-            return Ok(ResolvedSessionIdentifier::agent(value));
-        }
-        if let Some(value) = metadata_identifier(request.body, "session_id") {
-            return Ok(ResolvedSessionIdentifier::agent(value));
-        }
-        if let Some(value) = metadata_identifier(request.body, "chat_id") {
+        if let Some(value) = self.explicit_identifier(&request)? {
             return Ok(ResolvedSessionIdentifier::agent(value));
         }
 
@@ -267,6 +268,24 @@ impl SessionManager {
         }
     }
 
+    /// Returns the first caller-provided session identifier in precedence order.
+    fn explicit_identifier(
+        &self,
+        request: &SessionRequest<'_>,
+    ) -> Result<Option<String>, SessionError> {
+        if let Some(value) = header_identifier(request.headers, &self.config.headers.preferred)? {
+            return Ok(Some(value));
+        }
+
+        if let Some(value) = header_identifier(request.headers, &self.config.headers.open_webui)? {
+            return Ok(Some(value));
+        }
+
+        Ok(metadata_identifier(request.body, "session_id")
+            .or_else(|| metadata_identifier(request.body, "chat_id")))
+    }
+
+    /// Returns why a session is expired at `now`, or `None` when it remains reusable.
     fn expiration_reason(
         &self,
         session: &SessionContext,
@@ -275,15 +294,19 @@ impl SessionManager {
         if session.request_count >= self.config.max_requests {
             return Some(SessionExpirationReason::MaxRequests);
         }
+
         if now >= session.expires_at {
             return Some(SessionExpirationReason::MaxTtl);
         }
+
         if elapsed_since(session.last_used_at, now) >= self.config.idle_ttl {
             return Some(SessionExpirationReason::IdleTtl);
         }
+
         None
     }
 
+    /// Locks the session map and recovers the map if a previous holder panicked.
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionContext>> {
         self.sessions
             .lock()
@@ -291,6 +314,7 @@ impl SessionManager {
     }
 }
 
+/// Session identifier resolved from a request before it is combined with the model id.
 #[derive(Debug, Clone)]
 struct ResolvedSessionIdentifier {
     agent_session_id: String,
@@ -298,6 +322,7 @@ struct ResolvedSessionIdentifier {
 }
 
 impl ResolvedSessionIdentifier {
+    /// Creates an agent-scoped resolved identifier from a caller-provided id.
     fn agent(agent_session_id: String) -> Self {
         Self {
             agent_session_id,
@@ -307,6 +332,7 @@ impl ResolvedSessionIdentifier {
 }
 
 impl SessionContext {
+    /// Creates a new session snapshot for a model/id pair at the supplied time.
     fn new(
         model_id: &str,
         agent_session_id: String,
@@ -331,6 +357,7 @@ impl SessionContext {
     }
 }
 
+/// Errors returned while resolving, reusing, or updating proxy sessions.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SessionError {
     #[error("request model id must not be empty")]
@@ -347,6 +374,7 @@ pub enum SessionError {
     SessionExpired { reason: SessionExpirationReason },
 }
 
+/// Reads a configured header name from request headers and returns a trimmed non-empty value.
 fn header_identifier(
     headers: &HeaderMap,
     configured_name: &str,
@@ -368,6 +396,7 @@ fn header_identifier(
     Ok(non_empty_string(value))
 }
 
+/// Reads a non-empty session identifier from `metadata[key]` in the request body.
 fn metadata_identifier(body: Option<&Value>, key: &str) -> Option<String> {
     body.and_then(|body| body.get("metadata"))
         .and_then(|metadata| metadata.get(key))
@@ -375,15 +404,18 @@ fn metadata_identifier(body: Option<&Value>, key: &str) -> Option<String> {
         .and_then(non_empty_string)
 }
 
+/// Returns a trimmed owned string when the input contains non-whitespace text.
 fn non_empty_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// Builds the storage key that scopes a session identifier to a model id.
 fn session_key(model_id: &str, agent_session_id: &str) -> String {
     format!("{model_id}:{agent_session_id}")
 }
 
+/// Returns elapsed wall-clock time between two instants, or zero if `now` is earlier.
 fn elapsed_since(start: SystemTime, now: SystemTime) -> Duration {
     now.duration_since(start).unwrap_or(Duration::ZERO)
 }

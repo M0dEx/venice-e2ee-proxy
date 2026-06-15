@@ -43,6 +43,7 @@ pub fn generate_tool_call_id() -> String {
 /// by the full output size.
 const CORRECTION_INVALID_OUTPUT_MAX_BYTES: usize = 4_096;
 
+/// Per-request tool-emulation state derived from config, tools, and tool choice.
 #[derive(Debug, Clone)]
 pub struct ToolEmulationContext {
     config: ToolsConfig,
@@ -52,6 +53,7 @@ pub struct ToolEmulationContext {
     prompt_format: ToolPromptFormat,
 }
 
+/// Prompt/parser format selected for the model family handling tool calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolPromptFormat {
     HermesJson,
@@ -60,6 +62,7 @@ enum ToolPromptFormat {
 }
 
 impl ToolPromptFormat {
+    /// Chooses a prompt/parser format from the requested model id.
     fn for_model(model: &str) -> Self {
         let model = model.to_ascii_lowercase();
         if model.contains("glm") {
@@ -77,6 +80,7 @@ impl ToolPromptFormat {
 }
 
 impl ToolEmulationContext {
+    /// Builds tool-emulation context for a request, or returns `None` when tools are disabled or unused.
     pub fn from_request(
         config: &ToolsConfig,
         request: &ChatCompletionRequest,
@@ -84,9 +88,11 @@ impl ToolEmulationContext {
         if !config.enabled || config.mode == ToolMode::None {
             return Ok(None);
         }
+
         if matches!(request.tool_choice, ChatToolChoice::None) {
             return Ok(None);
         }
+
         if request.tools.is_empty() {
             if matches!(
                 request.tool_choice,
@@ -108,6 +114,7 @@ impl ToolEmulationContext {
                     format!("duplicate function tool name {:?}", tool.name()),
                 ));
             }
+
             if config.validate_json_schema
                 && let Some(schema) = tool.parameters_schema()
             {
@@ -159,14 +166,17 @@ impl ToolEmulationContext {
         }))
     }
 
+    /// Returns the tool-emulation configuration used by this context.
     pub fn config(&self) -> &ToolsConfig {
         &self.config
     }
 
+    /// Returns the maximum number of correction retries allowed for invalid tool calls.
     pub fn max_retries(&self) -> u32 {
         self.config.max_retries
     }
 
+    /// Returns the maximum time to wait for a non-streamed tool-call marker response.
     pub fn marker_timeout(&self) -> Duration {
         self.config.tool_call_marker_timeout
     }
@@ -176,6 +186,7 @@ impl ToolEmulationContext {
         self.create_parser_for_format(self.prompt_format)
     }
 
+    /// Creates a parser for a specific prompt format.
     fn create_parser_for_format(
         &self,
         format: ToolPromptFormat,
@@ -190,6 +201,7 @@ impl ToolEmulationContext {
         })
     }
 
+    /// Converts OpenAI function tools into the vLLM parser tool representation.
     fn vllm_tools(&self) -> Vec<Tool> {
         self.tools
             .iter()
@@ -209,6 +221,7 @@ impl ToolEmulationContext {
             .collect()
     }
 
+    /// Builds the system/controller prompt message that instructs the model to emit tool calls.
     pub fn controller_message(&self) -> NormalizedChatMessage {
         let requirement = if self.require_tool_call {
             "You must call at least one tool. Do not answer the user directly. Output each tool call using this format and nothing else:"
@@ -239,6 +252,7 @@ impl ToolEmulationContext {
         NormalizedChatMessage::new("user", content)
     }
 
+    /// Builds a correction prompt from the previous validation error and assistant output.
     pub fn correction_message(
         &self,
         validation_error: &str,
@@ -260,6 +274,7 @@ impl ToolEmulationContext {
         NormalizedChatMessage::new("system", content)
     }
 
+    /// Builds Hermes-style JSON tool-call controller instructions.
     fn hermes_controller_content(&self, requirement: &str, optional_rule: &str) -> String {
         format!(
             "You have access to tools.\n\n{requirement}\n\nRequired tool-call format:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nInside each {TOOL_CALL_START} block, output ONLY one valid JSON object with exactly these top-level keys:\n- \"name\": the tool name as a JSON string.\n- \"arguments\": a JSON object containing the tool arguments.\n\nValid single-call example:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nValid multi-call example:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nInvalid formats. NEVER use these:\n- {TOOL_CALL_START}TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}){TOOL_CALL_END}\n- {TOOL_CALL_START}TOOL_NAME{{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}{TOOL_CALL_END}\n- TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}})\n- {{\"tool\":\"TOOL_NAME\",\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- Always put the tool name in the JSON \"name\" field.\n- Always put tool arguments inside the JSON \"arguments\" object.\n- Do not put arguments directly after the tool name.\n- Do not use function-call syntax like TOOL_NAME(...).\n- arguments must be valid JSON and must satisfy the tool schema.\n- Emit one marker block per tool call.\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
@@ -271,6 +286,7 @@ impl ToolEmulationContext {
         )
     }
 
+    /// Builds Qwen XML-wrapped JSON tool-call controller instructions.
     fn qwen_xml_controller_content(&self, requirement: &str, optional_rule: &str) -> String {
         format!(
             "You have access to tools.\n\n{requirement}\n\nRequired Qwen XML-wrapped JSON tool-call format:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nThere MUST be a newline immediately after {TOOL_CALL_START}. Inside each block, output ONLY one valid JSON object with exactly these top-level keys:\n- \"name\": the tool name as a JSON string.\n- \"arguments\": a JSON object containing the tool arguments.\n\nValid example:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- Always put the tool name in the JSON \"name\" field.\n- Always put tool arguments inside the JSON \"arguments\" object.\n- Do not use function-call syntax like TOOL_NAME(...).\n- arguments must be valid JSON and must satisfy the tool schema.\n- Emit one marker block per tool call.\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
@@ -280,6 +296,7 @@ impl ToolEmulationContext {
         )
     }
 
+    /// Builds GLM XML tool-call controller instructions.
     fn glm_xml_controller_content(&self, requirement: &str, optional_rule: &str) -> String {
         format!(
             "You have access to tools.\n\n{requirement}\n\nRequired GLM XML tool-call format:\n\n{TOOL_CALL_START}TOOL_NAME\n<arg_key>ARGUMENT_NAME</arg_key>\n<arg_value>ARGUMENT_VALUE</arg_value>\n{TOOL_CALL_END}\n\nInside each {TOOL_CALL_START} block:\n- Start with the exact tool name as plain text.\n- Then output one <arg_key>/<arg_value> pair for each argument.\n- Put only the raw argument name inside <arg_key>.\n- Put only the raw argument value inside <arg_value>.\n- If an argument value is an object or array, put compact valid JSON inside <arg_value>.\n\nValid single-call example:\n\n{TOOL_CALL_START}TOOL_NAME\n<arg_key>ARGUMENT_NAME</arg_key>\n<arg_value>ARGUMENT_VALUE</arg_value>\n{TOOL_CALL_END}\n\nValid multi-call example:\n\n{TOOL_CALL_START}TOOL_NAME_1\n<arg_key>ARGUMENT_NAME</arg_key>\n<arg_value>ARGUMENT_VALUE</arg_value>\n{TOOL_CALL_END}\n{TOOL_CALL_START}TOOL_NAME_2\n<arg_key>ARGUMENT_NAME</arg_key>\n<arg_value>ARGUMENT_VALUE</arg_value>\n{TOOL_CALL_END}\n\nInvalid formats. NEVER use these:\n- {TOOL_CALL_START}TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}){TOOL_CALL_END}\n- {TOOL_CALL_START}TOOL_NAME{{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}{TOOL_CALL_END}\n- {TOOL_CALL_START}{{\"name\":\"TOOL_NAME\",\"arguments\":{{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}}}{TOOL_CALL_END}\n- TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}})\n\nRules:\n- TOOL_NAME must exactly match one available tool name.\n- Do not output JSON inside {TOOL_CALL_START} except for object/array values inside <arg_value>.\n- Do not use function-call syntax like TOOL_NAME(...).\n- Do not use the Hermes JSON format with \"name\" and \"arguments\" keys.\n- Argument names and values must satisfy the tool schema.\n- Emit one marker block per tool call.\n- Do not include markdown fences.\n- Do not include explanations.{optional_rule}\n\nAvailable tools:\n{}",
@@ -287,6 +304,7 @@ impl ToolEmulationContext {
         )
     }
 
+    /// Builds Hermes-style correction instructions after invalid tool-call output.
     fn hermes_correction_content(&self, validation_error: &str, invalid_output: &str) -> String {
         format!(
             "Your previous response attempted a tool call, but it was invalid.\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}\n\nYou must now return only valid tool calls and nothing else.\n\nUse this exact format:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nInside each {TOOL_CALL_START} block, output ONLY one valid JSON object with exactly these top-level keys:\n- \"name\": the tool name as a JSON string.\n- \"arguments\": a JSON object containing the tool arguments.\n\nValid example:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nInvalid formats. NEVER use these:\n- {TOOL_CALL_START}TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}){TOOL_CALL_END}\n- {TOOL_CALL_START}TOOL_NAME{{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}{TOOL_CALL_END}\n- TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}})\n\nRules:\n- TOOL_NAME must exactly match one of the available tools.\n- Always put the tool name in the JSON \"name\" field.\n- Always put tool arguments inside the JSON \"arguments\" object.\n- Do not put arguments directly after the tool name.\n- Do not use function-call syntax like TOOL_NAME(...).\n- arguments must be a JSON object.\n- arguments must satisfy the tool schema.\n- Do not include markdown fences.\n- Do not include explanations.\n- Do not answer the user directly.\n\nAvailable tools:\n{}",
@@ -296,6 +314,7 @@ impl ToolEmulationContext {
         )
     }
 
+    /// Builds Qwen XML-wrapped JSON correction instructions after invalid tool-call output.
     fn qwen_xml_correction_content(&self, validation_error: &str, invalid_output: &str) -> String {
         format!(
             "Your previous response attempted a tool call, but it was invalid.\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}\n\nYou must now return only valid tool calls and nothing else.\n\nUse this exact Qwen XML-wrapped JSON format:\n\n{TOOL_CALL_START}\n{}\n{TOOL_CALL_END}\n\nThere MUST be a newline immediately after {TOOL_CALL_START}. Inside each block, output ONLY one valid JSON object with \"name\" and \"arguments\" top-level keys.\n\nAvailable tools:\n{}",
@@ -303,6 +322,7 @@ impl ToolEmulationContext {
         )
     }
 
+    /// Builds GLM XML correction instructions after invalid tool-call output.
     fn glm_xml_correction_content(&self, validation_error: &str, invalid_output: &str) -> String {
         format!(
             "Your previous response attempted a tool call, but it was invalid.\n\nValidation error:\n{validation_error}\n\nInvalid output:\n{invalid_output}\n\nYou must now return only valid tool calls and nothing else.\n\nUse this exact GLM XML format:\n\n{TOOL_CALL_START}TOOL_NAME\n<arg_key>ARGUMENT_NAME</arg_key>\n<arg_value>ARGUMENT_VALUE</arg_value>\n{TOOL_CALL_END}\n\nInside each {TOOL_CALL_START} block:\n- Start with the exact tool name as plain text.\n- Then output one <arg_key>/<arg_value> pair for each argument.\n- Put only the raw argument name inside <arg_key>.\n- Put only the raw argument value inside <arg_value>.\n\nValid example:\n\n{TOOL_CALL_START}TOOL_NAME\n<arg_key>ARGUMENT_NAME</arg_key>\n<arg_value>ARGUMENT_VALUE</arg_value>\n{TOOL_CALL_END}\n\nInvalid formats. NEVER use these:\n- {TOOL_CALL_START}TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}){TOOL_CALL_END}\n- {TOOL_CALL_START}TOOL_NAME{{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}{TOOL_CALL_END}\n- {TOOL_CALL_START}{{\"name\":\"TOOL_NAME\",\"arguments\":{{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}}}}{TOOL_CALL_END}\n- TOOL_NAME({{\"ARGUMENT_NAME\":\"ARGUMENT_VALUE\"}})\n\nRules:\n- TOOL_NAME must exactly match one of the available tools.\n- Do not output JSON inside {TOOL_CALL_START} except for object/array values inside <arg_value>.\n- Do not use function-call syntax like TOOL_NAME(...).\n- Do not use the Hermes JSON format with \"name\" and \"arguments\" keys.\n- Argument names and values must satisfy the tool schema.\n- Do not include markdown fences.\n- Do not include explanations.\n- Do not answer the user directly.\n\nAvailable tools:\n{}",
@@ -326,25 +346,7 @@ impl ToolEmulationContext {
             };
         }
 
-        let result = match self.parse_tool_calls_with_format(self.prompt_format, output) {
-            Ok(tool_calls)
-                if tool_calls.is_empty()
-                    && self.prompt_format != ToolPromptFormat::HermesJson
-                    && output.contains(TOOL_CALL_START) =>
-            {
-                match self.parse_tool_calls_with_format(ToolPromptFormat::HermesJson, output) {
-                    Ok(fallback_calls) if !fallback_calls.is_empty() => Ok(fallback_calls),
-                    _ => Ok(tool_calls),
-                }
-            }
-            Err(error) if self.prompt_format != ToolPromptFormat::HermesJson => {
-                match self.parse_tool_calls_with_format(ToolPromptFormat::HermesJson, output) {
-                    Ok(fallback_calls) if !fallback_calls.is_empty() => Ok(fallback_calls),
-                    _ => Err(error),
-                }
-            }
-            result => result,
-        };
+        let result = self.parse_tool_calls(output);
 
         match result {
             Ok(tool_calls) if tool_calls.is_empty() => {
@@ -367,6 +369,44 @@ impl ToolEmulationContext {
         }
     }
 
+    /// Parses and validates assistant output, using Hermes as a compatibility fallback when needed.
+    fn parse_tool_calls(
+        &self,
+        output: &str,
+    ) -> Result<Vec<ValidatedToolCall>, ToolCallValidationError> {
+        let result = self.parse_tool_calls_with_format(self.prompt_format, output);
+        if self.prompt_format == ToolPromptFormat::HermesJson {
+            return result;
+        }
+
+        match result {
+            Ok(tool_calls) if tool_calls.is_empty() && output.contains(TOOL_CALL_START) => {
+                if let Some(fallback_calls) = self.hermes_fallback_tool_calls(output) {
+                    Ok(fallback_calls)
+                } else {
+                    Ok(tool_calls)
+                }
+            }
+            Err(error) => {
+                if let Some(fallback_calls) = self.hermes_fallback_tool_calls(output) {
+                    Ok(fallback_calls)
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
+    }
+
+    /// Attempts to parse non-empty Hermes JSON tool calls from model output.
+    fn hermes_fallback_tool_calls(&self, output: &str) -> Option<Vec<ValidatedToolCall>> {
+        match self.parse_tool_calls_with_format(ToolPromptFormat::HermesJson, output) {
+            Ok(tool_calls) if !tool_calls.is_empty() => Some(tool_calls),
+            _ => None,
+        }
+    }
+
+    /// Parses and validates assistant output using a specific prompt/parser format.
     fn parse_tool_calls_with_format(
         &self,
         format: ToolPromptFormat,
@@ -469,6 +509,7 @@ struct LenientToolParser {
 }
 
 impl ToolParser for LenientToolParser {
+    /// Creates a lenient Hermes parser for the supplied tools.
     fn create(tools: &[Tool]) -> vllm_tool_parser::Result<Box<dyn ToolParser>> {
         Ok(Box::new(Self {
             inner: HermesToolParser::create(tools)?,
@@ -477,6 +518,7 @@ impl ToolParser for LenientToolParser {
         }))
     }
 
+    /// Pushes one assistant output chunk through the parser and returns parsed deltas.
     fn push(&mut self, chunk: &str) -> vllm_tool_parser::Result<ToolParseResult> {
         let mut merged = ToolParseResult::default();
         if self.drained {
@@ -493,8 +535,9 @@ impl ToolParser for LenientToolParser {
                     if !self.args_scanner.complete() {
                         return Err(error);
                     }
-                    // The last call's arguments are complete; treat the rest
-                    // of the output as discardable garbage.
+                    // Some live GLM outputs append a native closing tag after complete
+                    // Hermes arguments; keep the parsed call rather than failing on that
+                    // incompatible tail.
                     warn!(%error, "ignoring trailing output after a complete tool call");
                     self.drained = true;
                     break;
@@ -504,6 +547,7 @@ impl ToolParser for LenientToolParser {
         Ok(merged)
     }
 
+    /// Finishes parsing and returns any recovered complete tool calls.
     fn finish(&mut self) -> vllm_tool_parser::Result<ToolParseResult> {
         if self.drained {
             return Ok(ToolParseResult::default());
@@ -512,8 +556,8 @@ impl ToolParser for LenientToolParser {
             Ok(result) => return Ok(result),
             Err(error) => error,
         };
-        // Assume the closing marker was cut off; complete it and retry. Keep
-        // the original error when the output is truncated beyond recovery.
+        // Venice sometimes cuts only the closing marker; keep the original
+        // parser error when appending that marker still cannot recover a complete call.
         let Ok(mut recovered) = self.inner.push(TOOL_CALL_END) else {
             return Err(error);
         };
@@ -555,6 +599,7 @@ struct ArgsCompletenessScanner {
 }
 
 impl ArgsCompletenessScanner {
+    /// Updates scanner state from parser deltas emitted for tool calls.
     fn track(&mut self, result: &ToolParseResult) {
         for call in &result.calls {
             if call.name.is_some() {
@@ -564,6 +609,7 @@ impl ArgsCompletenessScanner {
         }
     }
 
+    /// Consumes an argument fragment and updates JSON completeness state.
     fn feed(&mut self, fragment: &str) {
         for ch in fragment.chars() {
             if self.escaped {
@@ -594,11 +640,13 @@ impl ArgsCompletenessScanner {
         }
     }
 
+    /// Returns whether the most recently observed argument text is a complete JSON value.
     fn complete(&self) -> bool {
         self.started && self.depth == 0 && !self.in_string
     }
 }
 
+/// Classification of a decrypted assistant response under tool emulation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOutputClassification {
     NormalText,
@@ -609,6 +657,7 @@ pub enum ToolOutputClassification {
     },
 }
 
+/// OpenAI-compatible tool call validated against the request's available tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedToolCall {
     pub id: String,
@@ -617,6 +666,7 @@ pub struct ValidatedToolCall {
 }
 
 impl ValidatedToolCall {
+    /// Converts the validated call into an OpenAI `tool_calls` JSON object.
     pub fn to_openai_value(&self) -> Value {
         serde_json::json!({
             "id": self.id,
@@ -629,6 +679,7 @@ impl ValidatedToolCall {
     }
 }
 
+/// Validation error for parsed assistant tool-call output.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{message}")]
 pub struct ToolCallValidationError {
@@ -636,21 +687,25 @@ pub struct ToolCallValidationError {
 }
 
 impl ToolCallValidationError {
+    /// Creates a validation error with a client-facing message.
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
     }
 
+    /// Returns the validation error message.
     pub fn message(&self) -> &str {
         &self.message
     }
 }
 
+/// Validates that a tool parameters schema uses the supported JSON Schema subset.
 fn validate_schema_shape(schema: &Map<String, Value>) -> Result<(), String> {
     validate_schema_object_shape(schema, "schema")
 }
 
+/// Validates one schema object and nested supported schema objects.
 fn validate_schema_object_shape(object: &Map<String, Value>, path: &str) -> Result<(), String> {
     if let Some(kind) = object.get("type") {
         validate_schema_type_shape(kind, &format!("{path}.type"))?;
@@ -701,6 +756,7 @@ fn validate_schema_object_shape(object: &Map<String, Value>, path: &str) -> Resu
     Ok(())
 }
 
+/// Validates a JSON Schema `type` value in string or string-array form.
 fn validate_schema_type_shape(value: &Value, path: &str) -> Result<(), String> {
     match value {
         Value::String(kind) => validate_schema_type_name(kind, path),
@@ -720,6 +776,7 @@ fn validate_schema_type_shape(value: &Value, path: &str) -> Result<(), String> {
     }
 }
 
+/// Validates one supported JSON Schema type name.
 fn validate_schema_type_name(kind: &str, path: &str) -> Result<(), String> {
     match kind {
         "object" | "array" | "string" | "integer" | "number" | "boolean" | "null" => Ok(()),
@@ -729,6 +786,7 @@ fn validate_schema_type_name(kind: &str, path: &str) -> Result<(), String> {
     }
 }
 
+/// Validates a JSON value against the supported JSON Schema subset.
 fn validate_value_against_schema(
     value: &Value,
     schema: &Map<String, Value>,
@@ -812,6 +870,7 @@ fn validate_value_against_schema(
     Ok(())
 }
 
+/// Reads a nested schema value as an object for recursive validation.
 fn schema_value_as_object<'a>(
     schema: &'a Value,
     path: &str,
@@ -821,6 +880,7 @@ fn schema_value_as_object<'a>(
         .ok_or_else(|| format!("{path} schema must be an object"))
 }
 
+/// Returns whether a schema requires object-specific validation.
 fn schema_implies_object(schema: &Map<String, Value>) -> bool {
     schema
         .get("type")
@@ -830,6 +890,7 @@ fn schema_implies_object(schema: &Map<String, Value>) -> bool {
         || schema.contains_key("additionalProperties")
 }
 
+/// Returns whether a schema requires array-specific validation.
 fn schema_implies_array(schema: &Map<String, Value>) -> bool {
     schema
         .get("type")
@@ -837,6 +898,7 @@ fn schema_implies_array(schema: &Map<String, Value>) -> bool {
         || schema.contains_key("items")
 }
 
+/// Returns whether a JSON value matches a schema `type` value.
 fn schema_type_matches(value: &Value, kind: &Value) -> bool {
     match kind {
         Value::String(kind) => value_matches_schema_type(value, kind),
@@ -848,6 +910,7 @@ fn schema_type_matches(value: &Value, kind: &Value) -> bool {
     }
 }
 
+/// Returns whether a schema `type` value includes a named type.
 fn schema_type_includes(kind: &Value, expected: &str) -> bool {
     match kind {
         Value::String(kind) => kind == expected,
@@ -859,6 +922,7 @@ fn schema_type_includes(kind: &Value, expected: &str) -> bool {
     }
 }
 
+/// Returns whether a JSON value matches one supported schema type name.
 fn value_matches_schema_type(value: &Value, kind: &str) -> bool {
     match kind {
         "object" => value.is_object(),
@@ -872,6 +936,7 @@ fn value_matches_schema_type(value: &Value, kind: &str) -> bool {
     }
 }
 
+/// Formats a schema `type` value for validation error messages.
 fn schema_type_description(kind: &Value) -> String {
     match kind {
         Value::String(kind) => kind.clone(),
@@ -884,6 +949,7 @@ fn schema_type_description(kind: &Value) -> String {
     }
 }
 
+/// Returns a human-readable kind name for a JSON value.
 fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",

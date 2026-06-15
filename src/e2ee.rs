@@ -45,6 +45,7 @@ pub struct E2eeCodec {
 }
 
 impl E2eeCodec {
+    /// Builds an E2EE codec from validated proxy configuration.
     pub fn from_config(config: &E2eeConfig) -> Result<Self, E2eeCodecError> {
         Self::new(
             config.hkdf_info.as_bytes(),
@@ -52,6 +53,7 @@ impl E2eeCodec {
         )
     }
 
+    /// Builds an E2EE codec from HKDF context bytes and the missing-content response policy.
     pub fn new(
         hkdf_info: impl AsRef<[u8]>,
         require_encrypted_response_content: bool,
@@ -67,6 +69,7 @@ impl E2eeCodec {
         })
     }
 
+    /// Returns whether response chunks must contain encrypted content fields.
     pub fn require_encrypted_response_content(&self) -> bool {
         self.require_encrypted_response_content
     }
@@ -137,6 +140,7 @@ impl E2eeCodec {
             .map(Some)
     }
 
+    /// Encrypts plaintext using caller-supplied peer key, ephemeral key, and nonce values.
     fn encrypt_content_with_parts(
         &self,
         plaintext: &str,
@@ -163,6 +167,7 @@ impl E2eeCodec {
         Ok(EncryptedPayload::from_packed_bytes_unchecked(&packed))
     }
 
+    /// Derives a content key from a local private key and parsed peer public key.
     fn derive_content_key_from_public_key(
         &self,
         local_private_key: &SecretKey,
@@ -177,6 +182,7 @@ impl E2eeCodec {
 }
 
 impl Default for E2eeCodec {
+    /// Returns the codec for the default E2EE configuration.
     fn default() -> Self {
         Self::from_config(&E2eeConfig::default()).expect("default E2EE config is valid")
     }
@@ -188,10 +194,12 @@ impl Default for E2eeCodec {
 pub struct ContentEncryptionKey(Zeroizing<[u8; AES_256_KEY_LEN]>);
 
 impl ContentEncryptionKey {
+    /// Wraps derived key bytes in the content-encryption key type.
     fn new(bytes: Zeroizing<[u8; AES_256_KEY_LEN]>) -> Self {
         Self(bytes)
     }
 
+    /// Returns the raw key bytes for cipher construction.
     fn as_slice(&self) -> &[u8] {
         &self.0[..]
     }
@@ -200,12 +208,14 @@ impl ContentEncryptionKey {
 impl ZeroizeOnDrop for ContentEncryptionKey {}
 
 impl fmt::Debug for ContentEncryptionKey {
+    /// Formats the key without exposing secret key bytes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ContentEncryptionKey([redacted])")
     }
 }
 
 impl PartialEq for ContentEncryptionKey {
+    /// Compares two content keys by their raw key bytes.
     fn eq(&self, other: &Self) -> bool {
         self.as_slice() == other.as_slice()
     }
@@ -213,6 +223,7 @@ impl PartialEq for ContentEncryptionKey {
 
 impl Eq for ContentEncryptionKey {}
 
+/// Builds an AES-256-GCM cipher from a derived content-encryption key.
 fn aes256_gcm_from_key(key: &ContentEncryptionKey) -> Aes256Gcm {
     // Zeroization note for the resolved RustCrypto stack used here:
     // - `aes-gcm` with `zeroize` wipes its temporary GHASH key during init.
@@ -238,22 +249,26 @@ fn aes256_gcm_from_key(key: &ContentEncryptionKey) -> Aes256Gcm {
 pub struct Nonce([u8; NONCE_LEN]);
 
 impl Nonce {
+    /// Generates a fresh random AES-GCM nonce.
     pub fn generate() -> Self {
         let mut bytes = [0_u8; NONCE_LEN];
         OsRng.fill_bytes(&mut bytes);
         Self(bytes)
     }
 
+    /// Builds a nonce from exactly 12 bytes.
     pub fn from_bytes(bytes: [u8; NONCE_LEN]) -> Self {
         Self(bytes)
     }
 
+    /// Returns the nonce bytes for AES-GCM encryption or decryption.
     pub fn as_bytes(&self) -> &[u8; NONCE_LEN] {
         &self.0
     }
 }
 
 impl fmt::Debug for Nonce {
+    /// Formats the nonce as hex for diagnostics.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Nonce")
             .field(&hex::encode(self.as_bytes()))
@@ -267,26 +282,31 @@ impl fmt::Debug for Nonce {
 pub struct EncryptedPayload(String);
 
 impl EncryptedPayload {
+    /// Validates a packed encrypted payload hex string and stores it in lowercase form.
     pub fn from_hex(value: impl Into<String>) -> Result<Self, E2eeCodecError> {
         let value = value.into();
         validate_packed_payload_hex(&value)?;
         Ok(Self(value.to_ascii_lowercase()))
     }
 
+    /// Returns the packed encrypted payload as a hex string slice.
     pub fn as_hex(&self) -> &str {
         &self.0
     }
 
+    /// Consumes the payload and returns the owned packed hex string.
     pub fn into_hex(self) -> String {
         self.0
     }
 
+    /// Encodes already-packed encrypted payload bytes as lowercase hex.
     fn from_packed_bytes_unchecked(bytes: &[u8]) -> Self {
         Self(hex::encode(bytes))
     }
 }
 
 impl fmt::Debug for EncryptedPayload {
+    /// Formats payload metadata without printing the ciphertext bytes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EncryptedPayload")
             .field("hex_len", &self.0.len())
@@ -294,6 +314,7 @@ impl fmt::Debug for EncryptedPayload {
     }
 }
 
+/// Parsed parts of a packed Venice E2EE payload.
 struct PackedEncryptedPayload {
     ephemeral_public_key: PublicKey,
     nonce: [u8; NONCE_LEN],
@@ -301,6 +322,7 @@ struct PackedEncryptedPayload {
 }
 
 impl PackedEncryptedPayload {
+    /// Splits a validated encrypted payload into public key, nonce, and ciphertext/tag parts.
     fn unpack(payload: &EncryptedPayload) -> Result<Self, E2eeCodecError> {
         let bytes = hex::decode(payload.as_hex()).map_err(|error| {
             E2eeCodecError::MalformedEncryptedPayload {
@@ -337,6 +359,7 @@ impl PackedEncryptedPayload {
     }
 }
 
+/// Errors returned by E2EE request encryption and response decryption.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum E2eeCodecError {
     #[error("configured E2EE HKDF info must not be empty")]
@@ -355,6 +378,7 @@ pub enum E2eeCodecError {
     EncryptionFailed,
 }
 
+/// Derives an AES-256 content key from an ECDH shared secret and HKDF context bytes.
 fn derive_aes_key(shared_secret: &SharedSecret, hkdf_info: &[u8]) -> ContentEncryptionKey {
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret.raw_secret_bytes());
     let mut output_key = Zeroizing::new([0_u8; AES_256_KEY_LEN]);
@@ -363,6 +387,7 @@ fn derive_aes_key(shared_secret: &SharedSecret, hkdf_info: &[u8]) -> ContentEncr
     ContentEncryptionKey::new(output_key)
 }
 
+/// Parses an uncompressed SEC1 secp256k1 public key from a hex string.
 fn decode_uncompressed_public_key_hex(value: &str) -> Result<PublicKey, E2eeCodecError> {
     let bytes = hex::decode(value).map_err(|error| E2eeCodecError::InvalidPublicKey {
         message: error.to_string(),
@@ -387,6 +412,7 @@ fn decode_uncompressed_public_key_hex(value: &str) -> Result<PublicKey, E2eeCode
     })
 }
 
+/// Validates that a hex string can contain the minimum packed Venice E2EE payload.
 fn validate_packed_payload_hex(value: &str) -> Result<(), E2eeCodecError> {
     if value.is_empty() {
         return Err(E2eeCodecError::MalformedEncryptedPayload {
