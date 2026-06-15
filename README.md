@@ -45,7 +45,7 @@ Endpoints:
 - `stream_options.include_usage`
 - Venice reasoning fields: `reasoning` and `reasoning_effort`
 - OpenAI function tools via local emulation
-- session reuse through `X-Venice-Proxy-Session-Id`, `X-OpenWebUI-Chat-Id`, or `metadata.session_id` / `metadata.chat_id`
+- session reuse through the configured session-id header (`X-Venice-Proxy-Session-Id` by default) or `metadata.session_id`
 
 ## Build
 
@@ -84,7 +84,7 @@ Useful config sections:
 
 - `[server]`: bind host and port. Defaults in `config/default.toml` are `0.0.0.0:8080`.
 - `[venice]`: Venice base URL, API key, and request timeout.
-- `[session]`: in-memory attestation/model-key reuse policy and session-id headers.
+- `[session]`: in-memory attestation/model-key reuse policy and session-id header.
 - `[attestation]`: local attestation policy gates.
 - `[e2ee]`: E2EE codec settings.
 - `[tools]`: tool emulation mode, retry count, marker timeout, max parsed output size, and schema validation.

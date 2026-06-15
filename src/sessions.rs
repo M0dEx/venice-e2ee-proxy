@@ -1,7 +1,7 @@
 //! Per-agent-session lifecycle and attestation/model-key state.
 //!
 //! Sessions are keyed by `model_id:agent_session_id`, with identifiers resolved
-//! from configured headers, Open WebUI headers, request metadata, or configured
+//! from the configured session-id header, request metadata, or configured
 //! fallback behavior. Expired sessions are discarded before reuse so E2EE and
 //! attestation state can be refreshed safely.
 
@@ -273,16 +273,13 @@ impl SessionManager {
         &self,
         request: &SessionRequest<'_>,
     ) -> Result<Option<String>, SessionError> {
-        if let Some(value) = header_identifier(request.headers, &self.config.headers.preferred)? {
+        if let Some(value) =
+            header_identifier(request.headers, &self.config.headers.incoming_session_id)?
+        {
             return Ok(Some(value));
         }
 
-        if let Some(value) = header_identifier(request.headers, &self.config.headers.open_webui)? {
-            return Ok(Some(value));
-        }
-
-        Ok(metadata_identifier(request.body, "session_id")
-            .or_else(|| metadata_identifier(request.body, "chat_id")))
+        Ok(metadata_identifier(request.body, "session_id"))
     }
 
     /// Returns why a session is expired at `now`, or `None` when it remains reusable.
@@ -449,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_new_agent_session_from_preferred_header() {
+    fn creates_new_agent_session_from_incoming_session_id_header() {
         let manager = manager();
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -471,12 +468,14 @@ mod tests {
     }
 
     #[test]
-    fn reuses_existing_session_from_configured_headers() {
-        let manager = manager();
+    fn reuses_existing_session_from_configured_header() {
+        let mut config = test_config();
+        config.headers.incoming_session_id = "X-Custom-Session-Id".to_owned();
+        let manager = SessionManager::new(config);
         let mut headers = HeaderMap::new();
         headers.insert(
-            "X-OpenWebUI-Chat-Id",
-            HeaderValue::from_static("open-webui-chat"),
+            "X-Custom-Session-Id",
+            HeaderValue::from_static("configured-chat"),
         );
 
         let first = manager
@@ -495,18 +494,14 @@ mod tests {
     }
 
     #[test]
-    fn preferred_header_wins_over_open_webui_and_metadata() {
+    fn configured_header_wins_over_metadata() {
         let manager = manager();
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Venice-Proxy-Session-Id",
-            HeaderValue::from_static("preferred"),
+            HeaderValue::from_static("header-session"),
         );
-        headers.insert(
-            "X-OpenWebUI-Chat-Id",
-            HeaderValue::from_static("open-webui"),
-        );
-        let body = json!({ "metadata": { "session_id": "body-session", "chat_id": "body-chat" } });
+        let body = json!({ "metadata": { "session_id": "body-session" } });
 
         let resolved = manager
             .get_or_create_at(
@@ -515,7 +510,7 @@ mod tests {
             )
             .expect("session should resolve");
 
-        assert_eq!(resolved.session.session_key, "model-a:preferred");
+        assert_eq!(resolved.session.session_key, "model-a:header-session");
     }
 
     #[test]

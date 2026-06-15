@@ -20,8 +20,7 @@ max_requests = 100
 fallback_scope = "request"
 
 [session.headers]
-preferred = "X-Venice-Proxy-Session-Id"
-open_webui = "X-OpenWebUI-Chat-Id"
+incoming_session_id = "X-Venice-Proxy-Session-Id"
 
 [attestation]
 mode = "independent"
