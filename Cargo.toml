@@ -1,6 +1,6 @@
 [package]
 name = "venice-e2ee-proxy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Jakub Kubík <jakub.kubik.it@protonmail.com>"]
 description = "OpenAI-compatible proxy for Venice.ai E2EE models"
