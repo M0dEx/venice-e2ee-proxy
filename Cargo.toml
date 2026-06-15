@@ -2,36 +2,54 @@
 name = "venice-e2ee-proxy"
 version = "0.1.0"
 edition = "2024"
+authors = ["Jakub Kubík <jakub.kubik.it@protonmail.com>"]
+description = "OpenAI-compatible proxy for Venice.ai E2EE models"
+repository = "https://github.com/M0dEx/venice-e2ee-proxy"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["openai", "venice", "e2ee", "proxy", "llm"]
+categories = [
+    "command-line-utilities",
+    "cryptography",
+    "network-programming",
+    "web-programming::http-server",
+]
 
 [dependencies]
+# Cryptography, key exchange, hashing, and secret handling.
 aes = { version = "0.8", features = ["zeroize"] }
 aes-gcm = { version = "0.10", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+hkdf = "0.12"
+k256 = { version = "0.13", features = ["ecdh"] }
+polyval = { version = "0.6", features = ["zeroize"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+secrecy = { version = "0.10", features = ["serde"] }
+sha2 = "0.10"
+sha3 = "0.10"
+zeroize = "1.8"
+
+# HTTP proxy runtime, upstream client, streaming, configuration, CLI, and logging.
+async-stream = "0.3"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 figment = { version = "0.10", features = ["env", "toml"] }
-ghash = { version = "0.5", features = ["zeroize"] }
-hex = "0.4"
-hkdf = "0.12"
-polyval = { version = "0.6", features = ["zeroize"] }
-base64 = "0.22"
-serde = { version = "1.0", features = ["derive"] }
-secrecy = { version = "0.10", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-serde_json = "1.0"
-async-stream = "0.3"
 futures-core = "0.3"
-sha2 = "0.10"
-sha3 = "0.10"
-thiserror = "2.0"
+humantime = "2.3.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tokio = { version = "1.0", features = ["macros", "net", "rt-multi-thread", "time"] }
-k256 = { version = "0.13", features = ["ecdh"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
-uuid = { version = "1.11", features = ["v4"] }
-zeroize = "1.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-humantime = "2.3.0"
-vllm-tool-parser = { git = "https://github.com/vllm-project/vllm", tag = "v0.22.1" }
+
+# Serialization, encoding, parser, identifiers, and error types.
+base64 = "0.22"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.11", features = ["v4"] }
+winnow = "1.0"
 
 [dev-dependencies]
+# Test support.
 tower = { version = "0.5", features = ["util"] }

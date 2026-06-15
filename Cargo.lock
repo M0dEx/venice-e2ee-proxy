@@ -417,12 +417,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "either"
-version = "1.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
-
-[[package]]
 name = "elliptic-curve"
 version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1671,28 +1665,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thiserror-ext"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fb7e61141f4141832ca9aad63c3c90023843f944a1975460abdacc64d03f534"
-dependencies = [
- "thiserror",
- "thiserror-ext-derive",
-]
-
-[[package]]
-name = "thiserror-ext-derive"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b5042dd3b562d1d57711be902006a0003fa2781b81d5b2bec07416be31586ff"
-dependencies = [
- "either",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "thiserror-impl"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2056,7 +2028,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vllm-tool-parser",
+ "winnow 1.0.3",
  "zeroize",
 ]
 
@@ -2065,18 +2037,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vllm-tool-parser"
-version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.22.1#0decac0d96c42b49572498019f0a0e3600f50398"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "thiserror-ext",
- "winnow 1.0.3",
-]
 
 [[package]]
 name = "want"

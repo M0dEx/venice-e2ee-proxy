@@ -13,3 +13,4 @@ pub mod sessions;
 pub mod tools;
 pub(crate) mod util;
 pub mod venice;
+pub(crate) mod vllm_tool_parser;

@@ -1,8 +1,8 @@
 //! OpenAI-style tool-call emulation.
 //!
 //! Venice E2EE responses do not expose native function calls, so this module
-//! parses tool calls client-side from decrypted assistant text using vLLM's
-//! `vllm-tool-parser`, validates the calls against the request's OpenAI
+//! parses tool calls client-side from decrypted assistant text using a vendored
+//! subset of vLLM's Rust tool parser, validates the calls against the request's OpenAI
 //! `tools`, and builds prompt text for the encrypted controller/correction
 //! requests.
 //!
@@ -13,21 +13,20 @@
 
 use std::{collections::HashSet, time::Duration};
 
-use serde_json::{Map, Value};
-use thiserror::Error;
-use tracing::warn;
-use vllm_tool_parser::{
-    Glm47MoeToolParser, HermesToolParser, Qwen3XmlToolParser, Tool, ToolCallDelta, ToolParseResult,
-    ToolParser,
-};
-
 use crate::{
     config::{ToolMode, ToolsConfig},
     openai::chat::{
         ChatCompletionRequest, ChatRequestError, ChatToolChoice, ChatToolDefinition,
         NormalizedChatMessage,
     },
+    vllm_tool_parser::{
+        Glm47MoeToolParser, HermesToolParser, Qwen3XmlToolParser, Result as ToolParserResult, Tool,
+        ToolCallDelta, ToolParseResult, ToolParser,
+    },
 };
+use serde_json::{Map, Value};
+use thiserror::Error;
+use tracing::warn;
 
 /// Tool-call markers used by the Hermes/Qwen/GLM prompt instructions.
 const TOOL_CALL_START: &str = "<tool_call>";
@@ -510,7 +509,7 @@ struct LenientToolParser {
 
 impl ToolParser for LenientToolParser {
     /// Creates a lenient Hermes parser for the supplied tools.
-    fn create(tools: &[Tool]) -> vllm_tool_parser::Result<Box<dyn ToolParser>> {
+    fn create(tools: &[Tool]) -> ToolParserResult<Box<dyn ToolParser>> {
         Ok(Box::new(Self {
             inner: HermesToolParser::create(tools)?,
             args_scanner: ArgsCompletenessScanner::default(),
@@ -518,8 +517,14 @@ impl ToolParser for LenientToolParser {
         }))
     }
 
+    /// Pushes one assistant output chunk through the parser, appending parsed deltas to `output`.
+    fn parse_into(&mut self, chunk: &str, output: &mut ToolParseResult) -> ToolParserResult<()> {
+        output.append(self.push(chunk)?);
+        Ok(())
+    }
+
     /// Pushes one assistant output chunk through the parser and returns parsed deltas.
-    fn push(&mut self, chunk: &str) -> vllm_tool_parser::Result<ToolParseResult> {
+    fn push(&mut self, chunk: &str) -> ToolParserResult<ToolParseResult> {
         let mut merged = ToolParseResult::default();
         if self.drained {
             return Ok(merged);
@@ -548,7 +553,7 @@ impl ToolParser for LenientToolParser {
     }
 
     /// Finishes parsing and returns any recovered complete tool calls.
-    fn finish(&mut self) -> vllm_tool_parser::Result<ToolParseResult> {
+    fn finish(&mut self) -> ToolParserResult<ToolParseResult> {
         if self.drained {
             return Ok(ToolParseResult::default());
         }
@@ -567,6 +572,13 @@ impl ToolParser for LenientToolParser {
         recovered.normal_text.push_str(&finished.normal_text);
         recovered.calls.extend(finished.calls);
         Ok(recovered)
+    }
+
+    /// Clears parser state and returns uncommitted buffered text.
+    fn reset(&mut self) -> String {
+        self.args_scanner = ArgsCompletenessScanner::default();
+        self.drained = false;
+        self.inner.reset()
     }
 }
 
