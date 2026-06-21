@@ -333,21 +333,16 @@ async fn openai_tool_emulated_chat_response(
         )
         .await?;
 
-        let include_usage_requested = request.stream_options.include_usage.unwrap_or(false);
-        let transformer = OpenAiToolEmulatedChatStreamTransformer::new(
-            tool_context,
-            codec,
-            proxy_instance_key,
-            request.model.clone(),
-            include_usage_requested,
-        )
-        .map_err(ProxyError::ChatStream)?;
-        return Ok(chat_sse_response(
+        return Ok(tool_emulated_chat_sse_response_with_retries(
+            ToolEmulatedChatSseRetryState {
+                state: state.clone(),
+                request: request.clone(),
+                tool_context: tool_context.clone(),
+                codec,
+                proxy_instance_key,
+                model_public_key: model_public_key.to_owned(),
+            },
             upstream,
-            transformer,
-            request.model.clone(),
-            include_usage_requested,
-            &TOOL_EMULATED_CHAT_SSE_LOG,
             metadata,
         ));
     }
@@ -688,6 +683,80 @@ where
     response
 }
 
+/// State needed to retry one tool-emulated chat SSE response.
+struct ToolEmulatedChatSseRetryState {
+    state: AppState,
+    request: ChatCompletionRequest,
+    tool_context: ToolEmulationContext,
+    codec: E2eeCodec,
+    proxy_instance_key: ProxyInstanceKey,
+    model_public_key: String,
+}
+
+impl ToolEmulatedChatSseRetryState {
+    fn include_usage_requested(&self) -> bool {
+        self.request.stream_options.include_usage.unwrap_or(false)
+    }
+
+    async fn upstream(
+        &self,
+        initial_upstream: &mut Option<reqwest::Response>,
+        correction: Option<&(String, String)>,
+    ) -> Result<reqwest::Response, ProxyError> {
+        if let Some(upstream) = initial_upstream.take() {
+            return Ok(upstream);
+        }
+
+        tool_emulated_upstream_stream(
+            &self.state,
+            &self.request,
+            &self.tool_context,
+            &self.codec,
+            &self.proxy_instance_key,
+            &self.model_public_key,
+            correction,
+        )
+        .await
+    }
+
+    fn transformer(
+        &self,
+        suppress_normal_output: bool,
+    ) -> Result<OpenAiToolEmulatedChatStreamTransformer, ChatStreamError> {
+        OpenAiToolEmulatedChatStreamTransformer::new(
+            &self.tool_context,
+            self.codec.clone(),
+            self.proxy_instance_key.clone(),
+            self.request.model.clone(),
+            self.include_usage_requested(),
+            suppress_normal_output,
+        )
+    }
+
+    fn log_attempt_start(&self, retries: u32, retrying: bool) {
+        info!(
+            model = %self.request.model,
+            include_usage_requested = self.include_usage_requested(),
+            retry = retries,
+            retrying,
+            "{}",
+            TOOL_EMULATED_CHAT_SSE_LOG.start
+        );
+    }
+}
+
+/// Builds a tool-emulated SSE response that can retry malformed buffered tool calls.
+fn tool_emulated_chat_sse_response_with_retries(
+    retry_state: ToolEmulatedChatSseRetryState,
+    initial_upstream: reqwest::Response,
+    metadata: ProxyMetadataHeaders,
+) -> Response {
+    let stream = tool_emulated_chat_sse_event_stream_with_retries(retry_state, initial_upstream);
+    let mut response = Sse::new(stream).into_response();
+    metadata.apply(response.headers_mut());
+    response
+}
+
 /// Streams upstream SSE chunks through a transformer into OpenAI-compatible SSE events.
 fn chat_sse_event_stream<T>(
     mut upstream: reqwest::Response,
@@ -706,83 +775,256 @@ where
             "{}", log.start
         );
         let mut parser = SseEventParser::default();
-        let mut upstream_done = false;
-        let mut chunk_count = 0_u64;
-        let mut event_count = 0_u64;
-        let mut output_count = 0_u64;
+        let mut stats = ChatSseStreamStats::default();
 
-        while let Some(chunk) = upstream
-            .chunk()
+        'stream: loop {
+            let events = next_sse_events(
+                &mut upstream,
+                &mut parser,
+                &fallback_model,
+                log,
+                &mut stats,
+            )
             .await
-            .map_err(ChatStreamError::upstream_stream)
-            .map_err(box_chat_stream_error)?
-        {
-            chunk_count += 1;
-            let chunk = std::str::from_utf8(&chunk)
-                .map_err(ChatStreamError::invalid_utf8)
-                .map_err(box_chat_stream_error)?;
-            let events = parser.push(chunk).map_err(box_chat_stream_error)?;
-            event_count += events.len() as u64;
-            debug!(
-                model = %fallback_model,
-                chunk_count,
-                parsed_events = events.len(),
-                total_events = event_count,
-                "{}", log.parsed_chunk
-            );
+            .map_err(box_chat_stream_error)?;
 
             for event in events {
                 let outputs = transformer.handle_event(event).map_err(box_chat_stream_error)?;
-                output_count += outputs.len() as u64;
-                debug!(
-                    model = %fallback_model,
-                    emitted_outputs = outputs.len(),
-                    total_outputs = output_count,
-                    "{}", log.transformed_event
-                );
+                record_transformed_outputs(&fallback_model, log, outputs.len(), &mut stats);
 
                 for output in outputs {
-                    match output {
-                        StreamOutput::Json(value) => yield Event::default().data(value.to_string()),
-                        StreamOutput::Done => {
-                            upstream_done = true;
-                            info!(
-                                model = %fallback_model,
-                                chunk_count,
-                                event_count,
-                                output_count,
-                                "{}", log.completed
-                            );
-                            yield Event::default().data("[DONE]");
-                            break;
-                        }
+                    let (event, done) = stream_output_event(output);
+                    if done {
+                        log_sse_completed(&fallback_model, log, &stats);
+                        yield event;
+                        break 'stream;
                     }
-                }
-
-                if upstream_done {
-                    break;
+                    yield event;
                 }
             }
-
-            if upstream_done {
-                break;
-            }
-        }
-
-        if !upstream_done {
-            warn!(
-                model = %fallback_model,
-                chunk_count,
-                event_count,
-                output_count,
-                "{}", log.ended_early
-            );
-            parser.finish().map_err(box_chat_stream_error)?;
-            Err::<(), axum::BoxError>(box_chat_stream_error(ChatStreamError::malformed_event(
-                "upstream stream ended before data: [DONE]",
-            )))?;
         }
     }
+}
+
+/// Streams tool-emulated upstream SSE chunks, retrying malformed buffered tool calls with corrections.
+fn tool_emulated_chat_sse_event_stream_with_retries(
+    retry_state: ToolEmulatedChatSseRetryState,
+    initial_upstream: reqwest::Response,
+) -> impl futures_core::Stream<Item = Result<Event, axum::BoxError>> {
+    async_stream::try_stream! {
+        let mut retries = 0_u32;
+        let mut correction: Option<(String, String)> = None;
+        let mut initial_upstream = Some(initial_upstream);
+
+        'attempts: loop {
+            let retrying = correction.is_some();
+            let mut upstream = retry_state
+                .upstream(&mut initial_upstream, correction.as_ref())
+                .await
+                .map_err(box_proxy_error)?;
+
+            retry_state.log_attempt_start(retries, retrying);
+
+            let mut transformer = retry_state
+                .transformer(retrying)
+                .map_err(box_chat_stream_error)?;
+            let mut parser = SseEventParser::default();
+            let mut stats = ChatSseStreamStats::default();
+
+            loop {
+                let events = next_sse_events(
+                    &mut upstream,
+                    &mut parser,
+                    &retry_state.request.model,
+                    &TOOL_EMULATED_CHAT_SSE_LOG,
+                    &mut stats,
+                )
+                .await
+                .map_err(box_chat_stream_error)?;
+
+                for event in events {
+                    let outputs = match tool_stream_event_outputs(
+                        &retry_state,
+                        &mut transformer,
+                        event,
+                        &mut retries,
+                        &mut correction,
+                    ) {
+                        Ok(ToolStreamEventOutputs::Outputs(outputs)) => outputs,
+                        Ok(ToolStreamEventOutputs::Retry) => continue 'attempts,
+                        Err(error) => Err::<Vec<StreamOutput>, axum::BoxError>(error)?,
+                    };
+
+                    record_transformed_outputs(
+                        &retry_state.request.model,
+                        &TOOL_EMULATED_CHAT_SSE_LOG,
+                        outputs.len(),
+                        &mut stats,
+                    );
+
+                    for output in outputs {
+                        let (event, done) = stream_output_event(output);
+                        if done {
+                            log_sse_completed(
+                                &retry_state.request.model,
+                                &TOOL_EMULATED_CHAT_SSE_LOG,
+                                &stats,
+                            );
+                            yield event;
+                            break 'attempts;
+                        }
+                        yield event;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Result of handling one tool-emulated SSE event in the retry-aware stream path.
+enum ToolStreamEventOutputs {
+    Outputs(Vec<StreamOutput>),
+    Retry,
+}
+
+/// Handles one retry-aware tool-emulated SSE event.
+fn tool_stream_event_outputs(
+    retry_state: &ToolEmulatedChatSseRetryState,
+    transformer: &mut OpenAiToolEmulatedChatStreamTransformer,
+    event: RawSseEvent,
+    retries: &mut u32,
+    correction: &mut Option<(String, String)>,
+) -> Result<ToolStreamEventOutputs, axum::BoxError> {
+    match transformer.handle_event(event) {
+        Ok(outputs) => Ok(ToolStreamEventOutputs::Outputs(outputs)),
+        Err(ChatStreamError::InvalidToolCall {
+            validation_error,
+            invalid_output,
+        }) if *retries < retry_state.tool_context.max_retries() => {
+            warn!(
+                model = %retry_state.request.model,
+                retry = *retries + 1,
+                max_retries = retry_state.tool_context.max_retries(),
+                validation_error = %validation_error,
+                "streamed tool call validation failed; retrying with correction"
+            );
+            *retries += 1;
+            *correction = Some((validation_error, invalid_output));
+            Ok(ToolStreamEventOutputs::Retry)
+        }
+        Err(ChatStreamError::InvalidToolCall {
+            validation_error, ..
+        }) => {
+            error!(
+                model = %retry_state.request.model,
+                max_retries = retry_state.tool_context.max_retries(),
+                validation_error = %validation_error,
+                "streamed tool call validation failed and retries were exhausted"
+            );
+            Err(box_proxy_error(ProxyError::ToolCallRetryExhausted {
+                max_retries: retry_state.tool_context.max_retries(),
+                last_validation_error: validation_error,
+            }))
+        }
+        Err(error) => Err(box_chat_stream_error(error)),
+    }
+}
+
+/// Counters tracked while transforming one upstream SSE attempt.
+#[derive(Debug, Default)]
+struct ChatSseStreamStats {
+    chunk_count: u64,
+    event_count: u64,
+    output_count: u64,
+}
+
+/// Reads and parses the next upstream SSE chunk for a streaming transformation attempt.
+async fn next_sse_events(
+    upstream: &mut reqwest::Response,
+    parser: &mut SseEventParser,
+    fallback_model: &str,
+    log: &'static ChatSseLogMessages,
+    stats: &mut ChatSseStreamStats,
+) -> Result<Vec<RawSseEvent>, ChatStreamError> {
+    let Some(chunk) = upstream
+        .chunk()
+        .await
+        .map_err(ChatStreamError::upstream_stream)?
+    else {
+        warn!(
+            model = %fallback_model,
+            chunk_count = stats.chunk_count,
+            event_count = stats.event_count,
+            output_count = stats.output_count,
+            "{}",
+            log.ended_early
+        );
+        parser.finish()?;
+        return Err(ChatStreamError::malformed_event(
+            "upstream stream ended before data: [DONE]",
+        ));
+    };
+
+    stats.chunk_count += 1;
+    let chunk = std::str::from_utf8(&chunk).map_err(ChatStreamError::invalid_utf8)?;
+    let events = parser.push(chunk)?;
+    stats.event_count += events.len() as u64;
+    debug!(
+        model = %fallback_model,
+        chunk_count = stats.chunk_count,
+        parsed_events = events.len(),
+        total_events = stats.event_count,
+        "{}",
+        log.parsed_chunk
+    );
+    Ok(events)
+}
+
+/// Records and logs transformed outputs for one parsed upstream event.
+fn record_transformed_outputs(
+    fallback_model: &str,
+    log: &'static ChatSseLogMessages,
+    output_count: usize,
+    stats: &mut ChatSseStreamStats,
+) {
+    stats.output_count += output_count as u64;
+    debug!(
+        model = %fallback_model,
+        emitted_outputs = output_count,
+        total_outputs = stats.output_count,
+        "{}",
+        log.transformed_event
+    );
+}
+
+/// Converts a transformer output into a client-facing SSE event and whether it finishes the stream.
+fn stream_output_event(output: StreamOutput) -> (Event, bool) {
+    match output {
+        StreamOutput::Json(value) => (Event::default().data(value.to_string()), false),
+        StreamOutput::Done => (Event::default().data("[DONE]"), true),
+    }
+}
+
+/// Logs completion of a client-facing SSE transformation.
+fn log_sse_completed(
+    fallback_model: &str,
+    log: &'static ChatSseLogMessages,
+    stats: &ChatSseStreamStats,
+) {
+    info!(
+        model = %fallback_model,
+        chunk_count = stats.chunk_count,
+        event_count = stats.event_count,
+        output_count = stats.output_count,
+        "{}",
+        log.completed
+    );
+}
+
+/// Converts a proxy error into an Axum boxed stream error after logging it.
+fn box_proxy_error(error: ProxyError) -> axum::BoxError {
+    error!(error = %error, "chat stream failed");
+    Box::new(error)
 }
 
 /// Converts a chat-stream error into an Axum boxed stream error after logging it.
@@ -1457,6 +1699,7 @@ struct OpenAiToolEmulatedChatStreamTransformer {
     tool_buffer: String,
     buffering_tool_call: bool,
     emitted_tool_calls: bool,
+    suppress_normal_output: bool,
 }
 
 impl OpenAiToolEmulatedChatStreamTransformer {
@@ -1467,6 +1710,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         proxy_instance_key: ProxyInstanceKey,
         fallback_model: String,
         include_usage_requested: bool,
+        suppress_normal_output: bool,
     ) -> Result<Self, ChatStreamError> {
         Ok(Self {
             ctx: ChunkContext::new(codec, proxy_instance_key, fallback_model),
@@ -1478,6 +1722,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             tool_buffer: String::new(),
             buffering_tool_call: false,
             emitted_tool_calls: false,
+            suppress_normal_output,
         })
     }
 
@@ -1501,6 +1746,7 @@ impl OpenAiToolEmulatedChatStreamTransformer {
         if let Some(reasoning_content) = reasoning_content
             && let Some(reasoning_content) = self.ctx.decrypt(Some(reasoning_content))?
             && !self.sent_final_finish
+            && !self.suppress_normal_output
         {
             output.push(self.reasoning_chunk(value, index, reasoning_content));
         }
@@ -1539,7 +1785,15 @@ impl OpenAiToolEmulatedChatStreamTransformer {
             self.pending_text.clear();
             self.buffering_tool_call = true;
             self.ensure_tool_buffer_within_limit()?;
+            if self.suppress_normal_output {
+                return Ok(Vec::new());
+            }
             return Ok(self.text_chunk_if_not_empty(upstream, index, text));
+        }
+
+        if self.suppress_normal_output {
+            self.ensure_pending_text_within_limit()?;
+            return Ok(Vec::new());
         }
 
         let streamable_len = streamable_pending_text_len(&self.pending_text);
@@ -1565,6 +1819,12 @@ impl OpenAiToolEmulatedChatStreamTransformer {
 
         if self.buffering_tool_call {
             output.extend(self.buffered_tool_call_chunks(upstream, index)?);
+        } else if self.suppress_normal_output {
+            let invalid_output = std::mem::take(&mut self.pending_text);
+            return Err(ChatStreamError::invalid_tool_call(
+                "expected corrected streamed response to include a tool call",
+                invalid_output,
+            ));
         } else if !self.pending_text.is_empty() {
             let text = std::mem::take(&mut self.pending_text);
             output.push(self.text_field_chunk(upstream, index, "content", text));
@@ -1611,16 +1871,20 @@ impl OpenAiToolEmulatedChatStreamTransformer {
                 self.buffering_tool_call = false;
                 Ok(self.text_chunk_if_not_empty(upstream, index, text))
             }
-            ToolOutputClassification::InvalidToolCall { error, .. } => {
+            ToolOutputClassification::InvalidToolCall {
+                error,
+                invalid_output,
+            } => {
                 error!(
                     validation_error = %error,
                     payload_bytes = self.tool_buffer.len(),
                     payload = %self.tool_buffer,
                     "buffered streamed tool-call payload failed validation"
                 );
-                Err(ChatStreamError::malformed_event(format!(
-                    "tool call parsing failed: {error}"
-                )))
+                Err(ChatStreamError::invalid_tool_call(
+                    format!("tool call parsing failed: {error}"),
+                    invalid_output,
+                ))
             }
         }
     }
@@ -1632,6 +1896,20 @@ impl OpenAiToolEmulatedChatStreamTransformer {
                 "tool call output exceeded max size of {} bytes",
                 self.tool_context.config().tool_call_max_bytes
             )));
+        }
+        Ok(())
+    }
+
+    /// Validates suppressed retry text so a retry that never emits a tool marker cannot grow forever.
+    fn ensure_pending_text_within_limit(&self) -> Result<(), ChatStreamError> {
+        if self.pending_text.len() > self.tool_context.config().tool_call_max_bytes {
+            return Err(ChatStreamError::invalid_tool_call(
+                format!(
+                    "corrected streamed response exceeded the tool call max size of {} bytes before emitting a tool call",
+                    self.tool_context.config().tool_call_max_bytes
+                ),
+                self.pending_text.clone(),
+            ));
         }
         Ok(())
     }
@@ -1876,6 +2154,11 @@ pub enum ChatStreamError {
     UpstreamEvent { message: String },
     #[error("Venice upstream stream event is malformed: {message}")]
     MalformedEvent { message: String },
+    #[error("streamed tool call failed validation: {validation_error}")]
+    InvalidToolCall {
+        validation_error: String,
+        invalid_output: String,
+    },
     #[error("failed to decrypt Venice E2EE response chunk: {source}")]
     Decryption { source: E2eeCodecError },
 }
@@ -1909,6 +2192,17 @@ impl ChatStreamError {
         }
     }
 
+    /// Creates a structured error for retryable streamed tool-call validation failures.
+    fn invalid_tool_call(
+        validation_error: impl Into<String>,
+        invalid_output: impl Into<String>,
+    ) -> Self {
+        Self::InvalidToolCall {
+            validation_error: validation_error.into(),
+            invalid_output: invalid_output.into(),
+        }
+    }
+
     /// Converts invalid upstream JSON SSE data into a malformed-event error.
     fn json_event(source: serde_json::Error) -> Self {
         Self::MalformedEvent {
@@ -1926,7 +2220,8 @@ impl ChatStreamError {
         match self {
             Self::UpstreamStream { .. }
             | Self::UpstreamEvent { .. }
-            | Self::MalformedEvent { .. } => "proxy_upstream_error",
+            | Self::MalformedEvent { .. }
+            | Self::InvalidToolCall { .. } => "proxy_upstream_error",
             Self::Decryption { .. } => "proxy_e2ee_error",
         }
     }
@@ -1937,6 +2232,7 @@ impl ChatStreamError {
             Self::UpstreamStream { .. } => "upstream_stream_error",
             Self::UpstreamEvent { .. } => "upstream_stream_error",
             Self::MalformedEvent { .. } => "upstream_malformed_response",
+            Self::InvalidToolCall { .. } => "tool_call_validation_failed",
             Self::Decryption { .. } => "e2ee_response_decryption_failed",
         }
     }
