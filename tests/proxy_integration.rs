@@ -297,6 +297,77 @@ async fn tool_call_emulation_retries_invalid_marker_then_returns_openai_tool_cal
 }
 
 #[tokio::test]
+async fn streamed_tool_call_emulation_retries_invalid_tool_call() {
+    let mock = MockVeniceServer::spawn(MockVeniceOptions::with_attempts(vec![
+        vec![
+            MockStreamFrame::Text(
+                r#"I'll search. <tool_call>{"name":"unknown","arguments":{"query":"example"}}</tool_call>"#,
+            ),
+            MockStreamFrame::Done,
+        ],
+        vec![
+            MockStreamFrame::Text("retry chatter that should not leak "),
+            MockStreamFrame::Text(
+                r#"<tool_call>{"name":"search_web","arguments":{"query":"example"}}</tool_call>"#,
+            ),
+            MockStreamFrame::Done,
+        ],
+    ]))
+    .await;
+    let app = proxy_app(&mock.base_url, Duration::from_secs(1));
+
+    let response = request_chat(
+        app,
+        TEST_SESSION_ID,
+        json!({
+            "model": TEST_MODEL,
+            "messages": [{"role": "user", "content": "search"}],
+            "stream": true,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "search_web",
+                    "description": "Search the web",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                }
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_verified_chat_headers(&response, TEST_SESSION_ID, None);
+
+    let body = response_text(response).await;
+    assert!(!body.contains("retry chatter"));
+    let data = sse_data(&body);
+    assert_eq!(data.len(), 4);
+
+    let prefix: Value = serde_json::from_str(data[0]).expect("prefix chunk should be JSON");
+    assert_eq!(prefix["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(prefix["choices"][0]["delta"]["content"], "I'll search. ");
+
+    let tool_chunk: Value = serde_json::from_str(data[1]).expect("tool chunk should be JSON");
+    let tool_call = &tool_chunk["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tool_call["index"], 0);
+    assert!(tool_call["id"].as_str().unwrap().starts_with("call_"));
+    assert_eq!(tool_call["type"], "function");
+    assert_eq!(tool_call["function"]["name"], "search_web");
+    assert_eq!(tool_call["function"]["arguments"], r#"{"query":"example"}"#);
+
+    let final_chunk: Value = serde_json::from_str(data[2]).expect("final chunk should be JSON");
+    assert_eq!(final_chunk["choices"][0]["delta"], json!({}));
+    assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(data[3], "[DONE]");
+    assert_eq!(mock.chat_count(), 2);
+}
+
+#[tokio::test]
 async fn tool_call_emulation_returns_multiple_openai_tool_calls() {
     let mock = MockVeniceServer::spawn(MockVeniceOptions::with_attempts(vec![vec![
         MockStreamFrame::Text(
