@@ -17,9 +17,9 @@
 
 use std::{fmt, time::SystemTime};
 
-use base64::{Engine as _, engine::general_purpose};
 use k256::{PublicKey, elliptic_curve::sec1::ToEncodedPoint};
 use rand_core::{OsRng, RngCore};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Keccak256;
@@ -27,7 +27,6 @@ use thiserror::Error;
 
 use crate::{
     config::{AttestationConfig, NvidiaRequirement, ProxyConfig},
-    util::json_kind,
     venice::{VeniceClient, VeniceClientError},
 };
 
@@ -49,6 +48,137 @@ const TDX_REPORT_DATA_END: usize = TDX_REPORT_DATA_OFFSET + TDX_REPORT_DATA_LEN;
 pub struct AttestationVerifier {
     policy: AttestationConfig,
     venice_client: VeniceClient,
+}
+
+/// Fresh random nonce sent to Venice and checked against attestation evidence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttestationNonce(String);
+
+/// Successful attestation result cached with a session and exposed through proxy metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAttestation {
+    pub model_id: String,
+    pub model_public_key: String,
+    pub signing_address: Option<String>,
+    pub tee_provider: Option<String>,
+    pub debug: Option<bool>,
+    pub tdx: TdxVerificationSummary,
+    pub nvidia: NvidiaVerificationSummary,
+    pub verified_at: SystemTime,
+}
+
+/// Summary of TDX evidence presence, local checks, and debug status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TdxVerificationSummary {
+    pub present: bool,
+    pub verified: bool,
+    pub debug: Option<bool>,
+    pub tee_type: Option<u32>,
+}
+
+/// Summary of NVIDIA attestation evidence presence and verification status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NvidiaVerificationSummary {
+    pub present: bool,
+    pub verified: NvidiaVerificationStatus,
+}
+
+/// Verification status for NVIDIA attestation evidence under the configured policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvidiaVerificationStatus {
+    NotPresent,
+    IgnoredByPolicy,
+    PresentVerifierUnavailable,
+}
+
+/// Errors returned while fetching or validating attestation evidence.
+#[derive(Debug, Error)]
+pub enum AttestationError {
+    #[error("invalid attestation request: {message}")]
+    InvalidRequest { message: String },
+    #[error("TEE attestation fetch failed: {0}")]
+    Fetch(#[from] VeniceClientError),
+    #[error("TEE attestation response is malformed: {message}")]
+    MalformedResponse { message: String },
+    #[error("TEE attestation evidence is missing required field {field}")]
+    MissingField { field: &'static str },
+    #[error("TEE attestation verification failed: {message}")]
+    PolicyViolation {
+        code: AttestationFailureCode,
+        message: String,
+    },
+    #[error("TEE attestation verifier unavailable: {message}")]
+    ExternalVerifierUnavailable {
+        verifier: &'static str,
+        message: String,
+    },
+}
+
+/// Stable failure codes for attestation policy violations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationFailureCode {
+    UpstreamNotVerified,
+    NonceMismatch,
+    ModelMismatch,
+    InvalidSigningKey,
+    SigningAddressMismatch,
+    DebugModeDetected,
+    MissingTdxEvidence,
+    InvalidTdxEvidence,
+    MissingNvidiaEvidence,
+    InvalidNvidiaEvidence,
+}
+
+/// TDX quote fields used by local policy checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedTdxQuote {
+    tee_type: u32,
+    debug: bool,
+}
+
+/// Typed Venice ACI attestation response used by the production E2EE endpoint.
+#[derive(Debug, Clone, Deserialize)]
+struct VeniceAttestationResponse {
+    attestation: AciAttestationEnvelope,
+    #[serde(flatten)]
+    fields: VeniceAttestationFields,
+}
+
+/// Root Venice attestation fields containing verification decision and model key binding.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VeniceAttestationFields {
+    #[serde(default)]
+    verified: Option<bool>,
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    tee_provider: Option<String>,
+    #[serde(default)]
+    signing_public_key: Option<String>,
+    #[serde(default)]
+    signing_address: Option<String>,
+    #[serde(default)]
+    debug: Option<bool>,
+    #[serde(default)]
+    nvidia_payload: Option<Value>,
+}
+
+/// ACI nested attestation object containing hardware evidence.
+#[derive(Debug, Clone, Deserialize)]
+struct AciAttestationEnvelope {
+    #[serde(default)]
+    evidence: AciEvidenceFields,
+}
+
+/// ACI nested hardware evidence fields used by the local verifier.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct AciEvidenceFields {
+    #[serde(default)]
+    quote: Option<String>,
+    #[serde(default)]
+    quote_report_data: Option<String>,
 }
 
 impl AttestationVerifier {
@@ -108,10 +238,6 @@ impl AttestationVerifier {
     }
 }
 
-/// Fresh random nonce sent to Venice and checked against attestation evidence.
-#[derive(Clone, PartialEq, Eq)]
-pub struct AttestationNonce(String);
-
 impl AttestationNonce {
     /// Generates a 32-byte nonce encoded as lowercase hex.
     pub fn generate() -> Self {
@@ -133,28 +259,6 @@ impl fmt::Debug for AttestationNonce {
     }
 }
 
-/// Successful attestation result cached with a session and exposed through proxy metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedAttestation {
-    pub model_id: String,
-    pub model_public_key: String,
-    pub signing_address: Option<String>,
-    pub tee_provider: Option<String>,
-    pub tdx: TdxVerificationSummary,
-    pub nvidia: NvidiaVerificationSummary,
-    pub verified_at: SystemTime,
-    pub attestation_report: Value,
-}
-
-/// Summary of TDX evidence presence, local checks, and debug status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TdxVerificationSummary {
-    pub present: bool,
-    pub verified: bool,
-    pub debug: Option<bool>,
-    pub tee_type: Option<u32>,
-}
-
 impl TdxVerificationSummary {
     /// Returns a summary representing absent TDX evidence.
     fn not_present() -> Self {
@@ -167,13 +271,6 @@ impl TdxVerificationSummary {
     }
 }
 
-/// Summary of NVIDIA attestation evidence presence and verification status.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NvidiaVerificationSummary {
-    pub present: bool,
-    pub verified: NvidiaVerificationStatus,
-}
-
 impl NvidiaVerificationSummary {
     /// Returns a summary representing absent NVIDIA evidence.
     fn not_present() -> Self {
@@ -182,14 +279,6 @@ impl NvidiaVerificationSummary {
             verified: NvidiaVerificationStatus::NotPresent,
         }
     }
-}
-
-/// Verification status for NVIDIA attestation evidence under the configured policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NvidiaVerificationStatus {
-    NotPresent,
-    IgnoredByPolicy,
-    PresentVerifierUnavailable,
 }
 
 impl NvidiaVerificationStatus {
@@ -201,29 +290,6 @@ impl NvidiaVerificationStatus {
             Self::PresentVerifierUnavailable => "verifier-unavailable",
         }
     }
-}
-
-/// Errors returned while fetching or validating attestation evidence.
-#[derive(Debug, Error)]
-pub enum AttestationError {
-    #[error("invalid attestation request: {message}")]
-    InvalidRequest { message: String },
-    #[error("TEE attestation fetch failed: {0}")]
-    Fetch(#[from] VeniceClientError),
-    #[error("TEE attestation response is malformed: {message}")]
-    MalformedResponse { message: String },
-    #[error("TEE attestation evidence is missing required field {field}")]
-    MissingField { field: &'static str },
-    #[error("TEE attestation verification failed: {message}")]
-    PolicyViolation {
-        code: AttestationFailureCode,
-        message: String,
-    },
-    #[error("TEE attestation verifier unavailable: {message}")]
-    ExternalVerifierUnavailable {
-        verifier: &'static str,
-        message: String,
-    },
 }
 
 impl AttestationError {
@@ -257,21 +323,6 @@ impl AttestationError {
     }
 }
 
-/// Stable failure codes for attestation policy violations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttestationFailureCode {
-    UpstreamNotVerified,
-    NonceMismatch,
-    ModelMismatch,
-    InvalidSigningKey,
-    SigningAddressMismatch,
-    DebugModeDetected,
-    MissingTdxEvidence,
-    InvalidTdxEvidence,
-    MissingNvidiaEvidence,
-    InvalidNvidiaEvidence,
-}
-
 impl AttestationFailureCode {
     /// Returns the stable string form used in proxy error responses.
     pub fn as_str(self) -> &'static str {
@@ -290,6 +341,83 @@ impl AttestationFailureCode {
     }
 }
 
+impl VeniceAttestationResponse {
+    /// Parses the raw Venice payload into the supported attestation response model.
+    fn parse(value: Value) -> Result<Self, AttestationError> {
+        serde_json::from_value(value).map_err(|source| AttestationError::MalformedResponse {
+            message: source.to_string(),
+        })
+    }
+
+    /// Returns the root fields containing Venice's verification decision and model key binding.
+    fn fields(&self) -> &VeniceAttestationFields {
+        &self.fields
+    }
+
+    /// Returns the TDX quote from ACI hardware evidence.
+    fn tdx_quote(&self) -> Option<&str> {
+        non_empty(self.attestation.evidence.quote.as_deref())
+    }
+
+    /// Returns TDX report data from ACI hardware evidence.
+    fn quote_report_data(&self) -> Option<&str> {
+        non_empty(self.attestation.evidence.quote_report_data.as_deref())
+    }
+}
+
+impl VeniceAttestationFields {
+    /// Reads Venice's required `verified` decision.
+    fn required_verified(&self) -> Result<bool, AttestationError> {
+        self.verified
+            .ok_or(AttestationError::MissingField { field: "verified" })
+    }
+
+    /// Reads a required non-empty string field from this attestation model.
+    fn required_string<'a>(
+        &'a self,
+        field: &'static str,
+        value: Option<&'a str>,
+    ) -> Result<&'a str, AttestationError> {
+        match value {
+            Some(value) if !value.trim().is_empty() => Ok(value),
+            Some(_) => Err(AttestationError::MalformedResponse {
+                message: format!("field {field} must not be empty"),
+            }),
+            None => Err(AttestationError::MissingField { field }),
+        }
+    }
+
+    fn nonce(&self) -> Option<&str> {
+        self.nonce.as_deref()
+    }
+
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    fn tee_provider(&self) -> Option<&str> {
+        non_empty(self.tee_provider.as_deref())
+    }
+
+    fn signing_public_key(&self) -> Option<&str> {
+        non_empty(self.signing_public_key.as_deref())
+    }
+
+    fn signing_address(&self) -> Option<&str> {
+        non_empty(self.signing_address.as_deref())
+    }
+
+    fn debug(&self) -> Option<bool> {
+        self.debug
+    }
+
+    fn nvidia_payload(&self) -> Option<&Value> {
+        self.nvidia_payload
+            .as_ref()
+            .filter(|value| !value.is_null())
+    }
+}
+
 /// Validates a Venice attestation response against the expected model, nonce, and policy.
 fn verify_attestation_evidence(
     policy: &AttestationConfig,
@@ -299,8 +427,9 @@ fn verify_attestation_evidence(
 ) -> Result<VerifiedAttestation, AttestationError> {
     validate_nonce_hex(client_nonce)?;
 
-    let evidence = evidence_object(&upstream_response)?;
-    let verified = required_bool(evidence, "verified")?;
+    let response_model = VeniceAttestationResponse::parse(upstream_response)?;
+    let evidence = response_model.fields();
+    let verified = evidence.required_verified()?;
 
     if !verified {
         return policy_error(
@@ -309,7 +438,7 @@ fn verify_attestation_evidence(
         );
     }
 
-    let nonce = required_string(evidence, "nonce")?;
+    let nonce = evidence.required_string("nonce", evidence.nonce())?;
 
     if nonce != client_nonce {
         return policy_error(
@@ -318,7 +447,7 @@ fn verify_attestation_evidence(
         );
     }
 
-    let model = required_string(evidence, "model")?;
+    let model = evidence.required_string("model", evidence.model())?;
 
     if model != requested_model_id {
         return policy_error(
@@ -329,14 +458,15 @@ fn verify_attestation_evidence(
         );
     }
 
-    let signing_key = optional_non_empty_string(evidence, "signing_key")
-        .or_else(|| optional_non_empty_string(evidence, "signing_public_key"))
+    let signing_key = evidence
+        .signing_public_key()
         .ok_or(AttestationError::MissingField {
-            field: "signing_key|signing_public_key",
+            field: "signing_public_key",
         })?;
     let normalized_signing_key = normalize_public_key_hex(signing_key)?;
     let derived_address = ethereum_address_from_uncompressed_key_hex(&normalized_signing_key)?;
-    let signing_address = optional_non_empty_string(evidence, "signing_address")
+    let signing_address = evidence
+        .signing_address()
         .map(normalize_ethereum_address)
         .transpose()?;
 
@@ -351,7 +481,9 @@ fn verify_attestation_evidence(
         );
     }
 
-    if top_level_debug(evidence) == Some(true) && !policy.allow_debug {
+    let debug = evidence.debug();
+
+    if debug == Some(true) && !policy.allow_debug {
         return policy_error(
             AttestationFailureCode::DebugModeDetected,
             "attestation evidence reports debug mode and attestation.allow_debug=false",
@@ -360,7 +492,7 @@ fn verify_attestation_evidence(
 
     let tdx = evaluate_tdx_policy(
         policy,
-        evidence,
+        &response_model,
         &normalized_signing_key,
         signing_address.as_deref(),
     )?;
@@ -370,33 +502,33 @@ fn verify_attestation_evidence(
         model_id: requested_model_id.to_owned(),
         model_public_key: normalized_signing_key,
         signing_address,
-        tee_provider: optional_non_empty_string(evidence, "tee_provider").map(ToOwned::to_owned),
+        tee_provider: evidence.tee_provider().map(ToOwned::to_owned),
+        debug,
         tdx,
         nvidia,
         verified_at: SystemTime::now(),
-        attestation_report: upstream_response,
     })
 }
 
 /// Evaluates TDX evidence fields against the configured TDX policy.
 fn evaluate_tdx_policy(
     policy: &AttestationConfig,
-    evidence: &serde_json::Map<String, Value>,
+    response: &VeniceAttestationResponse,
     signing_key: &str,
     signing_address: Option<&str>,
 ) -> Result<TdxVerificationSummary, AttestationError> {
-    let Some(intel_quote) = optional_non_empty_string(evidence, "intel_quote") else {
+    let Some(tdx_quote) = response.tdx_quote() else {
         return if policy.require_tdx {
             policy_error(
                 AttestationFailureCode::MissingTdxEvidence,
-                "attestation.require_tdx=true but intel_quote is absent",
+                "attestation.require_tdx=true but attestation.evidence.quote is absent",
             )
         } else {
             Ok(TdxVerificationSummary::not_present())
         };
     };
 
-    let parsed = parse_tdx_quote(intel_quote)?;
+    let parsed = parse_tdx_quote(tdx_quote)?;
 
     if parsed.tee_type != TDX_TEE_TYPE {
         return policy_error(
@@ -415,7 +547,7 @@ fn evaluate_tdx_policy(
         );
     }
 
-    if let Some(reportdata) = optional_non_empty_string(evidence, "tdx_reportdata") {
+    if let Some(reportdata) = response.quote_report_data() {
         verify_reportdata_binding(reportdata, signing_key, signing_address)?;
     }
 
@@ -443,11 +575,9 @@ fn evaluate_tdx_policy(
 /// Evaluates NVIDIA evidence fields against the configured NVIDIA policy.
 fn evaluate_nvidia_policy(
     policy: &AttestationConfig,
-    evidence: &serde_json::Map<String, Value>,
+    evidence: &VeniceAttestationFields,
 ) -> Result<NvidiaVerificationSummary, AttestationError> {
-    let nvidia_payload = evidence
-        .get("nvidia_payload")
-        .filter(|value| !value.is_null());
+    let nvidia_payload = evidence.nvidia_payload();
 
     match (policy.require_nvidia, nvidia_payload) {
         (NvidiaRequirement::Required, None) => policy_error(
@@ -471,13 +601,6 @@ fn evaluate_nvidia_policy(
         ),
         (NvidiaRequirement::WhenPresent, None) => Ok(NvidiaVerificationSummary::not_present()),
     }
-}
-
-/// TDX quote fields used by local policy checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ParsedTdxQuote {
-    tee_type: u32,
-    debug: bool,
 }
 
 /// Parses a TDX quote string and returns the fields needed by policy evaluation.
@@ -509,23 +632,14 @@ fn parse_tdx_quote(value: &str) -> Result<ParsedTdxQuote, AttestationError> {
     Ok(ParsedTdxQuote { tee_type, debug })
 }
 
-/// Decodes a TDX quote supplied as hex or base64 text.
+/// Decodes a hex-encoded TDX quote.
 fn decode_tdx_quote(value: &str) -> Result<Vec<u8>, AttestationError> {
     let value = value.trim();
     let hex = value.strip_prefix("0x").unwrap_or(value);
-    // `hex::decode("")` succeeds with empty bytes, so keep empty input on the base64 path.
-    if !hex.is_empty()
-        && let Ok(bytes) = hex::decode(hex)
-    {
-        return Ok(bytes);
-    }
-
-    general_purpose::STANDARD
-        .decode(value)
-        .map_err(|source| AttestationError::PolicyViolation {
-            code: AttestationFailureCode::InvalidTdxEvidence,
-            message: format!("intel_quote is neither hex nor valid base64: {source}"),
-        })
+    hex::decode(hex).map_err(|source| AttestationError::PolicyViolation {
+        code: AttestationFailureCode::InvalidTdxEvidence,
+        message: format!("attestation.evidence.quote is not valid hex: {source}"),
+    })
 }
 
 /// Verifies that TDX report data binds to the attested signing key or signing address.
@@ -537,13 +651,13 @@ fn verify_reportdata_binding(
     let reportdata =
         hex::decode(reportdata_hex).map_err(|error| AttestationError::PolicyViolation {
             code: AttestationFailureCode::InvalidTdxEvidence,
-            message: format!("tdx_reportdata is not valid hex: {error}"),
+            message: format!("quote_report_data is not valid hex: {error}"),
         })?;
     if reportdata.len() != TDX_REPORT_DATA_LEN {
         return policy_error(
             AttestationFailureCode::InvalidTdxEvidence,
             format!(
-                "tdx_reportdata has {} bytes, expected {TDX_REPORT_DATA_LEN}",
+                "quote_report_data has {} bytes, expected {TDX_REPORT_DATA_LEN}",
                 reportdata.len()
             ),
         );
@@ -564,6 +678,19 @@ fn verify_reportdata_binding(
         if reportdata.starts_with(&signing_address_hash[..]) {
             return Ok(());
         }
+
+        let signing_address_hex = signing_address
+            .strip_prefix("0x")
+            .unwrap_or(signing_address);
+        let signing_address_bytes = hex::decode(signing_address_hex).map_err(|error| {
+            AttestationError::PolicyViolation {
+                code: AttestationFailureCode::SigningAddressMismatch,
+                message: format!("normalized signing address is not valid hex: {error}"),
+            }
+        })?;
+        if signing_address_bytes.len() == 20 && reportdata.starts_with(&signing_address_bytes) {
+            return Ok(());
+        }
     }
 
     policy_error(
@@ -572,71 +699,9 @@ fn verify_reportdata_binding(
     )
 }
 
-/// Returns the attestation object from either a wrapped or direct upstream response.
-fn evidence_object(response: &Value) -> Result<&serde_json::Map<String, Value>, AttestationError> {
-    if let Value::Object(root) = response {
-        if let Some(Value::Object(attestation)) = root.get("attestation") {
-            return Ok(attestation);
-        }
-        return Ok(root);
-    }
-
-    Err(AttestationError::MalformedResponse {
-        message: format!(
-            "expected attestation response object, got {}",
-            json_kind(response)
-        ),
-    })
-}
-
-/// Reads a required boolean field from an attestation evidence object.
-fn required_bool(
-    object: &serde_json::Map<String, Value>,
-    field: &'static str,
-) -> Result<bool, AttestationError> {
-    match object.get(field) {
-        Some(Value::Bool(value)) => Ok(*value),
-        Some(other) => Err(AttestationError::MalformedResponse {
-            message: format!("field {field} must be a boolean, got {}", json_kind(other)),
-        }),
-        None => Err(AttestationError::MissingField { field }),
-    }
-}
-
-/// Reads a required non-empty string field from an attestation evidence object.
-fn required_string<'a>(
-    object: &'a serde_json::Map<String, Value>,
-    field: &'static str,
-) -> Result<&'a str, AttestationError> {
-    match object.get(field) {
-        Some(Value::String(value)) if !value.trim().is_empty() => Ok(value),
-        Some(Value::String(_)) => Err(AttestationError::MalformedResponse {
-            message: format!("field {field} must not be empty"),
-        }),
-        Some(other) => Err(AttestationError::MalformedResponse {
-            message: format!("field {field} must be a string, got {}", json_kind(other)),
-        }),
-        None => Err(AttestationError::MissingField { field }),
-    }
-}
-
-/// Reads an optional string field and ignores missing, null, or empty values.
-fn optional_non_empty_string<'a>(
-    object: &'a serde_json::Map<String, Value>,
-    field: &'static str,
-) -> Option<&'a str> {
-    match object.get(field) {
-        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
-        _ => None,
-    }
-}
-
-/// Reads the top-level debug flag from either supported attestation evidence field name.
-fn top_level_debug(object: &serde_json::Map<String, Value>) -> Option<bool> {
-    object
-        .get("debug")
-        .or_else(|| object.get("tdx_debug"))
-        .and_then(Value::as_bool)
+/// Returns a non-empty string slice after trimming-only emptiness checks.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 /// Parses a secp256k1 public key hex string and returns uncompressed SEC1 lowercase hex.
@@ -776,16 +841,38 @@ mod tests {
         (public_key_hex, address)
     }
 
+    fn reportdata_for_address(signing_address: &str) -> String {
+        let mut reportdata = vec![0_u8; TDX_REPORT_DATA_LEN];
+        let address = hex::decode(
+            signing_address
+                .strip_prefix("0x")
+                .expect("test signing address should be normalized"),
+        )
+        .expect("test signing address should be hex");
+        reportdata[..address.len()].copy_from_slice(&address);
+        hex::encode(reportdata)
+    }
+
     fn valid_evidence() -> Value {
         let (signing_key, signing_address) = key_material();
         json!({
+            "api_version": "aci/1",
+            "attestation": {
+                "tee_type": "tdx",
+                "evidence": {}
+            },
             "verified": true,
             "nonce": NONCE,
             "model": MODEL,
-            "tee_provider": "tdx",
-            "signing_key": signing_key,
+            "tee_provider": "phala",
+            "debug": false,
+            "signing_public_key": signing_key,
             "signing_address": signing_address
         })
+    }
+
+    fn set_tdx_quote(evidence: &mut Value, quote: String) {
+        evidence["attestation"]["evidence"]["quote"] = json!(quote);
     }
 
     #[test]
@@ -810,9 +897,51 @@ mod tests {
             result.signing_address.as_deref(),
             Some(expected_address.as_str())
         );
-        assert_eq!(result.tee_provider.as_deref(), Some("tdx"));
+        assert_eq!(result.tee_provider.as_deref(), Some("phala"));
         assert!(!result.tdx.present);
         assert_eq!(result.nvidia.verified, NvidiaVerificationStatus::NotPresent);
+    }
+
+    #[test]
+    fn aci_envelope_uses_root_verification_fields_and_nested_hardware_evidence() {
+        let (signing_key, signing_address) = key_material();
+        let reportdata = reportdata_for_address(&signing_address);
+        let result = verifier(AttestationConfig {
+            require_tdx: false,
+            require_nvidia: NvidiaRequirement::Never,
+            ..AttestationConfig::default()
+        })
+        .verify_evidence(
+            MODEL,
+            NONCE,
+            json!({
+                "api_version": "aci/1",
+                "attestation": {
+                    "tee_type": "tdx",
+                    "evidence": {
+                        "quote": tdx_quote_hex(false, TDX_TEE_TYPE),
+                        "quote_report_data": reportdata
+                    }
+                },
+                "verified": true,
+                "nonce": NONCE,
+                "model": MODEL,
+                "tee_provider": "phala",
+                "signing_public_key": signing_key,
+                "signing_address": signing_address,
+                "nvidia_payload": {"nonce": NONCE}
+            }),
+        )
+        .expect("ACI attestation envelope should verify from root fields");
+
+        assert_eq!(result.model_id, MODEL);
+        assert_eq!(result.model_public_key, key_material().0);
+        assert_eq!(result.tee_provider.as_deref(), Some("phala"));
+        assert!(result.tdx.present);
+        assert_eq!(
+            result.nvidia.verified,
+            NvidiaVerificationStatus::IgnoredByPolicy
+        );
     }
 
     #[test]
@@ -874,10 +1003,7 @@ mod tests {
     #[test]
     fn tdx_required_mode_fails_on_invalid_tdx_evidence() {
         let mut evidence = valid_evidence();
-        evidence
-            .as_object_mut()
-            .unwrap()
-            .insert("intel_quote".to_owned(), json!("not quote encoding"));
+        set_tdx_quote(&mut evidence, "not quote encoding".to_owned());
 
         let error = verifier(AttestationConfig {
             require_tdx: true,
@@ -899,10 +1025,7 @@ mod tests {
     #[test]
     fn tdx_debug_quote_fails_when_debug_is_not_allowed() {
         let mut evidence = valid_evidence();
-        evidence.as_object_mut().unwrap().insert(
-            "intel_quote".to_owned(),
-            json!(tdx_quote_hex(true, TDX_TEE_TYPE)),
-        );
+        set_tdx_quote(&mut evidence, tdx_quote_hex(true, TDX_TEE_TYPE));
 
         let error = verifier(AttestationConfig {
             require_tdx: false,
@@ -923,32 +1046,9 @@ mod tests {
     }
 
     #[test]
-    fn tdx_optional_mode_accepts_legacy_base64_quote_encoding() {
-        let mut evidence = valid_evidence();
-        evidence.as_object_mut().unwrap().insert(
-            "intel_quote".to_owned(),
-            json!(tdx_quote_base64(false, TDX_TEE_TYPE)),
-        );
-
-        let result = verifier(AttestationConfig {
-            require_tdx: false,
-            require_nvidia: NvidiaRequirement::Never,
-            ..AttestationConfig::default()
-        })
-        .verify_evidence(MODEL, NONCE, evidence)
-        .expect("legacy base64-encoded TDX quote should parse when TDX is optional");
-
-        assert!(result.tdx.present);
-        assert_eq!(result.tdx.tee_type, Some(TDX_TEE_TYPE));
-    }
-
-    #[test]
     fn tdx_required_mode_fails_closed_when_dcap_verifier_is_unavailable() {
         let mut evidence = valid_evidence();
-        evidence.as_object_mut().unwrap().insert(
-            "intel_quote".to_owned(),
-            json!(tdx_quote_hex(false, TDX_TEE_TYPE)),
-        );
+        set_tdx_quote(&mut evidence, tdx_quote_hex(false, TDX_TEE_TYPE));
 
         let error = verifier(AttestationConfig {
             require_tdx: true,
@@ -1098,10 +1198,16 @@ mod tests {
             (
                 StatusCode::OK,
                 serde_json::to_vec(&json!({
+                    "api_version": "aci/1",
+                    "attestation": {
+                        "tee_type": "tdx",
+                        "evidence": {}
+                    },
                     "verified": true,
                     "nonce": nonce,
                     "model": MODEL,
-                    "signing_key": signing_key,
+                    "tee_provider": "phala",
+                    "signing_public_key": signing_key,
                     "signing_address": signing_address
                 }))
                 .expect("response should serialize"),
@@ -1156,10 +1262,6 @@ mod tests {
 
     fn tdx_quote_hex(debug: bool, tee_type: u32) -> String {
         hex::encode(tdx_quote_bytes(debug, tee_type))
-    }
-
-    fn tdx_quote_base64(debug: bool, tee_type: u32) -> String {
-        general_purpose::STANDARD.encode(tdx_quote_bytes(debug, tee_type))
     }
 
     fn tdx_quote_bytes(debug: bool, tee_type: u32) -> Vec<u8> {
