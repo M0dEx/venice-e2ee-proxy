@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     attestation::{AttestationError, AttestationVerifier},
-    config::{NvidiaRequirement, ProxyConfig},
+    config::ProxyConfig,
     e2ee::{E2eeCodec, E2eeCodecError},
     keys::ProxyInstanceKey,
     openai::{
@@ -280,7 +280,9 @@ async fn ensure_attested_session(
 
     let state_update = AttestedModelState {
         model_public_key: attestation.model_public_key,
-        attestation_report: attestation.attestation_report,
+        tee_provider: attestation.tee_provider,
+        tdx_debug: attestation.tdx.debug.or(attestation.debug),
+        nvidia_verified: attestation.nvidia.verified.as_header_value().to_owned(),
         verified_at: attestation.verified_at,
     };
 
@@ -2121,31 +2123,15 @@ impl ProxyMetadataHeaders {
 
     /// Creates metadata headers for a chat response after session attestation succeeds.
     pub fn for_verified_chat(config: &ProxyConfig, session: &SessionContext) -> Self {
-        let evidence = session
-            .attestation_report
-            .as_ref()
-            .and_then(|report| report.get("attestation"))
-            .and_then(Value::as_object);
-        let tee_provider = evidence
-            .and_then(|evidence| evidence.get("tee_provider"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned();
-        let tdx_debug = evidence.and_then(|evidence| {
-            evidence
-                .get("debug")
-                .or_else(|| evidence.get("tdx_debug"))
-                .and_then(Value::as_bool)
-        });
-        let nvidia_payload_present = evidence
-            .and_then(|evidence| evidence.get("nvidia_payload"))
-            .is_some_and(|value| !value.is_null());
-        let nvidia_verified = match (config.attestation.require_nvidia, nvidia_payload_present) {
-            (_, false) => "not-present",
-            (NvidiaRequirement::Never, true) => "ignored",
-            (_, true) => "verified",
-        }
-        .to_owned();
+        let tee_provider = session
+            .attestation_tee_provider
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        let tdx_debug = session.attestation_tdx_debug;
+        let nvidia_verified = session
+            .attestation_nvidia_verified
+            .clone()
+            .unwrap_or_else(|| "not-present".to_owned());
 
         Self {
             e2ee: Some("verified".to_owned()),
@@ -3451,13 +3437,16 @@ mod tests {
                     let model_public_key = attestation_key.clone();
                     async move {
                         Json(json!({
+                            "api_version": "aci/1",
                             "attestation": {
-                                "verified": verified,
-                                "nonce": query.get("nonce").cloned().unwrap_or_default(),
-                                "model": query.get("model").cloned().unwrap_or_default(),
-                                "tee_provider": "tdx",
-                                "signing_key": model_public_key,
-                            }
+                                "tee_type": "tdx",
+                                "evidence": {}
+                            },
+                            "verified": verified,
+                            "nonce": query.get("nonce").cloned().unwrap_or_default(),
+                            "model": query.get("model").cloned().unwrap_or_default(),
+                            "tee_provider": "phala",
+                            "signing_public_key": model_public_key,
                         }))
                     }
                 }),
@@ -3554,13 +3543,16 @@ mod tests {
                     let model_public_key = attestation_key.clone();
                     async move {
                         Json(json!({
+                            "api_version": "aci/1",
                             "attestation": {
-                                "verified": true,
-                                "nonce": query.get("nonce").cloned().unwrap_or_default(),
-                                "model": query.get("model").cloned().unwrap_or_default(),
-                                "tee_provider": "tdx",
-                                "signing_key": model_public_key,
-                            }
+                                "tee_type": "tdx",
+                                "evidence": {}
+                            },
+                            "verified": true,
+                            "nonce": query.get("nonce").cloned().unwrap_or_default(),
+                            "model": query.get("model").cloned().unwrap_or_default(),
+                            "tee_provider": "phala",
+                            "signing_public_key": model_public_key,
                         }))
                     }
                 }),
@@ -3738,12 +3730,16 @@ mod tests {
                 let model_public_key = model_public_key.clone();
                 async move {
                     Json(json!({
+                        "api_version": "aci/1",
                         "attestation": {
-                            "verified": verified,
-                            "nonce": query.get("nonce").cloned().unwrap_or_default(),
-                            "model": query.get("model").cloned().unwrap_or_default(),
-                            "signing_key": model_public_key,
-                        }
+                            "tee_type": "tdx",
+                            "evidence": {}
+                        },
+                        "verified": verified,
+                        "nonce": query.get("nonce").cloned().unwrap_or_default(),
+                        "model": query.get("model").cloned().unwrap_or_default(),
+                        "tee_provider": "phala",
+                        "signing_public_key": model_public_key,
                     }))
                 }
             }),

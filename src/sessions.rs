@@ -65,7 +65,9 @@ pub struct SessionContext {
     pub expires_at: SystemTime,
     pub request_count: u64,
     pub attested_model_public_key: Option<String>,
-    pub attestation_report: Option<Value>,
+    pub attestation_tee_provider: Option<String>,
+    pub attestation_tdx_debug: Option<bool>,
+    pub attestation_nvidia_verified: Option<String>,
     pub verified_at: Option<SystemTime>,
 }
 
@@ -81,7 +83,9 @@ pub struct SessionResolution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestedModelState {
     pub model_public_key: String,
-    pub attestation_report: Value,
+    pub tee_provider: Option<String>,
+    pub tdx_debug: Option<bool>,
+    pub nvidia_verified: String,
     pub verified_at: SystemTime,
 }
 
@@ -218,7 +222,9 @@ impl SessionManager {
                     session_key: session_key.to_owned(),
                 })?;
         session.attested_model_public_key = Some(state.model_public_key);
-        session.attestation_report = Some(state.attestation_report);
+        session.attestation_tee_provider = state.tee_provider;
+        session.attestation_tdx_debug = state.tdx_debug;
+        session.attestation_nvidia_verified = Some(state.nvidia_verified);
         session.verified_at = Some(state.verified_at);
 
         Ok(session.clone())
@@ -348,7 +354,9 @@ impl SessionContext {
             expires_at: now + config.max_ttl,
             request_count: 1,
             attested_model_public_key: None,
-            attestation_report: None,
+            attestation_tee_provider: None,
+            attestation_tdx_debug: None,
+            attestation_nvidia_verified: None,
             verified_at: None,
         }
     }
@@ -735,7 +743,9 @@ mod tests {
                 &session.session_key,
                 AttestedModelState {
                     model_public_key: "model-public-key".to_owned(),
-                    attestation_report: json!({ "verified": true }),
+                    tee_provider: Some("phala".to_owned()),
+                    tdx_debug: Some(false),
+                    nvidia_verified: "ignored".to_owned(),
                     verified_at: now(1),
                 },
                 now(1),
@@ -746,9 +756,11 @@ mod tests {
             updated.attested_model_public_key.as_deref(),
             Some("model-public-key")
         );
+        assert_eq!(updated.attestation_tee_provider.as_deref(), Some("phala"));
+        assert_eq!(updated.attestation_tdx_debug, Some(false));
         assert_eq!(
-            updated.attestation_report,
-            Some(json!({ "verified": true }))
+            updated.attestation_nvidia_verified.as_deref(),
+            Some("ignored")
         );
         assert_eq!(updated.verified_at, Some(now(1)));
     }

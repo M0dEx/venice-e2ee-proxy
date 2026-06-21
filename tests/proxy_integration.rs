@@ -637,14 +637,17 @@ async fn mock_attestation(
     }
 
     Json(json!({
+        "api_version": "aci/1",
         "attestation": {
-            "verified": state.attestation_verified(),
-            "nonce": query.get("nonce").cloned().unwrap_or_default(),
-            "model": query.get("model").cloned().unwrap_or_default(),
-            "tee_provider": "tdx",
-            "debug": false,
-            "signing_key": state.model_public_key(),
-        }
+            "tee_type": "tdx",
+            "evidence": {}
+        },
+        "verified": state.attestation_verified(),
+        "nonce": query.get("nonce").cloned().unwrap_or_default(),
+        "model": query.get("model").cloned().unwrap_or_default(),
+        "tee_provider": "phala",
+        "debug": false,
+        "signing_public_key": state.model_public_key(),
     }))
     .into_response()
 }
@@ -948,7 +951,7 @@ fn assert_verified_chat_headers(response: &Response, session_id: &str, tool_retr
     );
     assert_eq!(
         response.headers().get(HEADER_PROXY_TEE_PROVIDER).unwrap(),
-        "tdx"
+        "phala"
     );
     assert_eq!(
         response.headers().get(HEADER_PROXY_TDX_DEBUG).unwrap(),
